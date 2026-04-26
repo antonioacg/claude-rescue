@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# claude-rescue — interactive picker for recovering Claude Code sessions
+# from the per-window event logs maintained by bin/rescue-log.
+#
+# Top-level usage (from inside tmux):
+#   claude-rescue              Open the two-stage drill-down picker.
+#
+# Internal subcommands (used by fzf and re-execs):
+#   list-windows               TSV of windows for fzf level 1.
+#   list-sessions <window>     TSV of sessions for fzf level 2.
+#   preview-window <window>    Preview text for highlighted window.
+#   preview-session <window> <session>   Preview text for highlighted session.
+#   level2 <window>            Inner fzf invocation for one window's sessions.
+#   scrollback-uuids [pane]    Grep current pane's live scrollback for session UUIDs (fallback).
+#
+# Exit keys (level 2):
+#   enter     resume in the originating pane
+#   ctrl-n    resume in a new tmux window in the originating session
+#   ctrl-w    resume in a brand-new tmux session
+#   ctrl-y    copy session UUID to the clipboard
+
+set -uo pipefail
+
+# Resolve $0 through any symlinks so we find lib/common.sh regardless of how
+# this binary was invoked (direct, via ~/.local/bin/ symlink, etc.).
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+ensure_dirs
+
+# ---------------------------------------------------------------------------
+# Data formatters
+
+# TSV columns: uuid \t last_seen \t session_count \t window_name \t primary_cwd \t last_title
+list_windows_tsv() {
+  local idx="$CLAUDE_RESCUE_HOME/index.jsonl"
+  [ -f "$idx" ] || return 0
+
+  # Build a list of (uuid, last_seen) from index.jsonl, sorted by last_seen desc.
+  jq -rs 'sort_by(.last_seen) | reverse | .[] | [.window_uuid, .last_seen, .window_name, .primary_cwd] | @tsv' "$idx" \
+  | while IFS=$'\t' read -r uuid last_seen wname cwd; do
+      local meta="$CLAUDE_RESCUE_HOME/windows/$uuid.meta.json"
+      [ -f "$meta" ] || continue
+      jq -r --arg uuid "$uuid" --arg last_seen "$last_seen" --arg wname "$wname" --arg cwd "$cwd" '
+        [
+          $uuid,
+          $last_seen,
+          (.sessions | length // 0),
+          $wname,
+          $cwd,
+          ((.sessions // []) | map(.last_title) | map(select(. != null)) | .[0] // "")
+        ] | @tsv
+      ' "$meta"
+    done
+}
+
+# TSV columns: session_id \t started \t ended \t cwd \t pane_id \t source \t label
+# `label` falls back: last_title → first_user_message → empty.
+list_sessions_tsv() {
+  local window_uuid="$1"
+  local meta="$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json"
+  [ -f "$meta" ] || return 0
+  jq -r '.sessions // [] | .[] | [
+    .session_id,
+    (.started // ""),
+    (.ended // ""),
+    (.cwd // ""),
+    (.pane_id // ""),
+    (.source // ""),
+    (.last_title // (.first_user_message // "")[:80])
+  ] | @tsv' "$meta"
+}
+
+preview_window() {
+  local window_uuid="$1"
+  local meta="$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json"
+  [ -f "$meta" ] || { echo "(no metadata)"; return 0; }
+
+  jq -r '
+    "Window: \(.window_uuid)",
+    "Path:   \(.primary_cwd // "?")",
+    "Range:  \(.first_seen // "?") → \(.last_seen // "?")",
+    "",
+    "Sessions (\(.sessions | length)):",
+    "",
+    (.sessions[] |
+      "  • \(.last_title // (.first_user_message // "(no label)")[:80])",
+      "    id: \(.session_id)",
+      "    started: \(.started // "?")  ended: \(.ended // "(open)")",
+      "    pane: \(.pane_id // "?")  source: \(.source // "?")",
+      ""
+    )
+  ' "$meta"
+}
+
+UUID_REGEX='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+# Capture the live scrollback of a pane and extract any session UUIDs that
+# look like Claude Code session IDs. Used as a fallback when the picker can't
+# find a session in any log (logs lost, importer missed it, fresh window).
+scrollback_uuids() {
+  local pane="${1:-${TMUX_PANE:-${CLAUDE_RESCUE_ORIG_PANE:-}}}"
+  [ -n "$pane" ] || { echo "no pane to capture" >&2; return 1; }
+  tmux capture-pane -peJ -S - -t "$pane" 2>/dev/null \
+    | grep -Eoh "$UUID_REGEX" \
+    | awk '!seen[$0]++'
+}
+
+# Cross-reference candidate UUIDs against ~/.claude/projects/. Emits TSV
+# "uuid<TAB>cwd<TAB>first_user_message" for UUIDs that have a transcript on disk.
+scrollback_resolve() {
+  local pane="${1:-${TMUX_PANE:-${CLAUDE_RESCUE_ORIG_PANE:-}}}"
+  local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+  scrollback_uuids "$pane" | while read -r uuid; do
+    [ -z "$uuid" ] && continue
+    local transcript
+    transcript="$(find "$projects_root" -maxdepth 2 -name "$uuid.jsonl" 2>/dev/null | head -1)"
+    [ -z "$transcript" ] && continue
+    local cwd_dir="$(dirname "$transcript")"
+    local cwd_decoded
+    # Project dir name is the cwd with '/' encoded as '-'. Decode best-effort.
+    cwd_decoded="$(basename "$cwd_dir" | sed 's|^-|/|; s|-|/|g')"
+    local first_msg
+    first_msg="$(jq -r 'select(.message.role == "user") | .message.content // empty | if type == "string" then . else (.[0].text // "") end' "$transcript" 2>/dev/null \
+      | head -1 | tr '\n' ' ' | cut -c1-80)"
+    printf '%s\t%s\t%s\n' "$uuid" "$cwd_decoded" "$first_msg"
+  done
+}
+
+preview_session() {
+  local window_uuid="$1" session_id="$2"
+  local log="$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
+  [ -f "$log" ] || { echo "(no log)"; return 0; }
+
+  # Backfill events have no session_id on title events (window-level only).
+  # Fall back to all-window-titles for the title timeline of a backfilled session.
+  jq -rs --arg sid "$session_id" '
+    . as $all
+    | [.[] | select(.session_id == $sid)] as $sevents
+    | (if ($sevents | map(select(.kind | startswith("session_start"))) | length) == 0
+       then [.[] | select(.session_id == null and (.kind | endswith("title")))]
+       else [$sevents[] | select(.kind | endswith("title"))]
+       end) as $titles
+    | "Session: \($sid)",
+      "Started: \(([$sevents[] | select(.kind | startswith("session_start"))][0].ts) // "?")",
+      "Ended:   \(([$sevents[] | select(.kind | startswith("session_end"))][0].ts) // "(open)")",
+      "Cwd:     \(([$sevents[] | select(.cwd != null and .cwd != "")][0].cwd) // "?")",
+      "Source:  \(([$sevents[] | select(.source != null)][0].source) // "?")",
+      "First:   \(([$sevents[] | select(.first_user_message != null)][0].first_user_message) // "(none)")",
+      "",
+      "Title history (\($titles | length)):",
+      "",
+      ($titles[] | "  \(.ts)  \(.title)")
+  ' "$log"
+}
+
+# ---------------------------------------------------------------------------
+# Render helpers (humanize TSV → display rows for fzf)
+
+humanize_age() {
+  # Argument: ISO 8601 UTC timestamp. Output a short relative string.
+  local ts="$1" then now diff
+  [ -z "$ts" ] && { echo "?"; return; }
+  then="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%s" 2>/dev/null)" || { echo "?"; return; }
+  now="$(date -u +%s)"
+  diff=$((now - then))
+  if   [ $diff -lt 60 ];     then echo "just now"
+  elif [ $diff -lt 3600 ];   then echo "$((diff / 60))m ago"
+  elif [ $diff -lt 86400 ];  then echo "$((diff / 3600))h ago"
+  else echo "$((diff / 86400))d ago"
+  fi
+}
+
+format_window_rows() {
+  # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
+  while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
+    local age short_uuid line
+    age="$(humanize_age "$last_seen")"
+    short_uuid="${uuid:0:8}"
+    line="$(printf '%-12s  %3s sessions  %-30s  %s' \
+      "$age" "$scount" "${wname:-?}" "${last_title:-${cwd}}")"
+    printf '%s\t%s\n' "$uuid" "$line"
+  done
+}
+
+format_session_rows() {
+  # Reads list_sessions_tsv on stdin, emits "session_id<TAB>display" rows.
+  while IFS=$'\t' read -r sid started ended cwd pane source last_title; do
+    local age short status line
+    age="$(humanize_age "${started:-$ended}")"
+    short="${sid:0:8}"
+    if [ -z "$ended" ]; then status="open"; else status="ended"; fi
+    line="$(printf '%-12s  %-5s  %-8s  %s' \
+      "$age" "$status" "${source:-?}" "${last_title:-(no title)}")"
+    printf '%s\t%s\n' "$sid" "$line"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Action dispatch
+
+resume_command() {
+  # Builds the shell command to resume a session, given session_id and cwd.
+  local sid="$1" cwd="$2"
+  printf 'cd %q && claude --resume %q' "$cwd" "$sid"
+}
+
+action_resume_here() {
+  local sid="$1" cwd="$2"
+  local target="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
+  if [ -z "$target" ]; then
+    echo "no originating pane to send to" >&2
+    return 1
+  fi
+  tmux send-keys -t "$target" " $(resume_command "$sid" "$cwd")" Enter
+}
+
+action_resume_new_window() {
+  local sid="$1" cwd="$2"
+  tmux new-window -c "$cwd" "$(resume_command "$sid" "$cwd")"
+}
+
+action_resume_new_session() {
+  local sid="$1" cwd="$2"
+  local sname
+  sname="claude-$(printf '%s' "$sid" | cut -c1-8)"
+  tmux new-session -d -s "$sname" -c "$cwd" "$(resume_command "$sid" "$cwd")"
+  tmux switch-client -t "$sname" 2>/dev/null || true
+}
+
+action_copy_uuid() {
+  local sid="$1"
+  if command -v pbcopy >/dev/null 2>&1; then
+    printf '%s' "$sid" | pbcopy
+  elif command -v xclip >/dev/null 2>&1; then
+    printf '%s' "$sid" | xclip -selection clipboard
+  else
+    echo "no clipboard tool found (pbcopy/xclip); UUID: $sid" >&2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Inner picker — runs inside the popup.
+
+popup_picker() {
+  local fzf_common=(
+    --ansi
+    --reverse
+    --no-multi
+    --header-lines=0
+    --preview-window=right:55%:wrap
+  )
+
+  # --- Level 1: windows ---
+  local rows level1_out
+  rows="$(list_windows_tsv | format_window_rows)"
+
+  # Append a virtual "(scrollback search)" row that runs the fallback.
+  local scrollback_rows
+  scrollback_rows="$(scrollback_resolve | while IFS=$'\t' read -r uuid cwd first_msg; do
+    printf 'scrollback:%s\t%-12s  %3s sessions  %-30s  %s\n' \
+      "$uuid" "scrollback" "1" "${cwd:-?}" "${first_msg:-(no first message)}"
+  done)"
+  if [ -n "$scrollback_rows" ]; then
+    rows="$rows"$'\n'"$scrollback_rows"
+  fi
+
+  if [ -z "$rows" ]; then
+    echo "No windows logged yet. Start a claude session and try again." >&2
+    return 1
+  fi
+
+  level1_out="$(printf '%s\n' "$rows" \
+    | fzf "${fzf_common[@]}" \
+        --with-nth=2.. --delimiter=$'\t' \
+        --prompt='windows> ' \
+        --header='enter: drill in   esc: cancel' \
+        --preview "$0 preview-window {1}" \
+  )" || return 0
+
+  local window_uuid
+  window_uuid="$(printf '%s' "$level1_out" | cut -f1)"
+  [ -z "$window_uuid" ] && return 0
+
+  # Scrollback fallback: virtual row encodes uuid in the first field as
+  # "scrollback:<session_uuid>". Resume directly without level 2.
+  if [[ "$window_uuid" == scrollback:* ]]; then
+    local sid="${window_uuid#scrollback:}"
+    local cwd
+    cwd="$(scrollback_resolve | awk -F'\t' -v u="$sid" '$1==u {print $2; exit}')"
+    [ -z "$cwd" ] && cwd="$HOME"
+    action_resume_here "$sid" "$cwd"
+    return 0
+  fi
+
+  # --- Level 2: sessions of selected window ---
+  local s_rows
+  s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
+  if [ -z "$s_rows" ]; then
+    echo "(no sessions in window $window_uuid)" >&2
+    return 1
+  fi
+
+  local level2_out key sid
+  level2_out="$(printf '%s\n' "$s_rows" \
+    | fzf "${fzf_common[@]}" \
+        --with-nth=2.. --delimiter=$'\t' \
+        --prompt='sessions> ' \
+        --header='enter: resume here   ctrl-n: new window   ctrl-w: new session   ctrl-y: copy uuid' \
+        --expect=ctrl-n,ctrl-w,ctrl-y \
+        --preview "$0 preview-session $window_uuid {1}" \
+  )" || return 0
+
+  key="$(printf '%s' "$level2_out" | sed -n 1p)"
+  sid="$(printf '%s' "$level2_out" | sed -n 2p | cut -f1)"
+  [ -z "$sid" ] && return 0
+
+  local cwd
+  cwd="$(jq -r --arg sid "$sid" \
+    '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
+    "$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json")"
+  [ -z "$cwd" ] && cwd="$HOME"
+
+  case "$key" in
+    ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
+    ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
+    ctrl-y) action_copy_uuid "$sid" ;;
+    *)      action_resume_here "$sid" "$cwd" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Entry — dispatch subcommands or pop the picker.
+
+cmd="${1:-}"
+case "$cmd" in
+  list-windows)       list_windows_tsv ;;
+  list-sessions)      shift; list_sessions_tsv "$@" ;;
+  preview-window)     shift; preview_window "$@" ;;
+  preview-session)    shift; preview_session "$@" ;;
+  scrollback-uuids)   shift; scrollback_uuids "$@" ;;
+  scrollback-resolve) shift; scrollback_resolve "$@" ;;
+  '')
+    if [ -z "${TMUX:-}" ]; then
+      echo "claude-rescue must be run inside tmux" >&2
+      exit 1
+    fi
+    if [ -z "${CLAUDE_RESCUE_IN_POPUP:-}" ]; then
+      exec tmux display-popup -E -h 80% -w 90% \
+        env CLAUDE_RESCUE_IN_POPUP=1 \
+            CLAUDE_RESCUE_HOME="$CLAUDE_RESCUE_HOME" \
+            CLAUDE_RESCUE_ORIG_PANE="${TMUX_PANE:-}" \
+            "$0"
+    fi
+    popup_picker
+    ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    exit 2
+    ;;
+esac

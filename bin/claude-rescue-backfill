@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# rescue-backfill — reconstruct historical claude-rescue events from on-disk
+# artifacts that predate the writer's installation.
+#
+# Architecture: single-pass awk+sort+awk pipeline. Avoids ~30 shell forks per
+# pane-line of the previous version; processes 10K snapshots in seconds.
+#
+# Sources:
+#   1. ~/.local/share/tmux/resurrect/<dir>/tmux_resurrect_*.txt
+#      → all (timestamp, session, window, pane, title, cwd, command) tuples
+#   2. ~/.claude/projects/<encoded-cwd>/<session>.jsonl
+#      → confirms a session_id is real and gives a first-user-message label
+#
+# Idempotent: writes a marker $CLAUDE_RESCUE_HOME/.backfill-done with the
+# highest snapshot timestamp processed. Re-running skips already-covered files.
+#
+# Synthesized events get kind suffixed _backfill to distinguish from observed.
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+ensure_dirs
+
+RESURRECT_DIR="${CLAUDE_RESCUE_RESURRECT_DIR:-$HOME/.local/share/tmux/resurrect/default}"
+PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+MARKER="$CLAUDE_RESCUE_HOME/.backfill-done"
+MAX_SNAPSHOTS="${CLAUDE_RESCUE_MAX_SNAPSHOTS:-0}"  # 0 = unbounded
+
+WORK_DIR="$(mktemp -d -t bf-work.XXXXXX)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+if [ ! -d "$RESURRECT_DIR" ]; then
+  echo "no resurrect dir at $RESURRECT_DIR; nothing to backfill" >&2
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Pass 0: enumerate snapshots, sorted oldest→newest, optionally capped.
+# Filter to claude-bearing files via ripgrep when available.
+
+snapshot_list="$WORK_DIR/snapshots.list"
+if command -v rg >/dev/null 2>&1; then
+  rg -l --no-messages '^pane.*claude' "$RESURRECT_DIR" -g 'tmux_resurrect_*.txt' 2>/dev/null \
+    | sort > "$snapshot_list"
+else
+  find "$RESURRECT_DIR" -maxdepth 1 -name "tmux_resurrect_*.txt" 2>/dev/null \
+    | sort > "$snapshot_list"
+fi
+
+# Honor the marker (skip files older than last_processed timestamp).
+last_processed=""
+[ -f "$MARKER" ] && last_processed="$(cat "$MARKER")"
+if [ -n "$last_processed" ]; then
+  awk -v cutoff="$last_processed" '
+    {
+      fn = $0
+      sub(/.*tmux_resurrect_/, "", fn); sub(/\.txt$/, "", fn)
+      ts = substr(fn,1,4) "-" substr(fn,5,2) "-" substr(fn,7,2) "T" \
+           substr(fn,10,2) ":" substr(fn,12,2) ":" substr(fn,14,2) "Z"
+      if (ts > cutoff) print
+    }' "$snapshot_list" > "$snapshot_list.new"
+  mv "$snapshot_list.new" "$snapshot_list"
+fi
+
+# Apply cap (keep N most recent — tail N after sorted-asc list).
+total="$(wc -l < "$snapshot_list" | tr -d ' ')"
+if [ "$MAX_SNAPSHOTS" -gt 0 ] && [ "$total" -gt "$MAX_SNAPSHOTS" ]; then
+  tail -n "$MAX_SNAPSHOTS" "$snapshot_list" > "$snapshot_list.cap"
+  mv "$snapshot_list.cap" "$snapshot_list"
+  total="$MAX_SNAPSHOTS"
+fi
+
+if [ "$total" -eq 0 ]; then
+  echo "nothing new to backfill" >&2
+  exit 0
+fi
+echo "backfill: $total snapshot(s) to process" >&2
+
+# ---------------------------------------------------------------------------
+# Pass 1: single awk over all snapshots, emit
+#   ts \t session_name \t window_index \t pane_index \t pane_title \t cwd \t full_command
+# (FILENAME magic gives us the per-file timestamp without per-snapshot forks.)
+
+panes_tsv="$WORK_DIR/panes.tsv"
+# xargs splits args automatically to stay under ARG_MAX.
+xargs awk -F'\t' '
+  FNR == 1 {
+    fn = FILENAME
+    sub(/.*tmux_resurrect_/, "", fn); sub(/\.txt$/, "", fn)
+    ts = substr(fn,1,4) "-" substr(fn,5,2) "-" substr(fn,7,2) "T" \
+         substr(fn,10,2) ":" substr(fn,12,2) ":" substr(fn,14,2) "Z"
+  }
+  $1 == "pane" {
+    gsub(/^:/, "", $8); gsub(/^:/, "", $11)
+    print ts "\t" $2 "\t" $3 "\t" $6 "\t" $7 "\t" $8 "\t" $11
+  }
+' < "$snapshot_list" > "$panes_tsv"
+
+pane_lines="$(wc -l < "$panes_tsv" | tr -d ' ')"
+echo "  extracted $pane_lines pane records" >&2
+
+# ---------------------------------------------------------------------------
+# Pass 2: sort by (session_name, window_index, pane_index, ts) so that within
+# each (sn, wi, pi) group entries are time-ordered. Awk's gawk-style sort is
+# unavailable on macOS, so we delegate to coreutils sort.
+
+panes_sorted="$WORK_DIR/panes.sorted.tsv"
+LC_ALL=C sort -t $'\t' -k2,2 -k3,3n -k4,4n -k1,1 "$panes_tsv" > "$panes_sorted"
+
+# ---------------------------------------------------------------------------
+# Pass 3: walk sorted stream, emit transitions. Group keyed by (sn, wi, pi);
+# emit a title_backfill JSON line whenever ptitle changes within a group.
+# Also tracks (sn, wi) → last_seen_dir so we can pick a primary_cwd per window.
+# Bucketing into window logs happens by computing a deterministic backfill UUID
+# from (session_name, window_name, primary_cwd) — same scheme as in the writer.
+
+# Helper: given session_name, window_name, cwd, mint a "bf-XXXXXXXX-..." UUID.
+# We do this in awk via a small shasum call per unique key — but that's still a
+# fork. Cheaper: build a deterministic UUID from a CRC of the key, computed in
+# pure awk (no forks).
+#   bf-XXXXXXXX-0000-0000-0000-000000000000
+# where XXXXXXXX is a hex CRC32-like hash. Awk can compute a simple FNV-1a 32-bit.
+
+events_jsonl="$WORK_DIR/events.jsonl"
+awk -F'\t' -v outdir="$CLAUDE_RESCUE_HOME/windows" '
+  # djb2 — multiplicative hash, no bitwise ops needed (BSD awk has no XOR).
+  function djb2(s,    h, i) {
+    h = 5381
+    for (i = 1; i <= length(s); i++) {
+      h = ((h * 33) + (ord[substr(s, i, 1)] + 0)) % 4294967296
+    }
+    return h
+  }
+  function tohex(n,    s, d, hex) {
+    hex = "0123456789abcdef"
+    s = ""
+    while (n > 0) {
+      d = int(n % 16)
+      s = substr(hex, d+1, 1) s
+      n = int(n / 16)
+    }
+    while (length(s) < 8) s = "0" s
+    return s
+  }
+  # Strip ANSI escapes + other ASCII control chars; leave printable + space.
+  function strip_ctrl(s,    i, c, out, code) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+      c = substr(s, i, 1)
+      code = ord[c] + 0
+      if (code >= 32 || code == 9) out = out c   # printable or tab
+    }
+    return out
+  }
+  function jesc(s) {
+    s = strip_ctrl(s)
+    gsub(/\\/, "\\\\", s)
+    gsub(/"/, "\\\"", s)
+    gsub(/\t/, "\\t", s)
+    return s
+  }
+  # Window grouping: one logical window per (session_name, cwd). Title changes
+  # within that pair are transitions of the SAME window.
+  function uuid_for(sn, cwd,    key) {
+    key = sn "|" cwd
+    return "bf-" tohex(djb2(key)) "-0000-0000-0000-000000000000"
+  }
+  BEGIN {
+    # Build ord[] for fast char→int lookup.
+    for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i
+    cur_key = ""
+    last_title = ""
+  }
+  {
+    ts = $1; sn = $2; wi = $3; pi = $4; ptitle = $5; cwd = $6; cmd = $7
+    if (ptitle == "") next
+
+    key = sn "\t" wi "\t" pi
+    if (key != cur_key) {
+      cur_key = key
+      last_title = ""
+    }
+
+    if (ptitle != last_title) {
+      uuid = uuid_for(sn, cwd)
+      out = outdir "/" uuid ".jsonl"
+      printf("{\"ts\":\"%s\",\"kind\":\"title_backfill\",\"title\":\"%s\",\"session_name\":\"%s\",\"window_name\":\"%s\",\"cwd\":\"%s\"}\n",
+             ts, jesc(ptitle), jesc(sn), jesc(ptitle), jesc(cwd)) >> out
+      last_title = ptitle
+
+      # Track (sn, wi) → most-recent cwd for the per-window primary_cwd hint.
+      win_cwd[sn "|" wi] = cwd
+      win_count[sn "|" wi]++
+    }
+
+    # Capture session UUIDs from -r / --resume in the saved command line.
+    if (match(cmd, /(-r|--resume)[ =]+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)) {
+      m = substr(cmd, RSTART, RLENGTH)
+      if (match(m, /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)) {
+        sid = substr(m, RSTART, RLENGTH)
+        skey = sid "|" sn "|" ptitle "|" cwd
+        if (!(skey in seen_session)) {
+          seen_session[skey] = 1
+          uuid = uuid_for(sn, cwd)
+          out = outdir "/" uuid ".jsonl"
+          printf("{\"ts\":\"%s\",\"kind\":\"session_start_backfill\",\"session_id\":\"%s\",\"session_name\":\"%s\",\"window_name\":\"%s\",\"cwd\":\"%s\",\"source\":\"resume_backfill\"}\n",
+                 ts, sid, jesc(sn), jesc(ptitle), jesc(cwd)) >> out
+        }
+      }
+    }
+  }
+' "$panes_sorted"
+
+events_total="$(find "$CLAUDE_RESCUE_HOME/windows" -name "*.jsonl" 2>/dev/null \
+                | xargs wc -l 2>/dev/null | awk '/total/ {print $1; exit}' \
+                | grep -E '^[0-9]+$' || echo 0)"
+echo "  emitted ~$events_total events into per-window logs" >&2
+
+# ---------------------------------------------------------------------------
+# Pass 4: enrich session_start_backfill events with first_user_message.
+# We do one resolve per *unique* session_id, cached on disk. This is the only
+# place we fork jq, and only for sessions that exist on disk.
+
+resolve_cache="$WORK_DIR/resolve.cache"
+: > "$resolve_cache"
+
+# Collect every unique session_id we emitted.
+sids="$(find "$CLAUDE_RESCUE_HOME/windows" -name "*.jsonl" 2>/dev/null \
+        | xargs grep -h '"kind":"session_start_backfill"' 2>/dev/null \
+        | grep -oE '"session_id":"[0-9a-f-]{36}"' \
+        | grep -oE '[0-9a-f-]{36}' \
+        | sort -u)"
+sid_count="$(printf '%s\n' "$sids" | grep -c . || true)"
+echo "  resolving $sid_count unique session IDs from ~/.claude/projects/..." >&2
+
+resolved=0
+for sid in $sids; do
+  transcript="$(find "$PROJECTS_DIR" -maxdepth 2 -name "$sid.jsonl" 2>/dev/null | head -1)"
+  [ -z "$transcript" ] && continue
+  cwd="$(jq -r 'select(.cwd != null) | .cwd' "$transcript" 2>/dev/null | head -1)"
+  msg="$(jq -r '
+    select(.type == "user" or (.message? and .message.role == "user"))
+    | (.message.content // .content // "")
+    | if type == "string" then . else (.[0].text // "") end
+  ' "$transcript" 2>/dev/null | head -1 \
+    | LC_ALL=C tr -d '\000-\010\013-\037\177' \
+    | tr '\n\t' '  ' | cut -c1-160)"
+  printf '%s\t%s\t%s\n' "$sid" "${cwd:-?}" "${msg:-}" >> "$resolve_cache"
+  resolved=$((resolved + 1))
+done
+echo "  $resolved sessions found in ~/.claude/projects/" >&2
+
+# Append enrichment events into each window's log. We don't rewrite the
+# existing session_start_backfill entries; we add a session_meta_backfill row
+# carrying the resolved cwd and first_user_message for the picker preview.
+if [ -s "$resolve_cache" ]; then
+  while IFS=$'\t' read -r sid cwd msg; do
+    # Find which window log(s) reference this session_id.
+    matching=$(grep -lE "\"session_id\":\"$sid\"" "$CLAUDE_RESCUE_HOME/windows/"*.jsonl 2>/dev/null || true)
+    [ -z "$matching" ] && continue
+    while IFS= read -r log; do
+      [ -z "$log" ] && continue
+      cwd_e="$(printf '%s' "$cwd" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      msg_e="$(printf '%s' "$msg" | LC_ALL=C tr -d '\000-\037\177' | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      printf '{"ts":"%s","kind":"session_meta_backfill","session_id":"%s","cwd":"%s","first_user_message":"%s"}\n' \
+        "$(now_iso)" "$sid" "$cwd_e" "$msg_e" >> "$log"
+    done <<< "$matching"
+  done < "$resolve_cache"
+fi
+
+# ---------------------------------------------------------------------------
+# Pass 5: rebuild meta + index for every touched window.
+
+echo "  rebuilding meta + index..." >&2
+for log in "$CLAUDE_RESCUE_HOME/windows/"*.jsonl; do
+  [ -f "$log" ] || continue
+  uuid="$(basename "$log" .jsonl)"
+  rebuild_meta "$uuid"
+  meta="$CLAUDE_RESCUE_HOME/windows/$uuid.meta.json"
+  [ -f "$meta" ] || continue
+  sn="$(jq -r '.session_name // ""' "$meta")"
+  wn="$(jq -r '.window_name // ""' "$meta")"
+  cwd="$(jq -r '.primary_cwd // ""' "$meta")"
+  update_index "$uuid" "$sn" "$wn" "$cwd"
+done
+
+# Marker = highest ts in the processed list.
+new_max="$(awk '
+  { fn = $0
+    sub(/.*tmux_resurrect_/, "", fn); sub(/\.txt$/, "", fn)
+    ts = substr(fn,1,4) "-" substr(fn,5,2) "-" substr(fn,7,2) "T" \
+         substr(fn,10,2) ":" substr(fn,12,2) ":" substr(fn,14,2) "Z"
+    if (ts > max) max = ts
+  } END { print max }
+' "$snapshot_list")"
+[ -n "$new_max" ] && printf '%s' "$new_max" > "$MARKER"
+
+echo "backfill complete. windows indexed: $(wc -l < "$CLAUDE_RESCUE_HOME/index.jsonl" 2>/dev/null | tr -d ' ' || echo 0)" >&2

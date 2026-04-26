@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# claude-rescue-log — single dispatch point for everything claude-rescue
+# does in response to events from Claude Code, tmux, and tmux-resurrect.
+#
+# Event subcommands (writer):
+#   session_start              Read JSON from stdin (Claude SessionStart hook).
+#   session_end                Read JSON from stdin (Claude SessionEnd hook).
+#   title <pane_id> <title>    Schedule a debounced title commit.
+#   title-commit <pane_id>     Internal: commit a debounced title if still settled.
+#   pane-died <pane_id>        Final flush before tmux reaps a pane.
+#   client-detached            Logged at server-wide level (no pane).
+#   stopped <pane_id> <pids>   SIGSTOP layer event.
+#   resume_unstop <pane_id>    SIGSTOP layer event.
+#
+# Resurrect hooks:
+#   resurrect-save <state_file>   Write @claude-window-id sidecar (post-save-layout).
+#   resurrect-restore             Re-apply @claude-window-id from sidecar (post-restore-all).
+#
+# SIGSTOP layer:
+#   sigstop-arm <pane_id> <pane_pid>   Schedule SIGSTOP after focus-out delay.
+#   sigstop-resume <pane_id>           Cancel pending arm + SIGCONT any stopped PIDs.
+#
+# All output goes to stderr. Stdout is reserved (Claude hooks pipe stdout into context).
+
+set -uo pipefail
+
+# Resolve $0 through any symlinks so we find the real lib/common.sh, regardless
+# of how this binary was invoked (direct, via ~/.local/bin/ symlink, etc.).
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
+ensure_dirs
+
+DEBOUNCE_SECONDS="${CLAUDE_RESCUE_TITLE_DEBOUNCE:-5}"
+
+# --- Subcommand handlers ----------------------------------------------------
+
+cmd_session_start() {
+  local json
+  json="$(cat)"
+  local session_id cwd source model transcript hook_event
+  session_id="$(jq -r '.session_id // empty' <<<"$json")"
+  cwd="$(jq -r '.cwd // empty' <<<"$json")"
+  source="$(jq -r '.source // empty' <<<"$json")"
+  model="$(jq -r '.model // empty' <<<"$json")"
+  transcript="$(jq -r '.transcript_path // empty' <<<"$json")"
+  hook_event="$(jq -r '.hook_event_name // empty' <<<"$json")"
+
+  if [ -z "$session_id" ]; then
+    log_err "session_start: missing session_id in stdin JSON"
+    return 0
+  fi
+
+  local pane_id="${TMUX_PANE:-}"
+  if [ -z "$pane_id" ] || [ -z "${TMUX:-}" ]; then
+    log_no_tmux session_start "$session_id" "$cwd" "$source" "$model" "$transcript"
+    return 0
+  fi
+
+  local window_uuid
+  window_uuid="$(ensure_window_uuid "$pane_id")" || {
+    log_err "session_start: failed to ensure window uuid for $pane_id"
+    return 0
+  }
+
+  # Force-flush any pending title for this pane (so /clear or /compact preserve last task).
+  flush_pending_title "$pane_id" "$window_uuid"
+
+  # On /clear or /compact: emit synthetic session_end for the prior session in this pane.
+  if [ "$source" = "clear" ] || [ "$source" = "compact" ]; then
+    local prior
+    prior="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+    if [ -n "$prior" ]; then
+      append_event "$window_uuid" "$(jq -nc \
+        --arg ts "$(now_iso)" --arg sid "$prior" --arg pane "$pane_id" --arg reason "$source" \
+        '{ts:$ts, kind:"session_end", session_id:$sid, pane_id:$pane, reason:$reason}')"
+    fi
+  fi
+
+  local session_name window_index window_name pane_cwd
+  IFS=$'\t' read -r session_name window_index window_name pane_cwd \
+    < <(tmux_pane_info "$pane_id" || echo $'\t\t\t')
+
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg sid "$session_id" --arg pane "$pane_id" \
+    --arg cwd "${cwd:-$pane_cwd}" --arg src "$source" --arg model "$model" \
+    --arg tr "$transcript" --arg sn "$session_name" --arg wn "$window_name" \
+    '{ts:$ts, kind:"session_start", session_id:$sid, pane_id:$pane,
+      cwd:$cwd, source:$src, model:$model, transcript_path:$tr,
+      session_name:$sn, window_name:$wn}')"
+
+  update_index "$window_uuid" "$session_name" "$window_name" "${cwd:-$pane_cwd}"
+  rebuild_meta "$window_uuid"
+}
+
+cmd_session_end() {
+  local json
+  json="$(cat)"
+  local session_id cwd
+  session_id="$(jq -r '.session_id // empty' <<<"$json")"
+  cwd="$(jq -r '.cwd // empty' <<<"$json")"
+
+  if [ -z "$session_id" ]; then
+    log_err "session_end: missing session_id in stdin JSON"
+    return 0
+  fi
+
+  local pane_id="${TMUX_PANE:-}"
+  if [ -z "$pane_id" ] || [ -z "${TMUX:-}" ]; then
+    log_no_tmux session_end "$session_id" "$cwd" "" "" ""
+    return 0
+  fi
+
+  local window_uuid
+  window_uuid="$(tmux_get_window_uuid "$pane_id")"
+  if [ -z "$window_uuid" ]; then
+    log_err "session_end: no @claude-window-id on pane $pane_id; ignoring"
+    return 0
+  fi
+
+  flush_pending_title "$pane_id" "$window_uuid"
+
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg sid "$session_id" --arg pane "$pane_id" --arg reason "exit" \
+    '{ts:$ts, kind:"session_end", session_id:$sid, pane_id:$pane, reason:$reason}')"
+  rebuild_meta "$window_uuid"
+}
+
+cmd_title() {
+  local pane_id="$1" title="$2"
+  [ -z "$pane_id" ] && return 0
+  [ -z "$title" ] && return 0
+
+  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  jq -nc --arg t "$title" --arg ts "$(now_iso)" '{title:$t, ts:$ts}' > "$cand"
+
+  # Schedule a debounced commit. Multiple sleeps may stack; only the one whose
+  # candidate is still settled at commit time will write the event.
+  ( sleep "$DEBOUNCE_SECONDS"
+    "$REPO/bin/rescue-log" title-commit "$pane_id" >/dev/null 2>&1 ) &
+  disown 2>/dev/null || true
+}
+
+cmd_title_commit() {
+  local pane_id="$1"
+  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local last="$CLAUDE_RESCUE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  [ -f "$cand" ] || return 0
+
+  local title cand_ts now elapsed
+  title="$(jq -r '.title' "$cand")"
+  cand_ts="$(jq -r '.ts' "$cand")"
+  now="$(now_iso)"
+
+  # Settle check: candidate must be at least DEBOUNCE_SECONDS old.
+  elapsed=$(iso_age_seconds "$cand_ts")
+  [ "$elapsed" -lt "$DEBOUNCE_SECONDS" ] && return 0
+
+  # Dedup: skip if we already emitted this exact title for this pane.
+  if [ -f "$last" ] && [ "$(cat "$last")" = "$title" ]; then
+    return 0
+  fi
+
+  local window_uuid session_id
+  window_uuid="$(tmux_get_window_uuid "$pane_id")"
+  [ -z "$window_uuid" ] && return 0
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$now" --arg t "$title" --arg pane "$pane_id" \
+    --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"title", pane_id:$pane, title:$t} +
+     (if $sid == "" then {} else {session_id:$sid} end)')"
+  printf '%s' "$title" > "$last"
+  rebuild_meta "$window_uuid"
+}
+
+cmd_pane_died() {
+  local pane_id="$1"
+  [ -z "$pane_id" ] && return 0
+  # Pane is gone, but window options may still resolve via the parent window.
+  local window_uuid
+  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  [ -z "$window_uuid" ] && return 0
+
+  flush_pending_title "$pane_id" "$window_uuid"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg pane "$pane_id" \
+    '{ts:$ts, kind:"pane_died", pane_id:$pane}')"
+  rebuild_meta "$window_uuid"
+}
+
+cmd_client_detached() {
+  # Server-wide event; no pane attribution. Best-effort: log for forensic context.
+  local marker="$CLAUDE_RESCUE_HOME/client-detached.log"
+  printf '%s\n' "$(now_iso)" >> "$marker"
+}
+
+cmd_stopped() {
+  local pane_id="$1" pids="${2:-}"
+  [ -z "$pane_id" ] && return 0
+  local window_uuid session_id
+  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  [ -z "$window_uuid" ] && return 0
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg pane "$pane_id" --arg pids "$pids" \
+    --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"stopped", pane_id:$pane, pids:$pids} +
+     (if $sid == "" then {} else {session_id:$sid} end)')"
+}
+
+cmd_resume_unstop() {
+  local pane_id="$1"
+  [ -z "$pane_id" ] && return 0
+  local window_uuid session_id
+  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  [ -z "$window_uuid" ] && return 0
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg pane "$pane_id" \
+    --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"resume_unstop", pane_id:$pane} +
+     (if $sid == "" then {} else {session_id:$sid} end)')"
+}
+
+# --- Helpers used by handlers -----------------------------------------------
+
+# Returns the session_id of the most recent session_start in this window+pane
+# that has not been followed by a session_end (or empty if none).
+latest_open_session_in_pane() {
+  local window_uuid="$1" pane_id="$2"
+  local log="$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
+  [ -f "$log" ] || return 0
+  jq -rs --arg pane "$pane_id" '
+    [.[] | select(.pane_id == $pane and (.kind == "session_start" or .kind == "session_end"))]
+    | reduce .[] as $e ({}; . + {($e.session_id): $e.kind})
+    | to_entries | map(select(.value == "session_start")) | .[-1].key // empty
+  ' "$log"
+}
+
+flush_pending_title() {
+  local pane_id="$1" window_uuid="$2"
+  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local last="$CLAUDE_RESCUE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  [ -f "$cand" ] || return 0
+  local title
+  title="$(jq -r '.title' "$cand")"
+  if [ -f "$last" ] && [ "$(cat "$last")" = "$title" ]; then
+    return 0
+  fi
+  local session_id
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg t "$title" --arg pane "$pane_id" \
+    --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"title", pane_id:$pane, title:$t, forced:true} +
+     (if $sid == "" then {} else {session_id:$sid} end)')"
+  printf '%s' "$title" > "$last"
+}
+
+iso_age_seconds() {
+  local ts="$1"
+  local then now
+  then="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%s" 2>/dev/null)" || { echo 0; return; }
+  now="$(date -u +%s)"
+  echo $((now - then))
+}
+
+log_no_tmux() {
+  local kind="$1" sid="$2" cwd="$3" source="$4" model="$5" transcript="$6"
+  local host bucket
+  host="$(hostname -s)"
+  bucket="$CLAUDE_RESCUE_HOME/no-tmux/${host}__$(printf '%s' "$cwd" | shasum | cut -c1-12).jsonl"
+  printf '%s\n' "$(jq -nc \
+    --arg ts "$(now_iso)" --arg k "$kind" --arg sid "$sid" --arg cwd "$cwd" \
+    --arg src "$source" --arg model "$model" --arg tr "$transcript" \
+    '{ts:$ts, kind:$k, session_id:$sid, cwd:$cwd, source:$src, model:$model, transcript_path:$tr}')" \
+    >> "$bucket"
+}
+
+# --- Resurrect hooks (post-save-layout / post-restore-all) ------------------
+
+cmd_resurrect_save() {
+  # Hooked into tmux-resurrect via @resurrect-hook-post-save-layout.
+  # Writes a sidecar TSV next to the resurrect state file containing every
+  # window's @claude-window-id (and any other user options worth surviving).
+  local state_file="${1:-}"
+  [ -n "$state_file" ] || return 0
+  [ -f "$state_file" ] || return 0
+  local sidecar="${state_file%.txt}.claude-userops.tsv"
+  tmux list-windows -aF $'#{session_name}\t#{window_index}\t#{window_name}\t#{@claude-window-id}' \
+    | awk -F'\t' 'NF==4 && $4 != "" { print }' \
+    > "$sidecar.tmp"
+  mv "$sidecar.tmp" "$sidecar"
+}
+
+cmd_resurrect_restore() {
+  # Hooked into tmux-resurrect via @resurrect-hook-post-restore-all.
+  # Re-applies @claude-window-id from the sidecar TSV.
+  local resurrect_dir
+  resurrect_dir="$(tmux show-options -gv @resurrect-dir 2>/dev/null || true)"
+  if [ -z "$resurrect_dir" ]; then
+    resurrect_dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+    [ -d "$resurrect_dir" ] || resurrect_dir="$HOME/.tmux/resurrect"
+  fi
+  local last_link="$resurrect_dir/last"
+  [ -L "$last_link" ] || [ -f "$last_link" ] || return 0
+  local state_basename
+  state_basename="$(readlink "$last_link" 2>/dev/null || cat "$last_link" 2>/dev/null)"
+  [ -n "$state_basename" ] || return 0
+  local state_file="$resurrect_dir/$state_basename"
+  local sidecar="${state_file%.txt}.claude-userops.tsv"
+  [ -f "$sidecar" ] || return 0
+  while IFS=$'\t' read -r session_name window_index window_name uuid; do
+    [ -n "$uuid" ] || continue
+    tmux set-option -wt "$session_name:$window_index" @claude-window-id "$uuid" 2>/dev/null || true
+  done < "$sidecar"
+}
+
+# --- SIGSTOP layer (focus-driven STOP/CONT for idle claude processes) -------
+
+cmd_sigstop_arm() {
+  # Args: $1 = pane_id, $2 = pane_pid (root of the pane's process tree).
+  # Spawns a backgrounded timer that, after CLAUDE_RESCUE_STOP_DELAY (default 300s):
+  #   - defers up to N times if the pane title contains the streaming spinner,
+  #   - walks the pane's process tree, finds processes named "claude",
+  #   - issues kill -STOP and records PIDs to $CLAUDE_RESCUE_HOME/stopped/<pane>.json.
+  # If a corresponding sigstop-resume runs first, the timer is cancelled.
+  local pane_id="${1:-}" pane_pid="${2:-}"
+  [ -n "$pane_id" ] || return 0
+  [ -n "$pane_pid" ] || return 0
+
+  local DELAY="${CLAUDE_RESCUE_STOP_DELAY:-300}"
+  local DEFER_TIMES="${CLAUDE_RESCUE_STOP_DEFER_TIMES:-3}"
+  local DEFER_SECONDS="${CLAUDE_RESCUE_STOP_DEFER_SECONDS:-60}"
+  local SPINNER_REGEX="${CLAUDE_RESCUE_SPINNER_REGEX:-✳}"
+  local TARGET_COMM="${CLAUDE_RESCUE_TARGET_COMM:-claude}"
+
+  local san="${pane_id//[^A-Za-z0-9]/_}"
+  local arm_pid_file="$CLAUDE_RESCUE_HOME/stopped/$san.arm.pid"
+  local stopped_file="$CLAUDE_RESCUE_HOME/stopped/$san.json"
+
+  # If a timer is already running for this pane, leave it.
+  if [ -f "$arm_pid_file" ]; then
+    local prev_pid
+    prev_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
+    if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$arm_pid_file"
+  fi
+
+  (
+    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_HOME/sigstop-arm.err"
+    sleep "$DELAY"
+
+    local title active pids cur child cmd queue
+    for _ in $(seq 1 "$DEFER_TIMES"); do
+      title="$(tmux display-message -p -t "$pane_id" -F '#{pane_title}' 2>/dev/null || echo "")"
+      if [[ "$title" =~ $SPINNER_REGEX ]]; then sleep "$DEFER_SECONDS"; else break; fi
+    done
+
+    title="$(tmux display-message -p -t "$pane_id" -F '#{pane_title}' 2>/dev/null || echo "")"
+    if [[ "$title" =~ $SPINNER_REGEX ]]; then
+      cmd_stopped "$pane_id" "skip:streaming" 2>/dev/null || true
+      rm -f "$arm_pid_file"
+      exit 0
+    fi
+
+    active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
+    if [ "$active" = "11" ]; then
+      rm -f "$arm_pid_file"
+      exit 0
+    fi
+
+    pids=""
+    queue=("$pane_pid")
+    while [ ${#queue[@]} -gt 0 ]; do
+      cur="${queue[0]}"; queue=("${queue[@]:1}")
+      for child in $(pgrep -P "$cur" 2>/dev/null); do
+        queue+=("$child")
+        cmd="$(ps -o comm= -p "$child" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+        [ "$cmd" = "$TARGET_COMM" ] && pids="$pids $child"
+      done
+    done
+    pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
+
+    if [ -z "${pids// /}" ]; then
+      rm -f "$arm_pid_file"
+      exit 0
+    fi
+
+    local pid
+    for pid in $pids; do kill -STOP "$pid" 2>/dev/null || true; done
+    jq -nc --arg pane "$pane_id" --arg ts "$(now_iso)" --arg pids "$pids" \
+      '{pane_id:$pane, ts:$ts, pids:($pids | gsub("^ +| +$";"") | split(" "))}' \
+      > "$stopped_file"
+
+    cmd_stopped "$pane_id" "$pids" 2>/dev/null || true
+    rm -f "$arm_pid_file"
+  ) &
+  echo $! > "$arm_pid_file"
+  disown 2>/dev/null || true
+  trap '' HUP
+}
+
+cmd_sigstop_resume() {
+  # Cancel any pending arm timer for the pane and SIGCONT any previously-paused PIDs.
+  local pane_id="${1:-}"
+  [ -n "$pane_id" ] || return 0
+
+  local san="${pane_id//[^A-Za-z0-9]/_}"
+  local arm_pid_file="$CLAUDE_RESCUE_HOME/stopped/$san.arm.pid"
+  local stopped_file="$CLAUDE_RESCUE_HOME/stopped/$san.json"
+
+  if [ -f "$arm_pid_file" ]; then
+    local arm_pid
+    arm_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
+    if [ -n "$arm_pid" ] && kill -0 "$arm_pid" 2>/dev/null; then
+      kill "$arm_pid" 2>/dev/null || true
+    fi
+    rm -f "$arm_pid_file"
+  fi
+
+  if [ -f "$stopped_file" ]; then
+    local pids pid
+    pids="$(jq -r '.pids[]' "$stopped_file" 2>/dev/null | tr '\n' ' ')"
+    for pid in $pids; do
+      [ -n "$pid" ] || continue
+      kill -CONT "$pid" 2>/dev/null || true
+    done
+    rm -f "$stopped_file"
+    cmd_resume_unstop "$pane_id"
+  fi
+}
+
+# --- Dispatch ---------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  session_start)      cmd_session_start "$@" ;;
+  session_end)        cmd_session_end "$@" ;;
+  title)              cmd_title "$@" ;;
+  title-commit)       cmd_title_commit "$@" ;;
+  pane-died)          cmd_pane_died "$@" ;;
+  client-detached)    cmd_client_detached "$@" ;;
+  stopped)            cmd_stopped "$@" ;;
+  resume_unstop)      cmd_resume_unstop "$@" ;;
+  resurrect-save)     cmd_resurrect_save "$@" ;;
+  resurrect-restore)  cmd_resurrect_restore "$@" ;;
+  sigstop-arm)        cmd_sigstop_arm "$@" ;;
+  sigstop-resume)     cmd_sigstop_resume "$@" ;;
+  '')                 log_err "no subcommand"; exit 2 ;;
+  *)                  log_err "unknown subcommand: $cmd"; exit 2 ;;
+esac
