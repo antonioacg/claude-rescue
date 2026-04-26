@@ -146,7 +146,7 @@ cmd_title() {
   # Schedule a debounced commit. Multiple sleeps may stack; only the one whose
   # candidate is still settled at commit time will write the event.
   ( sleep "$DEBOUNCE_SECONDS"
-    "$REPO/bin/rescue-log" title-commit "$pane_id" >/dev/null 2>&1 ) &
+    "$REPO/bin/claude-rescue-log" title-commit "$pane_id" >/dev/null 2>&1 ) &
   disown 2>/dev/null || true
 }
 
