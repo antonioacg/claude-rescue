@@ -338,6 +338,18 @@ cmd_resurrect_save() {
   done < <(tmux list-panes -aF $'#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_title}\t#{pane_current_path}\t#{@claude-window-id}')
 
   # 2b. Detect panes that disappeared since last sample (deferred pane-died).
+  # Defensive guard: if this sample saw ZERO live panes with @claude-window-id,
+  # tmux's option lookup likely returned a transient empty (observed when a
+  # pane's command transitions, e.g. claude → zsh on Ctrl+C+Ctrl+C — the
+  # save fires in the middle of automatic-rename and the option query
+  # briefly returns nothing). Skip the gone-pane detection and wait for the
+  # next sample rather than firing false positive pane_died events.
+  if [ ! -s "$current_panes_file" ]; then
+    log_err "resurrect-save: list-panes returned no live windows with @claude-window-id; skipping gone-pane detection"
+    rm -f "$current_panes_file"
+    return 0
+  fi
+
   local stale_pane
   for stale_file in "$snapshot_dir"/*.last; do
     [ -f "$stale_file" ] || continue
