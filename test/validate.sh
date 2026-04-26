@@ -170,9 +170,10 @@ PREVIEW=$(CLAUDE_RESCUE_HOME=$HOME_DIR "$REPO/bin/claude-rescue" preview-window 
 assert_nonempty "picker: preview-window returns content" "$PREVIEW"
 
 # ---------------------------------------------------------------------------
-echo "[install.sh] dry-run lists what it would link"
-DR=$(bash "$REPO/install.sh" --dry-run 2>&1 | grep -c "ln -s")
-assert "install.sh dry-run shows 3 symlinks" "3" "$DR"
+echo "[install.sh] dry-run accounts for all 3 binaries"
+# Counts both "ln -s" (would link) and "already linked" (idempotent skip).
+DR=$(bash "$REPO/install.sh" --dry-run 2>&1 | grep -cE "ln -s|already linked")
+assert "install.sh dry-run accounts for all 3 binaries" "3" "$DR"
 
 # ---------------------------------------------------------------------------
 echo "[json] all window logs are valid JSONL"

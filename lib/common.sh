@@ -19,7 +19,13 @@ ensure_dirs() {
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
-log_err() { printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >&2; }
+log_err() {
+  # Write to the err file directly. tmux's run-shell -b swallows stderr, so
+  # relying on >&2 alone hides errors from hook contexts. ensure_dirs has
+  # already created CLAUDE_RESCUE_HOME by the time anything calls this.
+  local err_file="$CLAUDE_RESCUE_HOME/rescue-log.err"
+  printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >> "$err_file"
+}
 
 # Atomic JSONL append. Lines under PIPE_BUF (typically 512+ bytes) are atomic.
 append_event() {
