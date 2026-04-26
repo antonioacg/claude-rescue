@@ -315,7 +315,12 @@ cmd_resurrect_save() {
   local current_panes_file="$snapshot_dir/.current-panes"
   : > "$current_panes_file"
 
-  while IFS=$'\t' read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid; do
+  # Use ASCII unit separator (\x1f) instead of tab. Bash's `read` collapses
+  # consecutive whitespace IFS chars (including tabs), which silently drops
+  # empty fields like an unset pane_title — shifting subsequent fields and
+  # making @claude-window-id read empty. Non-whitespace IFS preserves them.
+  local US=$'\x1f'
+  while IFS="$US" read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid; do
     [ -z "$pane_id" ] && continue
     [ -z "$window_uuid" ] && continue
     printf '%s\n' "$pane_id" >> "$current_panes_file"
@@ -335,7 +340,7 @@ cmd_resurrect_save() {
          (if $sid == "" then {} else {session_id:$sid} end)')"
       printf '%s' "$pane_title" > "$last_file"
     fi
-  done < <(tmux list-panes -aF $'#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_title}\t#{pane_current_path}\t#{@claude-window-id}')
+  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}")
 
   # 2b. Detect panes that disappeared since last sample (deferred pane-died).
   # Defensive guard: if this sample saw ZERO live panes with @claude-window-id,
@@ -375,13 +380,14 @@ cmd_resurrect_save() {
   done
 
   # 2c. Update owner + window_uuid sidecars for currently-live panes.
-  while IFS=$'\t' read -r pane_id _ _ _ _ _ window_uuid; do
+  # Same US separator as above to handle empty pane_title correctly.
+  while IFS="$US" read -r pane_id _ _ _ _ _ window_uuid; do
     [ -z "$pane_id" ] && continue
     [ -z "$window_uuid" ] && continue
     local san="${pane_id//[^A-Za-z0-9]/_}"
     printf '%s' "$pane_id" > "$snapshot_dir/$san.owner"
     printf '%s' "$window_uuid" > "$snapshot_dir/$san.window_uuid"
-  done < <(tmux list-panes -aF $'#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_title}\t#{pane_current_path}\t#{@claude-window-id}')
+  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}")
 
   rm -f "$current_panes_file"
 
