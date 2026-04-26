@@ -86,7 +86,7 @@ preview_window() {
 
   jq -r '
     "Window: \(.window_uuid)",
-    "Path:   \(.primary_cwd // "?")",
+    "Path:   \((.primary_cwd // "?") | sub("^" + env.HOME; "~"))",
     "Range:  \(.first_seen // "?") → \(.last_seen // "?")",
     "",
     "Sessions (\(.sessions | length)):",
@@ -102,6 +102,16 @@ preview_window() {
 }
 
 UUID_REGEX='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+
+# Replace the leading $HOME with ~ for display purposes.
+tildify() {
+  local p="$1"
+  case "$p" in
+    "$HOME") echo "~" ;;
+    "$HOME"/*) echo "~${p#$HOME}" ;;
+    *) echo "$p" ;;
+  esac
+}
 
 # Capture the live scrollback of a pane and extract any session UUIDs that
 # look like Claude Code session IDs. Used as a fallback when the picker can't
@@ -152,7 +162,7 @@ preview_session() {
     | "Session: \($sid)",
       "Started: \(([$sevents[] | select(.kind | startswith("session_start"))][0].ts) // "?")",
       "Ended:   \(([$sevents[] | select(.kind | startswith("session_end"))][0].ts) // "(open)")",
-      "Cwd:     \(([$sevents[] | select(.cwd != null and .cwd != "")][0].cwd) // "?")",
+      "Cwd:     \((([$sevents[] | select(.cwd != null and .cwd != "")][0].cwd) // "?") | sub("^" + env.HOME; "~"))",
       "Source:  \(([$sevents[] | select(.source != null)][0].source) // "?")",
       "First:   \(([$sevents[] | select(.first_user_message != null)][0].first_user_message) // "(none)")",
       "",
@@ -181,24 +191,25 @@ humanize_age() {
 
 format_window_rows() {
   # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
+  # Display columns:  age          sessions  window-name              cwd-or-title
   while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
-    local age short_uuid line
+    local age line cwd_short
     age="$(humanize_age "$last_seen")"
-    short_uuid="${uuid:0:8}"
-    line="$(printf '%-12s  %3s sessions  %-30s  %s' \
-      "$age" "$scount" "${wname:-?}" "${last_title:-${cwd}}")"
+    cwd_short="$(tildify "${cwd:-?}")"
+    line="$(printf '%-10s  %3s sess  %-22s  %s' \
+      "$age" "$scount" "${wname:-?}" "${last_title:-${cwd_short}}")"
     printf '%s\t%s\n' "$uuid" "$line"
   done
 }
 
 format_session_rows() {
   # Reads list_sessions_tsv on stdin, emits "session_id<TAB>display" rows.
+  # Display columns:  age          state   source     label
   while IFS=$'\t' read -r sid started ended cwd pane source last_title; do
-    local age short status line
+    local age status line
     age="$(humanize_age "${started:-$ended}")"
-    short="${sid:0:8}"
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
-    line="$(printf '%-12s  %-5s  %-8s  %s' \
+    line="$(printf '%-10s  %-5s  %-8s  %s' \
       "$age" "$status" "${source:-?}" "${last_title:-(no title)}")"
     printf '%s\t%s\n' "$sid" "$line"
   done
@@ -251,11 +262,16 @@ action_copy_uuid() {
 # Inner picker — runs inside the popup.
 
 popup_picker() {
+  # --layout=default puts the prompt + header + count at the BOTTOM of the
+  # popup, with the list growing upward. Action keys end up near the user's
+  # focus instead of at the top of the popup. Selected item is the row
+  # closest to the prompt.
   local fzf_common=(
     --ansi
-    --reverse
+    --layout=default
     --no-multi
     --header-lines=0
+    --header-first
     --preview-window=right:55%:wrap
   )
 
@@ -282,7 +298,7 @@ popup_picker() {
     | fzf "${fzf_common[@]}" \
         --with-nth=2.. --delimiter=$'\t' \
         --prompt='windows> ' \
-        --header='enter: drill in   esc: cancel' \
+        --header=$'enter: drill in   esc: cancel\nage         sessions  window-name             cwd / last title' \
         --preview "$0 preview-window {1}" \
   )" || return 0
 
@@ -314,7 +330,7 @@ popup_picker() {
     | fzf "${fzf_common[@]}" \
         --with-nth=2.. --delimiter=$'\t' \
         --prompt='sessions> ' \
-        --header='enter: resume here   ctrl-n: new window   ctrl-w: new session   ctrl-y: copy uuid' \
+        --header=$'enter: resume here   ctrl-n: new window   ctrl-w: new session   ctrl-y: copy uuid   esc: back\nage         state  source    label' \
         --expect=ctrl-n,ctrl-w,ctrl-y \
         --preview "$0 preview-session $window_uuid {1}" \
   )" || return 0
