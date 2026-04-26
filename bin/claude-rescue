@@ -262,16 +262,14 @@ action_copy_uuid() {
 # Inner picker — runs inside the popup.
 
 popup_picker() {
-  # --layout=default puts the prompt + header + count at the BOTTOM of the
-  # popup, with the list growing upward. Action keys end up near the user's
-  # focus instead of at the top of the popup. Selected item is the row
-  # closest to the prompt.
+  # --reverse keeps the list at the top of the popup (where it dominates)
+  # with prompt + header just below. Hotkeys live in --header using compact
+  # glyph notation so they don't visually compete with the data rows.
   local fzf_common=(
     --ansi
-    --layout=default
+    --reverse
     --no-multi
     --header-lines=0
-    --header-first
     --preview-window=right:55%:wrap
   )
 
@@ -298,7 +296,7 @@ popup_picker() {
     | fzf "${fzf_common[@]}" \
         --with-nth=2.. --delimiter=$'\t' \
         --prompt='windows> ' \
-        --header=$'enter: drill in   esc: cancel\nage         sessions  window-name             cwd / last title' \
+        --header=$'↩ open · ⎋ cancel\nage         sessions  window-name             cwd / last title' \
         --preview "$0 preview-window {1}" \
   )" || return 0
 
@@ -330,7 +328,7 @@ popup_picker() {
     | fzf "${fzf_common[@]}" \
         --with-nth=2.. --delimiter=$'\t' \
         --prompt='sessions> ' \
-        --header=$'enter: resume here   ctrl-n: new window   ctrl-w: new session   ctrl-y: copy uuid   esc: back\nage         state  source    label' \
+        --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage         state  source    label' \
         --expect=ctrl-n,ctrl-w,ctrl-y \
         --preview "$0 preview-session $window_uuid {1}" \
   )" || return 0
