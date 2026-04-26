@@ -67,29 +67,35 @@ cmd_setup() {
 }
 JSON
 
-  # tmux config — separate resurrect dir, our rescue hooks, picker keybinding.
+  # tmux config — load the user's real ~/.tmux.conf for theme + keybindings,
+  # then override only what's needed for isolation.
   cat > "$STAGING_DIR/.config/tmux/staging.conf" <<TMUX
-# Staging tmux config — loads exactly what chezmoi-managed dot_tmux.conf
-# would load on your main system, but with isolated state.
+# Staging tmux config — loads your real ~/.tmux.conf (theme, plugins,
+# keybindings) and then overrides resurrect/continuum for isolation.
 
-set -g default-terminal "xterm-256color"
-set -g focus-events on
-set -g history-limit 50000
-set -g status on
-set -g status-right ' staging | %H:%M '
+# Pre-set @continuum-boot-started so your main config's if-shell sees
+# "boot already happened" and skips the auto-restore trigger. Without this,
+# main config's restore-wrapper would fire during source-file below and
+# pull in your real session state.
+set -g @continuum-boot-started 1
 
-# Staging-only resurrect state — does not touch your real ~/.local/share/tmux/resurrect/
+# Load your real config — theme, status bar position, TPM, plugins, keybindings.
+source-file -q "\$HOME/.tmux.conf"
+
+# Now override for staging isolation. These run AFTER ~/.tmux.conf so they win.
 set -g @resurrect-dir "$STAGING_DIR/resurrect"
 set -g @resurrect-capture-pane-contents 'on'
+set -g @continuum-restore 'off'
+set -g @continuum-save-interval '1'
 
-# Picker keybinding (prefix + R) — same as you'd want in your real config
+# Distinguishable status hint so you can tell staging from your main at a glance.
+set -ag status-right ' [staging]'
+
+# Picker keybinding
 bind R run-shell "claude-rescue"
 
-# Source claude-rescue hooks (PATH-resolved; uses claude-rescue-log on \$PATH)
+# claude-rescue hooks (sourced last so nothing in main config can clobber them).
 source-file -q "$REPO/tmux/rescue.tmux.conf"
-
-# Load tmux-resurrect from the user's TPM-managed plugin dir.
-run-shell "\$HOME/.config/tmux/plugins/tmux-resurrect/resurrect.tmux"
 TMUX
 
   echo "    staging dir ready"
@@ -129,7 +135,13 @@ TMUX
 }
 
 cmd_attach() {
-  exec tmux -L "$SOCK" attach
+  # Strip $TMUX so we don't nest-attach (which creates a separate session
+  # in the staging server). Always target the 'main' session we created.
+  if ! tmux -L "$SOCK" has-session -t main 2>/dev/null; then
+    echo "main session is gone — run 'setup' to recreate" >&2
+    exit 1
+  fi
+  exec env -u TMUX tmux -L "$SOCK" attach -t main
 }
 
 cmd_status() {

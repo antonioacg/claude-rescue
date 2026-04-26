@@ -292,16 +292,92 @@ log_no_tmux() {
 
 cmd_resurrect_save() {
   # Hooked into tmux-resurrect via @resurrect-hook-post-save-layout.
-  # Writes a sidecar TSV next to the resurrect state file containing every
-  # window's @claude-window-id (and any other user options worth surviving).
+  # Two jobs:
+  #   1. Write the @claude-window-id sidecar (so UUIDs survive a kill-server cycle).
+  #   2. Sample per-pane state and emit title transitions / pane-died events.
+  #      This replaces the pane-title-changed and pane-died tmux hooks, which
+  #      don't register at server-global scope on tmux 3.x. Granularity matches
+  #      the continuum save interval (typically 1 minute).
   local state_file="${1:-}"
   [ -n "$state_file" ] || return 0
   [ -f "$state_file" ] || return 0
+
+  # 1. Sidecar — preserves @claude-window-id across server restarts.
   local sidecar="${state_file%.txt}.claude-userops.tsv"
   tmux list-windows -aF $'#{session_name}\t#{window_index}\t#{window_name}\t#{@claude-window-id}' \
     | awk -F'\t' 'NF==4 && $4 != "" { print }' \
     > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
+
+  # 2. Per-pane sample — emit title transitions and detect pane death.
+  local snapshot_dir="$CLAUDE_RESCUE_HOME/tmp/last-pane-state"
+  mkdir -p "$snapshot_dir"
+  local current_panes_file="$snapshot_dir/.current-panes"
+  : > "$current_panes_file"
+
+  while IFS=$'\t' read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid; do
+    [ -z "$pane_id" ] && continue
+    [ -z "$window_uuid" ] && continue
+    printf '%s\n' "$pane_id" >> "$current_panes_file"
+
+    local san="${pane_id//[^A-Za-z0-9]/_}"
+    local last_file="$snapshot_dir/$san.last"
+    local prev_title=""
+    [ -f "$last_file" ] && prev_title="$(cat "$last_file" 2>/dev/null)"
+
+    if [ -n "$pane_title" ] && [ "$pane_title" != "$prev_title" ]; then
+      local session_id
+      session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+      append_event "$window_uuid" "$(jq -nc \
+        --arg ts "$(now_iso)" --arg t "$pane_title" --arg pane "$pane_id" \
+        --arg sid "${session_id:-}" \
+        '{ts:$ts, kind:"title", pane_id:$pane, title:$t} +
+         (if $sid == "" then {} else {session_id:$sid} end)')"
+      printf '%s' "$pane_title" > "$last_file"
+    fi
+  done < <(tmux list-panes -aF $'#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_title}\t#{pane_current_path}\t#{@claude-window-id}')
+
+  # 2b. Detect panes that disappeared since last sample (deferred pane-died).
+  local stale_pane
+  for stale_file in "$snapshot_dir"/*.last; do
+    [ -f "$stale_file" ] || continue
+    stale_pane="$(basename "$stale_file" .last)"
+    # Walk back to find the original pane_id by inverting the sanitization.
+    # Sanitization is one-way (multiple chars → underscore), so we record the
+    # full pane_id in a sidecar.
+    local owner_file="$snapshot_dir/$stale_pane.owner"
+    [ -f "$owner_file" ] || { rm -f "$stale_file"; continue; }
+    local original_pane_id
+    original_pane_id="$(cat "$owner_file")"
+    if ! grep -qxF "$original_pane_id" "$current_panes_file" 2>/dev/null; then
+      # Pane no longer exists; emit pane_died if we have a window UUID for it.
+      local last_window_uuid_file="$snapshot_dir/$stale_pane.window_uuid"
+      [ -f "$last_window_uuid_file" ] || { rm -f "$stale_file" "$owner_file"; continue; }
+      local last_window_uuid
+      last_window_uuid="$(cat "$last_window_uuid_file")"
+      append_event "$last_window_uuid" "$(jq -nc \
+        --arg ts "$(now_iso)" --arg pane "$original_pane_id" \
+        '{ts:$ts, kind:"pane_died", pane_id:$pane, source:"resurrect_sample"}')"
+      rm -f "$stale_file" "$owner_file" "$last_window_uuid_file"
+    fi
+  done
+
+  # 2c. Update owner + window_uuid sidecars for currently-live panes.
+  while IFS=$'\t' read -r pane_id _ _ _ _ _ window_uuid; do
+    [ -z "$pane_id" ] && continue
+    [ -z "$window_uuid" ] && continue
+    local san="${pane_id//[^A-Za-z0-9]/_}"
+    printf '%s' "$pane_id" > "$snapshot_dir/$san.owner"
+    printf '%s' "$window_uuid" > "$snapshot_dir/$san.window_uuid"
+  done < <(tmux list-panes -aF $'#{pane_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_title}\t#{pane_current_path}\t#{@claude-window-id}')
+
+  rm -f "$current_panes_file"
+
+  # 2d. Rebuild metas for any windows we touched.
+  for log in "$CLAUDE_RESCUE_HOME/windows/"*.jsonl; do
+    [ -f "$log" ] || continue
+    rebuild_meta "$(basename "$log" .jsonl)"
+  done
 }
 
 cmd_resurrect_restore() {
