@@ -195,11 +195,11 @@ preview_session() {
     | [.[] | select(.session_id == $sid)] as $sevents
     | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
     | ([$sevents[] | select(.kind | startswith("session_end"))][0].ts) as $send
-    | [$sevents[] | select(.kind | endswith("title"))] as $own_titles
+    | [$sevents[] | select(.kind | startswith("title"))] as $own_titles
     | (if ($own_titles | length) > 0
        then $own_titles
        else [.[] | select(.session_id == null
-                          and (.kind | endswith("title"))
+                          and (.kind | startswith("title"))
                           and ($sstart == null or .ts >= $sstart)
                           and ($send == null or .ts <= $send))]
        end) as $titles
@@ -235,15 +235,15 @@ humanize_age() {
 
 format_window_rows() {
   # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
-  # Display columns:  age          sessions  window-name              cwd-or-title
+  # Display columns:  age   #(right)  window-name(right)   cwd-or-title
   while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
     local age line cwd_short label
     age="$(humanize_age "$last_seen")"
     cwd_short="$(tildify "${cwd:-?}")"
     label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
     label="${label:-$cwd_short}"
-    line="$(printf '%-10s  %3s sess  %-22s  %s' \
-      "$age" "$scount" "${wname:-?}" "$label")"
+    line="$(printf '%-10s  %3s  %22s  %s' \
+      "$age" "$scount" "${wname:--}" "$label")"
     printf '%s\t%s\n' "$uuid" "$line"
   done
 }
@@ -349,7 +349,7 @@ popup_picker() {
       | fzf "${fzf_common[@]}" \
           --with-nth=2.. --delimiter=$'\t' \
           --prompt='windows> ' \
-          --header=$'↩ open · ⎋ cancel\nage         sessions  window-name             cwd / last title' \
+          --header=$'↩ open · ⎋ cancel\nage           #             window-name  cwd / last title' \
           --preview "$0 preview-window {1}" \
     )" || return 0
 

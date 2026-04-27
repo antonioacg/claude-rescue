@@ -223,10 +223,10 @@ rebuild_meta() {
               | .[0].first_user_message // null
             ),
             last_title: (
-              map(select(.kind | endswith("title")))
+              map(select(.kind | startswith("title")))
               | sort_by(.ts) | .[-1].title // null
             ),
-            title_count: (map(select(.kind | endswith("title"))) | length)
+            title_count: (map(select(.kind | startswith("title"))) | length)
           })
         | sort_by(.started // .ended // "") | reverse
       )
