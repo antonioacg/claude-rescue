@@ -137,6 +137,10 @@ tildify() {
 # unmodified title for data fidelity; this is display-only.
 format_title() {
   local window_name="$1" pane_command="$2" pane_title="$3"
+  # Backfilled events don't carry pane_command separately. window_name there
+  # is = pane_current_command (per the backfill fix), so substituting it in
+  # gives the formatter the same view it'd have for a live pane.
+  [ -z "$pane_command" ] && pane_command="$window_name"
   if [ -n "${CLAUDE_RESCUE_TITLE_FORMATTER:-}" ] && [ -x "$CLAUDE_RESCUE_TITLE_FORMATTER" ]; then
     local out
     out="$("$CLAUDE_RESCUE_TITLE_FORMATTER" \
@@ -190,13 +194,15 @@ preview_session() {
   # event — they were derived from sampling). To produce a meaningful title
   # timeline for a backfilled session, fall back to all window-level title
   # events whose timestamp falls between this session's start and end.
-  # Pre-strip leading glyphs (✳, ⠂, ⠐ …) from titles via jq's sub. Keeps the
-  # display consistent with format_title's default behaviour. Configured
-  # external CLAUDE_RESCUE_TITLE_FORMATTER doesn't affect the preview pane —
-  # that's a deliberate trade-off: invoking the formatter per title would
-  # mean N forks per preview render. Default regex covers the common case.
+  # Header (static fields). $window_name pulled from the rollup meta — used
+  # below to feed the title formatter for both header context and history.
+  local window_name=""
+  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
+  if [ -f "$meta" ]; then
+    window_name="$(jq -r '.window_name // ""' "$meta" 2>/dev/null)"
+  fi
+
   jq -rs --arg sid "$session_id" '
-    def strip_glyphs: sub("^[^ -~]+ +"; "");
     . as $all
     | [.[] | select(.session_id == $sid)] as $sevents
     | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
@@ -217,9 +223,49 @@ preview_session() {
       "First:   \(([$sevents[] | select(.first_user_message != null)][0].first_user_message) // "(none)")",
       "",
       "Title history (\($titles | length)):",
-      "",
-      ($titles[] | "  \(.ts)  \(.title | strip_glyphs)")
+      ""
   ' "$log"
+
+  # Title rows — emit raw <ts>\t<title> from jq, then run each title through
+  # format_title (which honours $CLAUDE_RESCUE_TITLE_FORMATTER if set, falls
+  # back to the built-in glyph strip). One fork per unique title; identical
+  # titles get cached in a tempdir keyed by SHA so heavy histories stay fast.
+  local cache_dir
+  cache_dir="$(mktemp -d -t cr-fmt.XXXXXX)"
+  trap "rm -rf '$cache_dir'" RETURN
+
+  jq -rs --arg sid "$session_id" '
+    . as $all
+    | [.[] | select(.session_id == $sid)] as $sevents
+    | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
+    | ([$sevents[] | select(.kind | startswith("session_end"))][0].ts) as $send
+    | [$sevents[] | select(.kind | startswith("title"))] as $own_titles
+    | (if ($own_titles | length) > 0
+       then $own_titles
+       else [.[] | select(.session_id == null
+                          and (.kind | startswith("title"))
+                          and ($sstart == null or .ts >= $sstart)
+                          and ($send == null or .ts <= $send))]
+       end)
+    | .[] | "\(.ts)\t\(.window_name // "")\t\(.title)"
+  ' "$log" \
+  | while IFS=$'\t' read -r ts ev_wname raw_title; do
+      [ -z "$raw_title" ] && continue
+      # Use the window_name AT THE TIME of the title event when present.
+      # Falls back to the window's rollup name (from meta) for live events
+      # which we don't currently re-stamp on every sample.
+      local effective_wname="${ev_wname:-$window_name}"
+      local cache_key cache_file formatted
+      cache_key="$(printf '%s|%s' "$effective_wname" "$raw_title" | shasum | cut -c1-12)"
+      cache_file="$cache_dir/$cache_key"
+      if [ -f "$cache_file" ]; then
+        formatted="$(cat "$cache_file")"
+      else
+        formatted="$(format_title "$effective_wname" "" "$raw_title")"
+        printf '%s' "$formatted" > "$cache_file"
+      fi
+      printf '  %s  %s\n' "$ts" "$formatted"
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -258,11 +304,11 @@ format_session_rows() {
   # Reads list_sessions_tsv (US-separated) on stdin, emits "session_id<TAB>display" rows.
   # Columns: age(8L) state(5L) source(15L) label
   local US=$'\x1f'
-  while IFS="$US" read -r sid started ended cwd pane source last_title; do
+  while IFS="$US" read -r sid started ended cwd pane source wname last_title; do
     local age status line label
     age="$(humanize_age "${started:-$ended}")"
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
-    label="${last_title:+$(format_title "" "" "$last_title")}"
+    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
     label="${label:-(no title)}"
     line="$(printf '%-8s %-5s %-15s %s' \
       "$age" "$status" "${source:--}" "$label")"
