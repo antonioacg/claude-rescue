@@ -62,21 +62,24 @@ list_windows_tsv() {
     done
 }
 
-# TSV columns: session_id \t started \t ended \t cwd \t pane_id \t source \t label
+# Columns: session_id ⎵ started ⎵ ended ⎵ cwd ⎵ pane_id ⎵ source ⎵ label
+# Separator is ASCII unit-separator (\x1f), NOT tab. bash's `read` collapses
+# consecutive whitespace IFS chars (tabs included), which silently drops empty
+# fields and shifts the rest. Non-whitespace IFS preserves them.
 # `label` falls back: last_title → first_user_message → empty.
 list_sessions_tsv() {
   local window_uuid="$1"
   local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
   [ -f "$meta" ] || return 0
-  jq -r '.sessions // [] | .[] | [
-    .session_id,
-    (.started // ""),
-    (.ended // ""),
-    (.cwd // ""),
-    (.pane_id // ""),
-    (.source // ""),
-    (.last_title // (.first_user_message // "")[:80])
-  ] | @tsv' "$meta"
+  jq -r '
+    def US: "";
+    .sessions // [] | .[] |
+      [
+        .session_id, (.started // ""), (.ended // ""),
+        (.cwd // ""), (.pane_id // ""), (.source // ""),
+        (.last_title // (.first_user_message // "")[:80])
+      ] | join(US)
+  ' "$meta"
 }
 
 preview_window() {
@@ -178,18 +181,26 @@ preview_session() {
   local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
   [ -f "$log" ] || { echo "(no log)"; return 0; }
 
-  # Backfill events have no session_id on title events (window-level only).
-  # Fall back to all-window-titles for the title timeline of a backfilled session.
+  # Backfilled title events aren't session-attributed (no session_id on the
+  # event — they were derived from sampling). To produce a meaningful title
+  # timeline for a backfilled session, fall back to all window-level title
+  # events whose timestamp falls between this session's start and end.
   jq -rs --arg sid "$session_id" '
     . as $all
     | [.[] | select(.session_id == $sid)] as $sevents
-    | (if ($sevents | map(select(.kind | startswith("session_start"))) | length) == 0
-       then [.[] | select(.session_id == null and (.kind | endswith("title")))]
-       else [$sevents[] | select(.kind | endswith("title"))]
+    | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
+    | ([$sevents[] | select(.kind | startswith("session_end"))][0].ts) as $send
+    | [$sevents[] | select(.kind | endswith("title"))] as $own_titles
+    | (if ($own_titles | length) > 0
+       then $own_titles
+       else [.[] | select(.session_id == null
+                          and (.kind | endswith("title"))
+                          and ($sstart == null or .ts >= $sstart)
+                          and ($send == null or .ts <= $send))]
        end) as $titles
     | "Session: \($sid)",
-      "Started: \(([$sevents[] | select(.kind | startswith("session_start"))][0].ts) // "?")",
-      "Ended:   \(([$sevents[] | select(.kind | startswith("session_end"))][0].ts) // "(open)")",
+      "Started: \($sstart // "?")",
+      "Ended:   \($send // "(open)")",
       "Cwd:     \((([$sevents[] | select(.cwd != null and .cwd != "")][0].cwd) // "?") | sub("^" + env.HOME; "~"))",
       "Source:  \(([$sevents[] | select(.source != null)][0].source) // "?")",
       "First:   \(([$sevents[] | select(.first_user_message != null)][0].first_user_message) // "(none)")",
@@ -233,15 +244,16 @@ format_window_rows() {
 }
 
 format_session_rows() {
-  # Reads list_sessions_tsv on stdin, emits "session_id<TAB>display" rows.
+  # Reads list_sessions_tsv (US-separated) on stdin, emits "session_id<TAB>display" rows.
   # Display columns:  age          state   source     label
-  while IFS=$'\t' read -r sid started ended cwd pane source last_title; do
+  local US=$'\x1f'
+  while IFS="$US" read -r sid started ended cwd pane source last_title; do
     local age status line label
     age="$(humanize_age "${started:-$ended}")"
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
     label="${last_title:+$(format_title "" "" "$last_title")}"
     label="${label:-(no title)}"
-    line="$(printf '%-10s  %-5s  %-8s  %s' \
+    line="$(printf '%-10s  %-5s  %-16s  %s' \
       "$age" "$status" "${source:-?}" "$label")"
     printf '%s\t%s\n' "$sid" "$line"
   done
@@ -324,63 +336,75 @@ popup_picker() {
     return 1
   fi
 
-  level1_out="$(printf '%s\n' "$rows" \
-    | fzf "${fzf_common[@]}" \
-        --with-nth=2.. --delimiter=$'\t' \
-        --prompt='windows> ' \
-        --header=$'↩ open · ⎋ cancel\nage         sessions  window-name             cwd / last title' \
-        --preview "$0 preview-window {1}" \
-  )" || return 0
+  # Loop level 1 ↔ level 2 so esc at level 2 returns to level 1 (esc at
+  # level 1 exits the popup as expected).
+  while true; do
+    local level1_out window_uuid
+    level1_out="$(printf '%s\n' "$rows" \
+      | fzf "${fzf_common[@]}" \
+          --with-nth=2.. --delimiter=$'\t' \
+          --prompt='windows> ' \
+          --header=$'↩ open · ⎋ cancel\nage         sessions  window-name             cwd / last title' \
+          --preview "$0 preview-window {1}" \
+    )" || return 0
 
-  local window_uuid
-  window_uuid="$(printf '%s' "$level1_out" | cut -f1)"
-  [ -z "$window_uuid" ] && return 0
+    window_uuid="$(printf '%s' "$level1_out" | cut -f1)"
+    [ -z "$window_uuid" ] && return 0
 
-  # Scrollback fallback: virtual row encodes uuid in the first field as
-  # "scrollback:<session_uuid>". Resume directly without level 2.
-  if [[ "$window_uuid" == scrollback:* ]]; then
-    local sid="${window_uuid#scrollback:}"
+    # Scrollback fallback: virtual row encodes uuid in the first field as
+    # "scrollback:<session_uuid>". Resume directly without level 2.
+    if [[ "$window_uuid" == scrollback:* ]]; then
+      local sid="${window_uuid#scrollback:}"
+      local cwd
+      cwd="$(scrollback_resolve | awk -F'\t' -v u="$sid" '$1==u {print $2; exit}')"
+      [ -z "$cwd" ] && cwd="$HOME"
+      action_resume_here "$sid" "$cwd"
+      return 0
+    fi
+
+    # --- Level 2: sessions of selected window ---
+    local s_rows
+    s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
+    if [ -z "$s_rows" ]; then
+      echo "(no sessions in window $window_uuid)" >&2
+      return 1
+    fi
+
+    local level2_out key sid
+    level2_out="$(printf '%s\n' "$s_rows" \
+      | fzf "${fzf_common[@]}" \
+          --with-nth=2.. --delimiter=$'\t' \
+          --prompt='sessions> ' \
+          --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage         state  source            label' \
+          --expect=ctrl-n,ctrl-w,ctrl-y \
+          --preview "$0 preview-session $window_uuid {1}" \
+    )" \
+      && break_inner=1 \
+      || break_inner=0
+
+    if [ "$break_inner" -eq 0 ]; then
+      # esc at level 2 → loop back to level 1
+      continue
+    fi
+
+    key="$(printf '%s' "$level2_out" | sed -n 1p)"
+    sid="$(printf '%s' "$level2_out" | sed -n 2p | cut -f1)"
+    [ -z "$sid" ] && continue
+
     local cwd
-    cwd="$(scrollback_resolve | awk -F'\t' -v u="$sid" '$1==u {print $2; exit}')"
+    cwd="$(jq -r --arg sid "$sid" \
+      '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
+      "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
     [ -z "$cwd" ] && cwd="$HOME"
-    action_resume_here "$sid" "$cwd"
+
+    case "$key" in
+      ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
+      ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
+      ctrl-y) action_copy_uuid "$sid" ;;
+      *)      action_resume_here "$sid" "$cwd" ;;
+    esac
     return 0
-  fi
-
-  # --- Level 2: sessions of selected window ---
-  local s_rows
-  s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
-  if [ -z "$s_rows" ]; then
-    echo "(no sessions in window $window_uuid)" >&2
-    return 1
-  fi
-
-  local level2_out key sid
-  level2_out="$(printf '%s\n' "$s_rows" \
-    | fzf "${fzf_common[@]}" \
-        --with-nth=2.. --delimiter=$'\t' \
-        --prompt='sessions> ' \
-        --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage         state  source    label' \
-        --expect=ctrl-n,ctrl-w,ctrl-y \
-        --preview "$0 preview-session $window_uuid {1}" \
-  )" || return 0
-
-  key="$(printf '%s' "$level2_out" | sed -n 1p)"
-  sid="$(printf '%s' "$level2_out" | sed -n 2p | cut -f1)"
-  [ -z "$sid" ] && return 0
-
-  local cwd
-  cwd="$(jq -r --arg sid "$sid" \
-    '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
-    "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
-  [ -z "$cwd" ] && cwd="$HOME"
-
-  case "$key" in
-    ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
-    ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
-    ctrl-y) action_copy_uuid "$sid" ;;
-    *)      action_resume_here "$sid" "$cwd" ;;
-  esac
+  done
 }
 
 # ---------------------------------------------------------------------------
