@@ -95,7 +95,6 @@ preview_window() {
   jq -r '
     def tildify: sub("^" + env.HOME; "~");
     def strip_glyphs: sub("^[^ -~]+ +"; "");
-    "Window: \(.window_uuid)",
     "Path:   \((.primary_cwd // "?") | tildify)",
     "Range:  \(.first_seen // "?") → \(.last_seen // "?")",
     "",
@@ -287,15 +286,17 @@ humanize_age() {
 
 format_window_rows() {
   # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
-  # Columns: age(8L) #(2R) window-name(8R) label
+  # Columns: age(8L) #(3R) label
+  # The label column uses the configured title formatter, which already
+  # encodes window_name (e.g. "Implement storage… - claude"), so a separate
+  # window column would be redundant.
   while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
     local age line cwd_short label
     age="$(humanize_age "$last_seen")"
     cwd_short="$(tildify "${cwd:-?}")"
     label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
     label="${label:-$cwd_short}"
-    line="$(printf '%-8s %3s %8s  %s' \
-      "$age" "$scount" "${wname:- }" "$label")"
+    line="$(printf '%-8s %3s  %s' "$age" "$scount" "$label")"
     printf '%s\t%s\n' "$uuid" "$line"
   done
 }
@@ -401,7 +402,7 @@ popup_picker() {
       | fzf "${fzf_common[@]}" \
           --with-nth=2.. --delimiter=$'\t' \
           --prompt='windows> ' \
-          --header=$'↩ open · ⎋ cancel\nage        #   window  cwd / last title' \
+          --header=$'↩ open · ⎋ cancel\nage        #   label' \
           --preview "$0 preview-window {1}" \
     )" || return 0
 

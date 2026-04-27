@@ -189,7 +189,8 @@ rebuild_meta() {
   local tmp
   tmp="$(mktemp "$meta.XXXXXX")"
   jq -s --arg uuid "$window_uuid" '
-    {
+    . as $all
+    | {
       window_uuid: $uuid,
       first_seen: (map(.ts) | min),
       last_seen:  (map(.ts) | max),
@@ -208,29 +209,92 @@ rebuild_meta() {
       sessions: (
         [.[] | select(.session_id != null)]
         | group_by(.session_id)
-        | map({
-            session_id: .[0].session_id,
-            started:      (map(select(.kind | startswith("session_start"))) | .[0].ts // null),
-            ended:        (map(select(.kind | startswith("session_end")))   | .[0].ts // null),
-            cwd:          (map(select(.cwd != null and .cwd != "")) | .[0].cwd // null),
-            pane_id:      (map(select(.pane_id != null)) | .[0].pane_id // null),
-            source:       (map(select(.source != null)) | .[0].source // null),
-            session_name: (map(select(.session_name != null and .session_name != "")) | .[0].session_name // null),
-            window_name:  (map(select(.window_name != null and .window_name != ""))   | .[0].window_name // null),
-            transcript_path: (map(select(.transcript_path != null)) | .[0].transcript_path // null),
-            first_user_message: (
-              map(select(.first_user_message != null and .first_user_message != ""))
-              | .[0].first_user_message // null
-            ),
-            last_title: (
-              map(select(.kind | startswith("title")))
-              | sort_by(.ts) | .[-1].title // null
-            ),
-            title_count: (map(select(.kind | startswith("title"))) | length)
-          })
+        | map(
+            {
+              session_id: .[0].session_id,
+              started:      (map(select(.kind | startswith("session_start"))) | .[0].ts // null),
+              ended:        (map(select(.kind | startswith("session_end")))   | .[0].ts // null),
+              cwd:          (map(select(.cwd != null and .cwd != "")) | .[0].cwd // null),
+              pane_id:      (map(select(.pane_id != null)) | .[0].pane_id // null),
+              source:       (map(select(.source != null)) | .[0].source // null),
+              session_name: (map(select(.session_name != null and .session_name != "")) | .[0].session_name // null),
+              window_name:  (map(select(.window_name != null and .window_name != ""))   | .[0].window_name // null),
+              transcript_path: (map(select(.transcript_path != null)) | .[0].transcript_path // null),
+              first_user_message: (
+                map(select(.first_user_message != null and .first_user_message != ""))
+                | .[0].first_user_message // null
+              ),
+              own_titles: (
+                map(select(.kind | startswith("title")))
+                | sort_by(.ts)
+              )
+            }
+            | . + (
+                # Fall back to window-level title events (no session_id)
+                # within this session''s [started, ended] window when the
+                # session itself has no own title events. Keeps backfilled
+                # sessions from showing "(no title)" when the window-level
+                # timeline obviously covers them.
+                if (.own_titles | length) > 0
+                then {
+                  last_title:  (.own_titles | .[-1].title // null),
+                  title_count: (.own_titles | length)
+                }
+                else
+                  ($all
+                    | map(select(
+                        (.kind | startswith("title"))
+                        and (.session_id == null or .session_id == "")
+                        and (. as $e | ($e.ts >= (.started // $e.ts)))
+                      ))
+                    | map(select(
+                        (.session_id == null or .session_id == "")
+                      ))
+                  ) as $win_titles
+                  |
+                  {
+                    last_title: (
+                      [
+                        $win_titles[]
+                        | select(
+                            (.ts >= (.started // .ts))
+                          )
+                      ]
+                      | (map(.title)) as $titles
+                      | $titles[-1] // null
+                    ),
+                    title_count: 0
+                  }
+                end
+              )
+            | del(.own_titles)
+          )
         | sort_by(.started // .ended // "") | reverse
       )
     }
+    | . + {
+        # Apply per-session window-title fallback now that started/ended are known.
+        sessions: (
+          .sessions | map(
+            . as $s
+            | if .last_title != null then .
+              else
+                . + {
+                  last_title: (
+                    $all
+                    | [.[] | select(
+                        (.kind | startswith("title"))
+                        and (.session_id == null or .session_id == "")
+                        and ($s.started == null or .ts >= $s.started)
+                        and ($s.ended   == null or .ts <= $s.ended)
+                      )]
+                    | sort_by(.ts) | .[-1].title // null
+                  )
+                }
+              end
+          )
+        )
+      }
   ' "$log" > "$tmp"
   mv "$tmp" "$meta"
 }
