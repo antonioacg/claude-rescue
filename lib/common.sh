@@ -1,18 +1,40 @@
 # Shared helpers for claude-rescue scripts. Source from bin/* and tmux/hooks/*.
 # Requires bash, jq, uuidgen, tmux.
+#
+# Storage layout (XDG-style):
+#   $CLAUDE_RESCUE_CONFIG_HOME — config file (config.sh, sourced if present)
+#     default: ${XDG_CONFIG_HOME:-~/.config}/claude-rescue
+#   $CLAUDE_RESCUE_DATA_HOME — durable event logs, indexes
+#     default: ${XDG_DATA_HOME:-~/.local/share}/claude-rescue
+#   $CLAUDE_RESCUE_CACHE_HOME — ephemeral state, error logs, sample cache
+#     default: ${XDG_CACHE_HOME:-~/.cache}/claude-rescue
 
-CLAUDE_RESCUE_HOME="${CLAUDE_RESCUE_HOME:-$HOME/.claude-rescue}"
-RESCUE_DIRS=(
-  "$CLAUDE_RESCUE_HOME"
-  "$CLAUDE_RESCUE_HOME/windows"
-  "$CLAUDE_RESCUE_HOME/tmp"
-  "$CLAUDE_RESCUE_HOME/stopped"
-  "$CLAUDE_RESCUE_HOME/no-tmux"
+CLAUDE_RESCUE_CONFIG_HOME="${CLAUDE_RESCUE_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-rescue}"
+
+# Source user config file if present. Allowed to override the data/cache homes
+# below, and to set $CLAUDE_RESCUE_TITLE_FORMATTER and other tunables.
+if [ -f "$CLAUDE_RESCUE_CONFIG_HOME/config.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$CLAUDE_RESCUE_CONFIG_HOME/config.sh"
+fi
+
+CLAUDE_RESCUE_DATA_HOME="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
+CLAUDE_RESCUE_CACHE_HOME="${CLAUDE_RESCUE_CACHE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-rescue}"
+
+RESCUE_DATA_DIRS=(
+  "$CLAUDE_RESCUE_DATA_HOME"
+  "$CLAUDE_RESCUE_DATA_HOME/windows"
+  "$CLAUDE_RESCUE_DATA_HOME/no-tmux"
+)
+RESCUE_CACHE_DIRS=(
+  "$CLAUDE_RESCUE_CACHE_HOME"
+  "$CLAUDE_RESCUE_CACHE_HOME/tmp"
+  "$CLAUDE_RESCUE_CACHE_HOME/stopped"
 )
 
 ensure_dirs() {
   local d
-  for d in "${RESCUE_DIRS[@]}"; do
+  for d in "${RESCUE_DATA_DIRS[@]}" "${RESCUE_CACHE_DIRS[@]}"; do
     [ -d "$d" ] || mkdir -p "$d"
   done
 }
@@ -20,17 +42,15 @@ ensure_dirs() {
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 log_err() {
-  # Write to the err file directly. tmux's run-shell -b swallows stderr, so
-  # relying on >&2 alone hides errors from hook contexts. ensure_dirs has
-  # already created CLAUDE_RESCUE_HOME by the time anything calls this.
-  local err_file="$CLAUDE_RESCUE_HOME/rescue-log.err"
+  # tmux's run-shell -b swallows stderr; write directly to a file in cache.
+  local err_file="$CLAUDE_RESCUE_CACHE_HOME/rescue-log.err"
   printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >> "$err_file"
 }
 
 # Atomic JSONL append. Lines under PIPE_BUF (typically 512+ bytes) are atomic.
 append_event() {
   local window_uuid="$1" json="$2"
-  printf '%s\n' "$json" >> "$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
+  printf '%s\n' "$json" >> "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
 }
 
 # tmux helpers ----------------------------------------------------------------
@@ -56,7 +76,7 @@ tmux_pane_info() {
 # Empty result if no match.
 heal_lookup() {
   local window_name="$1" cwd="$2"
-  local idx="$CLAUDE_RESCUE_HOME/index.jsonl"
+  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
   [ -f "$idx" ] || return 0
   jq -rs --arg wn "$window_name" --arg cwd "$cwd" '
     map(select(.window_name == $wn and .primary_cwd == $cwd))
@@ -70,7 +90,7 @@ acquire_window_lock() {
   local session_name="$1" window_name="$2"
   local key lockdir elapsed=0 timeout_ds=100  # 10 s in deciseconds
   key="$(printf '%s|%s' "$session_name" "$window_name" | shasum | cut -c1-12)"
-  lockdir="$CLAUDE_RESCUE_HOME/tmp/wlock-$key"
+  lockdir="$CLAUDE_RESCUE_CACHE_HOME/tmp/wlock-$key"
   while ! mkdir "$lockdir" 2>/dev/null; do
     sleep 0.1
     elapsed=$((elapsed + 1))
@@ -141,7 +161,7 @@ ensure_window_uuid() {
 # Update index.jsonl entry for window_uuid (last_seen, latest session_name/window_name/cwd).
 update_index() {
   local window_uuid="$1" session_name="$2" window_name="$3" cwd="$4"
-  local idx="$CLAUDE_RESCUE_HOME/index.jsonl"
+  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
   local tmp
   tmp="$(mktemp "$idx.XXXXXX")"
   {
@@ -163,8 +183,8 @@ update_index() {
 # event AND its `_backfill` sibling.
 rebuild_meta() {
   local window_uuid="$1"
-  local log="$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
-  local meta="$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json"
+  local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
+  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
   [ -f "$log" ] || return 0
   local tmp
   tmp="$(mktemp "$meta.XXXXXX")"

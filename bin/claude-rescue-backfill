@@ -11,7 +11,7 @@
 #   2. ~/.claude/projects/<encoded-cwd>/<session>.jsonl
 #      → confirms a session_id is real and gives a first-user-message label
 #
-# Idempotent: writes a marker $CLAUDE_RESCUE_HOME/.backfill-done with the
+# Idempotent: writes a marker $CLAUDE_RESCUE_DATA_HOME/.backfill-done with the
 # highest snapshot timestamp processed. Re-running skips already-covered files.
 #
 # Synthesized events get kind suffixed _backfill to distinguish from observed.
@@ -33,7 +33,7 @@ ensure_dirs
 
 RESURRECT_DIR="${CLAUDE_RESCUE_RESURRECT_DIR:-$HOME/.local/share/tmux/resurrect/default}"
 PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
-MARKER="$CLAUDE_RESCUE_HOME/.backfill-done"
+MARKER="$CLAUDE_RESCUE_DATA_HOME/.backfill-done"
 MAX_SNAPSHOTS="${CLAUDE_RESCUE_MAX_SNAPSHOTS:-0}"  # 0 = unbounded
 
 WORK_DIR="$(mktemp -d -t bf-work.XXXXXX)"
@@ -132,7 +132,7 @@ LC_ALL=C sort -t $'\t' -k2,2 -k3,3n -k4,4n -k1,1 "$panes_tsv" > "$panes_sorted"
 # where XXXXXXXX is a hex CRC32-like hash. Awk can compute a simple FNV-1a 32-bit.
 
 events_jsonl="$WORK_DIR/events.jsonl"
-awk -F'\t' -v outdir="$CLAUDE_RESCUE_HOME/windows" '
+awk -F'\t' -v outdir="$CLAUDE_RESCUE_DATA_HOME/windows" '
   # djb2 — multiplicative hash, no bitwise ops needed (BSD awk has no XOR).
   function djb2(s,    h, i) {
     h = 5381
@@ -221,7 +221,7 @@ awk -F'\t' -v outdir="$CLAUDE_RESCUE_HOME/windows" '
   }
 ' "$panes_sorted"
 
-events_total="$(find "$CLAUDE_RESCUE_HOME/windows" -name "*.jsonl" 2>/dev/null \
+events_total="$(find "$CLAUDE_RESCUE_DATA_HOME/windows" -name "*.jsonl" 2>/dev/null \
                 | xargs wc -l 2>/dev/null | awk '/total/ {print $1; exit}' \
                 | grep -E '^[0-9]+$' || echo 0)"
 echo "  emitted ~$events_total events into per-window logs" >&2
@@ -235,7 +235,7 @@ resolve_cache="$WORK_DIR/resolve.cache"
 : > "$resolve_cache"
 
 # Collect every unique session_id we emitted.
-sids="$(find "$CLAUDE_RESCUE_HOME/windows" -name "*.jsonl" 2>/dev/null \
+sids="$(find "$CLAUDE_RESCUE_DATA_HOME/windows" -name "*.jsonl" 2>/dev/null \
         | xargs grep -h '"kind":"session_start_backfill"' 2>/dev/null \
         | grep -oE '"session_id":"[0-9a-f-]{36}"' \
         | grep -oE '[0-9a-f-]{36}' \
@@ -266,7 +266,7 @@ echo "  $resolved sessions found in ~/.claude/projects/" >&2
 if [ -s "$resolve_cache" ]; then
   while IFS=$'\t' read -r sid cwd msg; do
     # Find which window log(s) reference this session_id.
-    matching=$(grep -lE "\"session_id\":\"$sid\"" "$CLAUDE_RESCUE_HOME/windows/"*.jsonl 2>/dev/null || true)
+    matching=$(grep -lE "\"session_id\":\"$sid\"" "$CLAUDE_RESCUE_DATA_HOME/windows/"*.jsonl 2>/dev/null || true)
     [ -z "$matching" ] && continue
     while IFS= read -r log; do
       [ -z "$log" ] && continue
@@ -282,11 +282,11 @@ fi
 # Pass 5: rebuild meta + index for every touched window.
 
 echo "  rebuilding meta + index..." >&2
-for log in "$CLAUDE_RESCUE_HOME/windows/"*.jsonl; do
+for log in "$CLAUDE_RESCUE_DATA_HOME/windows/"*.jsonl; do
   [ -f "$log" ] || continue
   uuid="$(basename "$log" .jsonl)"
   rebuild_meta "$uuid"
-  meta="$CLAUDE_RESCUE_HOME/windows/$uuid.meta.json"
+  meta="$CLAUDE_RESCUE_DATA_HOME/windows/$uuid.meta.json"
   [ -f "$meta" ] || continue
   sn="$(jq -r '.session_name // ""' "$meta")"
   wn="$(jq -r '.window_name // ""' "$meta")"
@@ -305,4 +305,4 @@ new_max="$(awk '
 ' "$snapshot_list")"
 [ -n "$new_max" ] && printf '%s' "$new_max" > "$MARKER"
 
-echo "backfill complete. windows indexed: $(wc -l < "$CLAUDE_RESCUE_HOME/index.jsonl" 2>/dev/null | tr -d ' ' || echo 0)" >&2
+echo "backfill complete. windows indexed: $(wc -l < "$CLAUDE_RESCUE_DATA_HOME/index.jsonl" 2>/dev/null | tr -d ' ' || echo 0)" >&2

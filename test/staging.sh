@@ -105,10 +105,11 @@ TMUX
   if tmux -L "$SOCK" has-session 2>/dev/null; then
     echo "    server already running"
   else
-    CLAUDE_RESCUE_HOME="$DATA_DIR" PATH="$HOME/.local/bin:$PATH" \
+    CLAUDE_RESCUE_DATA_HOME="$DATA_DIR" CLAUDE_RESCUE_CACHE_HOME="$DATA_DIR/cache" PATH="$HOME/.local/bin:$PATH" \
       tmux -L "$SOCK" -f "$STAGING_DIR/.config/tmux/staging.conf" \
         new-session -d -s main -c "$STAGING_DIR" -x 200 -y 50
-    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HOME "$DATA_DIR"
+    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_DATA_HOME "$DATA_DIR"
+    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$DATA_DIR/cache"
     tmux -L "$SOCK" set-environment -g PATH "$HOME/.local/bin:$PATH"
     echo "    started"
   fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a command against an isolated tmux server with a fresh CLAUDE_RESCUE_HOME.
+# Run a command against an isolated tmux server with a fresh CLAUDE_RESCUE_DATA_HOME.
 #
 # Usage:
 #   test/run-isolated.sh <subcommand> [args...]
@@ -10,7 +10,7 @@
 #   send <target> <keys>   tmux send-keys -t <target> <keys> Enter
 #   exec <args...>         tmux -L <socket> <args...>  (raw passthrough)
 #   shell                  Attach interactively (foreground).
-#   home                   Print the active CLAUDE_RESCUE_HOME path.
+#   home                   Print the active CLAUDE_RESCUE_DATA_HOME path.
 #
 # Env:
 #   CLAUDE_RESCUE_REPO     Path to the repo (defaults to the script's parent).
@@ -44,13 +44,14 @@ cmd_start() {
   echo "$home" > "$HOME_FILE"
   # CLAUDE_RESCUE_REPO is exported only so test.conf can locate rescue.tmux.conf
   # in the dev tree; the rescue config itself uses bare command names (PATH).
-  CLAUDE_RESCUE_HOME="$home" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
+  CLAUDE_RESCUE_DATA_HOME="$home" CLAUDE_RESCUE_CACHE_HOME="$home/cache" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
     tmux -L "$SOCK" -f "$REPO/tmux/test/test.conf" \
       new-session -d -s t1 -x 200 -y 50
-  tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HOME "$home"
+  tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_DATA_HOME "$home"
+  tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$home/cache"
   tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_REPO "$REPO"
   tmux -L "$SOCK" set-environment -g PATH "$REPO/bin:$PATH"
-  echo "started '$SOCK' with CLAUDE_RESCUE_HOME=$home" >&2
+  echo "started '$SOCK' with CLAUDE_RESCUE_DATA_HOME=$home" >&2
 }
 
 cmd_stop() {

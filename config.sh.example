@@ -1,0 +1,38 @@
+# claude-rescue config — copy to $XDG_CONFIG_HOME/claude-rescue/config.sh
+# (default: ~/.config/claude-rescue/config.sh).
+#
+# Sourced by every claude-rescue-* binary on startup. All values are
+# optional; the defaults are sensible for most setups.
+
+# --- Title formatter plugin -------------------------------------------------
+# An external executable that takes four positional args
+#     <window_name> <pane_command> <pane_title> <host_short>
+# and prints a single-line label to stdout. Used by the picker to format
+# session labels in the list views; falls back to a built-in
+# strip-spinner-glyph regex if unset, missing, or returning empty.
+#
+# Example: delegate to the same script your tmux status bar uses, so the
+# picker labels match what you see in the status line.
+#
+# CLAUDE_RESCUE_TITLE_FORMATTER="$HOME/.config/tmux/scripts/window-label.sh"
+# (note: the user's window-label.sh expects 'mode' as arg 1 — use a tiny
+# wrapper if the signature doesn't match: mode=title, then your real script.)
+
+# --- Persistence overrides --------------------------------------------------
+# Default to XDG_DATA_HOME / XDG_CACHE_HOME if unset.
+
+# CLAUDE_RESCUE_DATA_HOME="$HOME/.local/share/claude-rescue"
+# CLAUDE_RESCUE_CACHE_HOME="$HOME/.cache/claude-rescue"
+
+# --- SIGSTOP layer (opt-in; uncomment hooks in tmux/rescue.tmux.conf) ------
+
+# CLAUDE_RESCUE_STOP_DELAY=300                         # seconds idle before STOP
+# CLAUDE_RESCUE_STOP_DEFER_TIMES=3                      # spinner-defer cycles
+# CLAUDE_RESCUE_STOP_DEFER_SECONDS=60                   # seconds per defer
+# CLAUDE_RESCUE_TARGET_COMM=claude                      # process name to STOP
+
+# --- Backfill -----------------------------------------------------------------
+
+# CLAUDE_RESCUE_RESURRECT_DIR="$HOME/.local/share/tmux/resurrect/default"
+# CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+# CLAUDE_RESCUE_MAX_SNAPSHOTS=0                         # 0 = unbounded

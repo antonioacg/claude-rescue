@@ -41,13 +41,13 @@ ensure_dirs
 
 # TSV columns: uuid \t last_seen \t session_count \t window_name \t primary_cwd \t last_title
 list_windows_tsv() {
-  local idx="$CLAUDE_RESCUE_HOME/index.jsonl"
+  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
   [ -f "$idx" ] || return 0
 
   # Build a list of (uuid, last_seen) from index.jsonl, sorted by last_seen desc.
   jq -rs 'sort_by(.last_seen) | reverse | .[] | [.window_uuid, .last_seen, .window_name, .primary_cwd] | @tsv' "$idx" \
   | while IFS=$'\t' read -r uuid last_seen wname cwd; do
-      local meta="$CLAUDE_RESCUE_HOME/windows/$uuid.meta.json"
+      local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$uuid.meta.json"
       [ -f "$meta" ] || continue
       jq -r --arg uuid "$uuid" --arg last_seen "$last_seen" --arg wname "$wname" --arg cwd "$cwd" '
         [
@@ -66,7 +66,7 @@ list_windows_tsv() {
 # `label` falls back: last_title → first_user_message → empty.
 list_sessions_tsv() {
   local window_uuid="$1"
-  local meta="$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json"
+  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
   [ -f "$meta" ] || return 0
   jq -r '.sessions // [] | .[] | [
     .session_id,
@@ -81,18 +81,20 @@ list_sessions_tsv() {
 
 preview_window() {
   local window_uuid="$1"
-  local meta="$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json"
+  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
   [ -f "$meta" ] || { echo "(no metadata)"; return 0; }
 
   jq -r '
+    def tildify: sub("^" + env.HOME; "~");
+    def strip_glyphs: sub("^[^ -~]+ +"; "");
     "Window: \(.window_uuid)",
-    "Path:   \((.primary_cwd // "?") | sub("^" + env.HOME; "~"))",
+    "Path:   \((.primary_cwd // "?") | tildify)",
     "Range:  \(.first_seen // "?") → \(.last_seen // "?")",
     "",
     "Sessions (\(.sessions | length)):",
     "",
     (.sessions[] |
-      "  • \(.last_title // (.first_user_message // "(no label)")[:80])",
+      "  • \((.last_title | if . == null or . == "" then null else strip_glyphs end) // (.first_user_message[:80]) // "(no label)")",
       "    id: \(.session_id)",
       "    started: \(.started // "?")  ended: \(.ended // "(open)")",
       "    pane: \(.pane_id // "?")  source: \(.source // "?")",
@@ -111,6 +113,32 @@ tildify() {
     "$HOME"/*) echo "~${p#$HOME}" ;;
     *) echo "$p" ;;
   esac
+}
+
+# Format a sampled pane title for display.
+#
+# If $CLAUDE_RESCUE_TITLE_FORMATTER is set and points to an executable, call
+# it with four positional args matching the user's existing window-label.sh
+# convention:
+#     <window_name> <pane_command> <pane_title> <host_short>
+# and use its stdout as the label. Empty stdout / formatter failure falls
+# back to the default behaviour.
+#
+# Default: strip a leading run of non-ASCII-printable bytes plus following
+# spaces (Claude's spinner glyph and similar). Raw event log keeps the
+# unmodified title for data fidelity; this is display-only.
+format_title() {
+  local window_name="$1" pane_command="$2" pane_title="$3"
+  if [ -n "${CLAUDE_RESCUE_TITLE_FORMATTER:-}" ] && [ -x "$CLAUDE_RESCUE_TITLE_FORMATTER" ]; then
+    local out
+    out="$("$CLAUDE_RESCUE_TITLE_FORMATTER" \
+      "${window_name:-}" "${pane_command:-}" "${pane_title:-}" "$(hostname -s)" 2>/dev/null)"
+    if [ -n "$out" ]; then
+      printf '%s' "$out"
+      return
+    fi
+  fi
+  printf '%s' "$pane_title" | sed -E 's/^[^ -~]+ *//'
 }
 
 # Capture the live scrollback of a pane and extract any session UUIDs that
@@ -147,7 +175,7 @@ scrollback_resolve() {
 
 preview_session() {
   local window_uuid="$1" session_id="$2"
-  local log="$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
+  local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
   [ -f "$log" ] || { echo "(no log)"; return 0; }
 
   # Backfill events have no session_id on title events (window-level only).
@@ -193,11 +221,13 @@ format_window_rows() {
   # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
   # Display columns:  age          sessions  window-name              cwd-or-title
   while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
-    local age line cwd_short
+    local age line cwd_short label
     age="$(humanize_age "$last_seen")"
     cwd_short="$(tildify "${cwd:-?}")"
+    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
+    label="${label:-$cwd_short}"
     line="$(printf '%-10s  %3s sess  %-22s  %s' \
-      "$age" "$scount" "${wname:-?}" "${last_title:-${cwd_short}}")"
+      "$age" "$scount" "${wname:-?}" "$label")"
     printf '%s\t%s\n' "$uuid" "$line"
   done
 }
@@ -206,11 +236,13 @@ format_session_rows() {
   # Reads list_sessions_tsv on stdin, emits "session_id<TAB>display" rows.
   # Display columns:  age          state   source     label
   while IFS=$'\t' read -r sid started ended cwd pane source last_title; do
-    local age status line
+    local age status line label
     age="$(humanize_age "${started:-$ended}")"
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
+    label="${last_title:+$(format_title "" "" "$last_title")}"
+    label="${label:-(no title)}"
     line="$(printf '%-10s  %-5s  %-8s  %s' \
-      "$age" "$status" "${source:-?}" "${last_title:-(no title)}")"
+      "$age" "$status" "${source:-?}" "$label")"
     printf '%s\t%s\n' "$sid" "$line"
   done
 }
@@ -340,7 +372,7 @@ popup_picker() {
   local cwd
   cwd="$(jq -r --arg sid "$sid" \
     '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
-    "$CLAUDE_RESCUE_HOME/windows/$window_uuid.meta.json")"
+    "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
   [ -z "$cwd" ] && cwd="$HOME"
 
   case "$key" in
@@ -370,7 +402,9 @@ case "$cmd" in
     if [ -z "${CLAUDE_RESCUE_IN_POPUP:-}" ]; then
       exec tmux display-popup -E -h 80% -w 90% \
         env CLAUDE_RESCUE_IN_POPUP=1 \
-            CLAUDE_RESCUE_HOME="$CLAUDE_RESCUE_HOME" \
+            CLAUDE_RESCUE_CONFIG_HOME="$CLAUDE_RESCUE_CONFIG_HOME" \
+            CLAUDE_RESCUE_DATA_HOME="$CLAUDE_RESCUE_DATA_HOME" \
+            CLAUDE_RESCUE_CACHE_HOME="$CLAUDE_RESCUE_CACHE_HOME" \
             CLAUDE_RESCUE_ORIG_PANE="${TMUX_PANE:-}" \
             "$0"
     fi

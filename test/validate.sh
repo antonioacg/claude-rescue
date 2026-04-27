@@ -3,7 +3,7 @@
 #
 # Spins up `tmux -L claude-rescue-validate` with the *production* rescue.tmux.conf
 # sourced (the same one chezmoi installs into ~/.tmux.conf), uses a temp
-# CLAUDE_RESCUE_HOME, and exercises every scenario from PLAN.md.
+# CLAUDE_RESCUE_DATA_HOME, and exercises every scenario from PLAN.md.
 #
 # Touches NOTHING in your live tmux server, your ~/.tmux.conf, or your
 # ~/.claude/settings.json. Cleans up on exit.
@@ -50,11 +50,12 @@ assert_nonempty() {
 # ---------------------------------------------------------------------------
 # Bring up the isolated server with production conf.
 
-CLAUDE_RESCUE_HOME="$HOME_DIR" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
+CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
   tmux -L "$SOCK" -f "$REPO/tmux/test/test.conf" \
     new-session -d -s t1 -x 200 -y 50
 
-tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HOME "$HOME_DIR"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_DATA_HOME "$HOME_DIR"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$HOME_DIR/cache"
 tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_REPO "$REPO"
 tmux -L "$SOCK" set-environment -g PATH "$REPO/bin:$PATH"
 
@@ -133,9 +134,10 @@ tmux -L "$SOCK" run-shell "$HOME/.config/tmux/plugins/tmux-resurrect/scripts/sav
 sleep 1
 tmux -L "$SOCK" kill-server 2>/dev/null
 sleep 1
-CLAUDE_RESCUE_HOME="$HOME_DIR" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
+CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
   tmux -L "$SOCK" -f "$REPO/tmux/test/test.conf" new-session -d -s t1 -x 200 -y 50
-tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HOME "$HOME_DIR"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_DATA_HOME "$HOME_DIR"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$HOME_DIR/cache"
 tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_REPO "$REPO"
 tmux -L "$SOCK" set-environment -g PATH "$REPO/bin:$PATH"
 sleep 1
@@ -157,16 +159,16 @@ assert "scenario 7: UUID rode the swap" "$BEFORE" "$AFTER"
 echo "[scenario 8] claude run outside tmux → no-tmux fallback"
 SNT=$(uuidgen|tr A-Z a-z)
 env -u TMUX -u TMUX_PANE \
-  bash -c "echo '{\"session_id\":\"$SNT\",\"cwd\":\"/tmp/notmux\",\"source\":\"startup\",\"model\":\"x\",\"transcript_path\":\"\",\"hook_event_name\":\"SessionStart\"}' | CLAUDE_RESCUE_HOME=$HOME_DIR $REPO/bin/claude-rescue-log session_start"
+  bash -c "echo '{\"session_id\":\"$SNT\",\"cwd\":\"/tmp/notmux\",\"source\":\"startup\",\"model\":\"x\",\"transcript_path\":\"\",\"hook_event_name\":\"SessionStart\"}' | CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log session_start"
 NTBUCKETS=$(find "$HOME_DIR/no-tmux" -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
 assert "scenario 8: no-tmux bucket created" "1" "$NTBUCKETS"
 
 # ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
-WIN_TSV=$(CLAUDE_RESCUE_HOME=$HOME_DIR "$REPO/bin/claude-rescue" list-windows | head -1)
+WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"
 TOP_UUID=$(printf '%s' "$WIN_TSV" | cut -f1)
-PREVIEW=$(CLAUDE_RESCUE_HOME=$HOME_DIR "$REPO/bin/claude-rescue" preview-window "$TOP_UUID" | head -1)
+PREVIEW=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" preview-window "$TOP_UUID" | head -1)
 assert_nonempty "picker: preview-window returns content" "$PREVIEW"
 
 # ---------------------------------------------------------------------------

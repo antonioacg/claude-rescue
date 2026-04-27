@@ -140,7 +140,7 @@ cmd_title() {
   [ -z "$pane_id" ] && return 0
   [ -z "$title" ] && return 0
 
-  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
   jq -nc --arg t "$title" --arg ts "$(now_iso)" '{title:$t, ts:$ts}' > "$cand"
 
   # Schedule a debounced commit. Multiple sleeps may stack; only the one whose
@@ -152,8 +152,8 @@ cmd_title() {
 
 cmd_title_commit() {
   local pane_id="$1"
-  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
-  local last="$CLAUDE_RESCUE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
   [ -f "$cand" ] || return 0
 
   local title cand_ts now elapsed
@@ -201,7 +201,7 @@ cmd_pane_died() {
 
 cmd_client_detached() {
   # Server-wide event; no pane attribution. Best-effort: log for forensic context.
-  local marker="$CLAUDE_RESCUE_HOME/client-detached.log"
+  local marker="$CLAUDE_RESCUE_CACHE_HOME/client-detached.log"
   printf '%s\n' "$(now_iso)" >> "$marker"
 }
 
@@ -239,7 +239,7 @@ cmd_resume_unstop() {
 # that has not been followed by a session_end (or empty if none).
 latest_open_session_in_pane() {
   local window_uuid="$1" pane_id="$2"
-  local log="$CLAUDE_RESCUE_HOME/windows/$window_uuid.jsonl"
+  local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
   [ -f "$log" ] || return 0
   jq -rs --arg pane "$pane_id" '
     [.[] | select(.pane_id == $pane and (.kind == "session_start" or .kind == "session_end"))]
@@ -250,8 +250,8 @@ latest_open_session_in_pane() {
 
 flush_pending_title() {
   local pane_id="$1" window_uuid="$2"
-  local cand="$CLAUDE_RESCUE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
-  local last="$CLAUDE_RESCUE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
   [ -f "$cand" ] || return 0
   local title
   title="$(jq -r '.title' "$cand")"
@@ -280,7 +280,7 @@ log_no_tmux() {
   local kind="$1" sid="$2" cwd="$3" source="$4" model="$5" transcript="$6"
   local host bucket
   host="$(hostname -s)"
-  bucket="$CLAUDE_RESCUE_HOME/no-tmux/${host}__$(printf '%s' "$cwd" | shasum | cut -c1-12).jsonl"
+  bucket="$CLAUDE_RESCUE_DATA_HOME/no-tmux/${host}__$(printf '%s' "$cwd" | shasum | cut -c1-12).jsonl"
   printf '%s\n' "$(jq -nc \
     --arg ts "$(now_iso)" --arg k "$kind" --arg sid "$sid" --arg cwd "$cwd" \
     --arg src "$source" --arg model "$model" --arg tr "$transcript" \
@@ -310,7 +310,7 @@ cmd_resurrect_save() {
   mv "$sidecar.tmp" "$sidecar"
 
   # 2. Per-pane sample — emit title transitions and detect pane death.
-  local snapshot_dir="$CLAUDE_RESCUE_HOME/tmp/last-pane-state"
+  local snapshot_dir="$CLAUDE_RESCUE_CACHE_HOME/tmp/last-pane-state"
   mkdir -p "$snapshot_dir"
   local current_panes_file="$snapshot_dir/.current-panes"
   : > "$current_panes_file"
@@ -392,7 +392,7 @@ cmd_resurrect_save() {
   rm -f "$current_panes_file"
 
   # 2d. Rebuild metas for any windows we touched.
-  for log in "$CLAUDE_RESCUE_HOME/windows/"*.jsonl; do
+  for log in "$CLAUDE_RESCUE_DATA_HOME/windows/"*.jsonl; do
     [ -f "$log" ] || continue
     rebuild_meta "$(basename "$log" .jsonl)"
   done
@@ -428,7 +428,7 @@ cmd_sigstop_arm() {
   # Spawns a backgrounded timer that, after CLAUDE_RESCUE_STOP_DELAY (default 300s):
   #   - defers up to N times if the pane title contains the streaming spinner,
   #   - walks the pane's process tree, finds processes named "claude",
-  #   - issues kill -STOP and records PIDs to $CLAUDE_RESCUE_HOME/stopped/<pane>.json.
+  #   - issues kill -STOP and records PIDs to $CLAUDE_RESCUE_CACHE_HOME/stopped/<pane>.json.
   # If a corresponding sigstop-resume runs first, the timer is cancelled.
   local pane_id="${1:-}" pane_pid="${2:-}"
   [ -n "$pane_id" ] || return 0
@@ -441,8 +441,8 @@ cmd_sigstop_arm() {
   local TARGET_COMM="${CLAUDE_RESCUE_TARGET_COMM:-claude}"
 
   local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_HOME/stopped/$san.arm.pid"
-  local stopped_file="$CLAUDE_RESCUE_HOME/stopped/$san.json"
+  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.arm.pid"
+  local stopped_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.json"
 
   # If a timer is already running for this pane, leave it.
   if [ -f "$arm_pid_file" ]; then
@@ -455,7 +455,7 @@ cmd_sigstop_arm() {
   fi
 
   (
-    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_HOME/sigstop-arm.err"
+    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/sigstop-arm.err"
     sleep "$DELAY"
 
     local title active pids cur child cmd queue
@@ -514,8 +514,8 @@ cmd_sigstop_resume() {
   [ -n "$pane_id" ] || return 0
 
   local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_HOME/stopped/$san.arm.pid"
-  local stopped_file="$CLAUDE_RESCUE_HOME/stopped/$san.json"
+  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.arm.pid"
+  local stopped_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.json"
 
   if [ -f "$arm_pid_file" ]; then
     local arm_pid
