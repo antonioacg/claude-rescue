@@ -190,7 +190,13 @@ preview_session() {
   # event — they were derived from sampling). To produce a meaningful title
   # timeline for a backfilled session, fall back to all window-level title
   # events whose timestamp falls between this session's start and end.
+  # Pre-strip leading glyphs (✳, ⠂, ⠐ …) from titles via jq's sub. Keeps the
+  # display consistent with format_title's default behaviour. Configured
+  # external CLAUDE_RESCUE_TITLE_FORMATTER doesn't affect the preview pane —
+  # that's a deliberate trade-off: invoking the formatter per title would
+  # mean N forks per preview render. Default regex covers the common case.
   jq -rs --arg sid "$session_id" '
+    def strip_glyphs: sub("^[^ -~]+ +"; "");
     . as $all
     | [.[] | select(.session_id == $sid)] as $sevents
     | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
@@ -212,7 +218,7 @@ preview_session() {
       "",
       "Title history (\($titles | length)):",
       "",
-      ($titles[] | "  \(.ts)  \(.title)")
+      ($titles[] | "  \(.ts)  \(.title | strip_glyphs)")
   ' "$log"
 }
 
@@ -235,22 +241,22 @@ humanize_age() {
 
 format_window_rows() {
   # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
-  # Display columns:  age   #(right)  window-name(right)   cwd-or-title
+  # Columns: age(8L) #(2R) window-name(8R) label
   while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
     local age line cwd_short label
     age="$(humanize_age "$last_seen")"
     cwd_short="$(tildify "${cwd:-?}")"
     label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
     label="${label:-$cwd_short}"
-    line="$(printf '%-10s  %3s  %22s  %s' \
-      "$age" "$scount" "${wname:--}" "$label")"
+    line="$(printf '%-8s %3s %8s  %s' \
+      "$age" "$scount" "${wname:- }" "$label")"
     printf '%s\t%s\n' "$uuid" "$line"
   done
 }
 
 format_session_rows() {
   # Reads list_sessions_tsv (US-separated) on stdin, emits "session_id<TAB>display" rows.
-  # Display columns:  age          state   source     label
+  # Columns: age(8L) state(5L) source(15L) label
   local US=$'\x1f'
   while IFS="$US" read -r sid started ended cwd pane source last_title; do
     local age status line label
@@ -258,8 +264,8 @@ format_session_rows() {
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
     label="${last_title:+$(format_title "" "" "$last_title")}"
     label="${label:-(no title)}"
-    line="$(printf '%-10s  %-5s  %-16s  %s' \
-      "$age" "$status" "${source:-?}" "$label")"
+    line="$(printf '%-8s %-5s %-15s %s' \
+      "$age" "$status" "${source:--}" "$label")"
     printf '%s\t%s\n' "$sid" "$line"
   done
 }
@@ -349,7 +355,7 @@ popup_picker() {
       | fzf "${fzf_common[@]}" \
           --with-nth=2.. --delimiter=$'\t' \
           --prompt='windows> ' \
-          --header=$'↩ open · ⎋ cancel\nage           #             window-name  cwd / last title' \
+          --header=$'↩ open · ⎋ cancel\nage        #   window  cwd / last title' \
           --preview "$0 preview-window {1}" \
     )" || return 0
 
@@ -380,7 +386,7 @@ popup_picker() {
       | fzf "${fzf_common[@]}" \
           --with-nth=2.. --delimiter=$'\t' \
           --prompt='sessions> ' \
-          --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage         state  source            label' \
+          --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage      state source          label' \
           --expect=ctrl-n,ctrl-w,ctrl-y \
           --preview "$0 preview-session $window_uuid {1}" \
     )" \
