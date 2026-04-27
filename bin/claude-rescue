@@ -40,24 +40,29 @@ ensure_dirs
 # Data formatters
 
 # TSV columns: uuid \t last_seen \t session_count \t window_name \t primary_cwd \t last_title
+# Filters out windows with zero sessions — those have title history only and
+# nothing to resume, so showing them in the picker just adds noise.
 list_windows_tsv() {
   local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
   [ -f "$idx" ] || return 0
 
-  # Build a list of (uuid, last_seen) from index.jsonl, sorted by last_seen desc.
   jq -rs 'sort_by(.last_seen) | reverse | .[] | [.window_uuid, .last_seen, .window_name, .primary_cwd] | @tsv' "$idx" \
   | while IFS=$'\t' read -r uuid last_seen wname cwd; do
       local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$uuid.meta.json"
       [ -f "$meta" ] || continue
       jq -r --arg uuid "$uuid" --arg last_seen "$last_seen" --arg wname "$wname" --arg cwd "$cwd" '
-        [
-          $uuid,
-          $last_seen,
-          (.sessions | length // 0),
-          $wname,
-          $cwd,
-          ((.sessions // []) | map(.last_title) | map(select(. != null)) | .[0] // "")
-        ] | @tsv
+        (.sessions // []) as $s
+        | ($s | length) as $count
+        | if $count == 0 then empty else
+            [
+              $uuid,
+              $last_seen,
+              $count,
+              $wname,
+              $cwd,
+              ($s | map(.last_title) | map(select(. != null)) | .[0] // "")
+            ] | @tsv
+          end
       ' "$meta"
     done
 }

@@ -93,6 +93,14 @@ echo "backfill: $total snapshot(s) to process" >&2
 
 panes_tsv="$WORK_DIR/panes.tsv"
 # xargs splits args automatically to stay under ARG_MAX.
+# Resurrect pane line fields:
+#   $1=pane $2=session_name $3=window_index $4=window_active $5=:flags
+#   $6=pane_index $7=pane_title $8=:dir $9=pane_active $10=pane_command
+#   $11=:full_command
+# We emit: ts, session_name, window_index, pane_index, pane_title, dir,
+#          full_command, pane_command
+# pane_command is what tmux's automatic-rename uses as the window name; we
+# treat it as the authoritative window_name source for backfilled events.
 xargs awk -F'\t' '
   FNR == 1 {
     fn = FILENAME
@@ -102,7 +110,7 @@ xargs awk -F'\t' '
   }
   $1 == "pane" {
     gsub(/^:/, "", $8); gsub(/^:/, "", $11)
-    print ts "\t" $2 "\t" $3 "\t" $6 "\t" $7 "\t" $8 "\t" $11
+    print ts "\t" $2 "\t" $3 "\t" $6 "\t" $7 "\t" $8 "\t" $11 "\t" $10
   }
 ' < "$snapshot_list" > "$panes_tsv"
 
@@ -182,8 +190,13 @@ awk -F'\t' -v outdir="$CLAUDE_RESCUE_DATA_HOME/windows" '
     last_title = ""
   }
   {
-    ts = $1; sn = $2; wi = $3; pi = $4; ptitle = $5; cwd = $6; cmd = $7
+    ts = $1; sn = $2; wi = $3; pi = $4; ptitle = $5; cwd = $6
+    full_cmd = $7; pane_cmd = $8
     if (ptitle == "") next
+
+    # window_name = pane_command (e.g. "claude", "zsh") — what tmux would
+    # auto-rename to. Falls back to pane_title only when pane_command is empty.
+    wname = (pane_cmd != "" ? pane_cmd : ptitle)
 
     key = sn "\t" wi "\t" pi
     if (key != cur_key) {
@@ -195,26 +208,25 @@ awk -F'\t' -v outdir="$CLAUDE_RESCUE_DATA_HOME/windows" '
       uuid = uuid_for(sn, cwd)
       out = outdir "/" uuid ".jsonl"
       printf("{\"ts\":\"%s\",\"kind\":\"title_backfill\",\"title\":\"%s\",\"session_name\":\"%s\",\"window_name\":\"%s\",\"cwd\":\"%s\"}\n",
-             ts, jesc(ptitle), jesc(sn), jesc(ptitle), jesc(cwd)) >> out
+             ts, jesc(ptitle), jesc(sn), jesc(wname), jesc(cwd)) >> out
       last_title = ptitle
 
-      # Track (sn, wi) → most-recent cwd for the per-window primary_cwd hint.
       win_cwd[sn "|" wi] = cwd
       win_count[sn "|" wi]++
     }
 
     # Capture session UUIDs from -r / --resume in the saved command line.
-    if (match(cmd, /(-r|--resume)[ =]+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)) {
-      m = substr(cmd, RSTART, RLENGTH)
+    if (match(full_cmd, /(-r|--resume)[ =]+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)) {
+      m = substr(full_cmd, RSTART, RLENGTH)
       if (match(m, /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/)) {
         sid = substr(m, RSTART, RLENGTH)
-        skey = sid "|" sn "|" ptitle "|" cwd
+        skey = sid "|" sn "|" wname "|" cwd
         if (!(skey in seen_session)) {
           seen_session[skey] = 1
           uuid = uuid_for(sn, cwd)
           out = outdir "/" uuid ".jsonl"
           printf("{\"ts\":\"%s\",\"kind\":\"session_start_backfill\",\"session_id\":\"%s\",\"session_name\":\"%s\",\"window_name\":\"%s\",\"cwd\":\"%s\",\"source\":\"resume_backfill\"}\n",
-                 ts, sid, jesc(sn), jesc(ptitle), jesc(cwd)) >> out
+                 ts, sid, jesc(sn), jesc(wname), jesc(cwd)) >> out
         }
       }
     }
