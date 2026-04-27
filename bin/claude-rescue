@@ -482,12 +482,19 @@ case "$cmd" in
       exit 1
     fi
     if [ -z "${CLAUDE_RESCUE_IN_POPUP:-}" ]; then
+      # $TMUX_PANE can leak from a nested-tmux context (an outer server's
+      # pane id ends up in this server's global env). Query tmux directly
+      # for the active client's active pane — reliable regardless of how
+      # claude-rescue was invoked.
+      local orig_pane
+      orig_pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
+      [ -z "$orig_pane" ] && orig_pane="${TMUX_PANE:-}"
       exec tmux display-popup -E -h 80% -w 90% \
         env CLAUDE_RESCUE_IN_POPUP=1 \
             CLAUDE_RESCUE_CONFIG_HOME="$CLAUDE_RESCUE_CONFIG_HOME" \
             CLAUDE_RESCUE_DATA_HOME="$CLAUDE_RESCUE_DATA_HOME" \
             CLAUDE_RESCUE_CACHE_HOME="$CLAUDE_RESCUE_CACHE_HOME" \
-            CLAUDE_RESCUE_ORIG_PANE="${TMUX_PANE:-}" \
+            CLAUDE_RESCUE_ORIG_PANE="$orig_pane" \
             "$0"
     fi
     popup_picker

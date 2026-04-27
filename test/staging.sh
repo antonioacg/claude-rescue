@@ -105,12 +105,19 @@ TMUX
   if tmux -L "$SOCK" has-session 2>/dev/null; then
     echo "    server already running"
   else
-    CLAUDE_RESCUE_DATA_HOME="$DATA_DIR" CLAUDE_RESCUE_CACHE_HOME="$DATA_DIR/cache" PATH="$HOME/.local/bin:$PATH" \
+    # Strip any TMUX/TMUX_PANE leaking in from the calling shell — otherwise
+    # the staging server's global env carries the OUTER tmux's pane id, and
+    # run-shell-fired hooks misroute send-keys back to a pane that doesn't
+    # exist in staging.
+    env -u TMUX -u TMUX_PANE \
+      CLAUDE_RESCUE_DATA_HOME="$DATA_DIR" CLAUDE_RESCUE_CACHE_HOME="$DATA_DIR/cache" PATH="$HOME/.local/bin:$PATH" \
       tmux -L "$SOCK" -f "$STAGING_DIR/.config/tmux/staging.conf" \
         new-session -d -s main -c "$STAGING_DIR" -x 200 -y 50
     tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_DATA_HOME "$DATA_DIR"
     tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$DATA_DIR/cache"
     tmux -L "$SOCK" set-environment -g PATH "$HOME/.local/bin:$PATH"
+    tmux -L "$SOCK" set-environment -gu TMUX
+    tmux -L "$SOCK" set-environment -gu TMUX_PANE
     echo "    started"
   fi
 
