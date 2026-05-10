@@ -6,12 +6,15 @@
 #   claude-rescue              Open the two-stage drill-down picker.
 #
 # Internal subcommands (used by fzf and re-execs):
-#   list-windows               TSV of windows for fzf level 1.
-#   list-sessions <window>     TSV of sessions for fzf level 2.
-#   preview-window <window>    Preview text for highlighted window.
-#   preview-session <window> <session>   Preview text for highlighted session.
-#   level2 <window>            Inner fzf invocation for one window's sessions.
-#   scrollback-uuids [pane]    Grep current pane's live scrollback for session UUIDs (fallback).
+#   list-windows                    TSV of windows for the picker.
+#   list-sessions <window>          TSV of sessions for a given window.
+#   preview-window <window>         Preview text for the highlighted window row.
+#   preview-session <window> <sid>  Preview text for the highlighted session row.
+#   find-sessions [filter ...]      Cross-window session search (used by the
+#                                   filter-toggle modes and by claude-rescue-resume).
+#   print [pane_uuid|sid]           Cat a saved pane capture (no arg = current
+#                                   pane via @claude-pane-id). Reads from
+#                                   $DATA/captures/<pane_uuid>.{txt,json}.
 #
 # Exit keys (level 2):
 #   enter     resume in the originating pane
@@ -42,32 +45,39 @@ ensure_dirs
 # TSV columns: uuid \t last_seen \t session_count \t window_name \t primary_cwd \t last_title
 # Filters out windows with zero sessions — those have title history only and
 # nothing to resume, so showing them in the picker just adds noise.
+#
+# Enumerates from windows/*.meta.json directly. Each meta has its own
+# last_seen / window_name / primary_cwd, so no separate index is needed.
+# Sorted lexicographically by ISO last_seen, descending (newest first).
 list_windows_tsv() {
-  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
-  [ -f "$idx" ] || return 0
+  local meta_dir="$CLAUDE_RESCUE_DATA_HOME/windows"
+  [ -d "$meta_dir" ] || return 0
 
-  jq -rs 'sort_by(.last_seen) | reverse | .[] | [.window_uuid, .last_seen, .window_name, .primary_cwd] | @tsv' "$idx" \
-  | while IFS=$'\t' read -r uuid last_seen wname cwd; do
-      local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$uuid.meta.json"
-      [ -f "$meta" ] || continue
-      jq -r --arg uuid "$uuid" --arg last_seen "$last_seen" --arg wname "$wname" --arg cwd "$cwd" '
-        (.sessions // []) as $s
-        | ($s | length) as $count
-        | if $count == 0 then empty else
-            [
-              $uuid,
-              $last_seen,
-              $count,
-              $wname,
-              $cwd,
-              ($s | map(.last_title) | map(select(. != null)) | .[0] // "")
-            ] | @tsv
-          end
-      ' "$meta"
-    done
+  # nullglob-equivalent: skip the loop entirely if no meta files.
+  shopt -s nullglob
+  local metas=("$meta_dir"/*.meta.json)
+  shopt -u nullglob
+  [ ${#metas[@]} -eq 0 ] && return 0
+
+  for f in "${metas[@]}"; do
+    jq -r '
+      (.sessions // []) as $s
+      | ($s | length) as $count
+      | if $count == 0 then empty else
+          [
+            .window_uuid,
+            (.last_seen // ""),
+            $count,
+            (.window_name // ""),
+            (.primary_cwd // ""),
+            ($s | map(.last_title) | map(select(. != null)) | .[0] // "")
+          ] | @tsv
+        end
+    ' "$f"
+  done | sort -t$'\t' -k2,2r
 }
 
-# Columns: session_id ⎵ started ⎵ ended ⎵ cwd ⎵ pane_id ⎵ source ⎵ label
+# Columns: session_id ⎵ started ⎵ ended ⎵ cwd ⎵ pane_uuid ⎵ source ⎵ window_name ⎵ label
 # Separator is ASCII unit-separator (\x1f), NOT tab. bash's `read` collapses
 # consecutive whitespace IFS chars (tabs included), which silently drops empty
 # fields and shifts the rest. Non-whitespace IFS preserves them.
@@ -78,10 +88,12 @@ list_sessions_tsv() {
   [ -f "$meta" ] || return 0
   jq -r '
     def US: "";
+    . as $meta |
     .sessions // [] | .[] |
       [
         .session_id, (.started // ""), (.ended // ""),
-        (.cwd // ""), (.pane_id // ""), (.source // ""),
+        (.cwd // ""), (.pane_uuid // ""), (.source // ""),
+        ($meta.window_name // ""),
         (.last_title // (.first_user_message // "")[:80])
       ] | join(US)
   ' "$meta"
@@ -104,13 +116,11 @@ preview_window() {
       "  • \((.last_title | if . == null or . == "" then null else strip_glyphs end) // (.first_user_message[:80]) // "(no label)")",
       "    id: \(.session_id)",
       "    started: \(.started // "?")  ended: \(.ended // "(open)")",
-      "    pane: \(.pane_id // "?")  source: \(.source // "?")",
+      "    pane: \(.pane_uuid // "?")  source: \(.source // "?")",
       ""
     )
   ' "$meta"
 }
-
-UUID_REGEX='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 
 # Replace the leading $HOME with ~ for display purposes.
 tildify() {
@@ -150,38 +160,6 @@ format_title() {
     fi
   fi
   printf '%s' "$pane_title" | sed -E 's/^[^ -~]+ *//'
-}
-
-# Capture the live scrollback of a pane and extract any session UUIDs that
-# look like Claude Code session IDs. Used as a fallback when the picker can't
-# find a session in any log (logs lost, importer missed it, fresh window).
-scrollback_uuids() {
-  local pane="${1:-${TMUX_PANE:-${CLAUDE_RESCUE_ORIG_PANE:-}}}"
-  [ -n "$pane" ] || { echo "no pane to capture" >&2; return 1; }
-  tmux capture-pane -peJ -S - -t "$pane" 2>/dev/null \
-    | grep -Eoh "$UUID_REGEX" \
-    | awk '!seen[$0]++'
-}
-
-# Cross-reference candidate UUIDs against ~/.claude/projects/. Emits TSV
-# "uuid<TAB>cwd<TAB>first_user_message" for UUIDs that have a transcript on disk.
-scrollback_resolve() {
-  local pane="${1:-${TMUX_PANE:-${CLAUDE_RESCUE_ORIG_PANE:-}}}"
-  local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
-  scrollback_uuids "$pane" | while read -r uuid; do
-    [ -z "$uuid" ] && continue
-    local transcript
-    transcript="$(find "$projects_root" -maxdepth 2 -name "$uuid.jsonl" 2>/dev/null | head -1)"
-    [ -z "$transcript" ] && continue
-    local cwd_dir="$(dirname "$transcript")"
-    local cwd_decoded
-    # Project dir name is the cwd with '/' encoded as '-'. Decode best-effort.
-    cwd_decoded="$(basename "$cwd_dir" | sed 's|^-|/|; s|-|/|g')"
-    local first_msg
-    first_msg="$(jq -r 'select(.message.role == "user") | .message.content // empty | if type == "string" then . else (.[0].text // "") end' "$transcript" 2>/dev/null \
-      | head -1 | tr '\n' ' ' | cut -c1-80)"
-    printf '%s\t%s\t%s\n' "$uuid" "$cwd_decoded" "$first_msg"
-  done
 }
 
 preview_session() {
@@ -233,7 +211,12 @@ preview_session() {
   cache_dir="$(mktemp -d -t cr-fmt.XXXXXX)"
   trap "rm -rf '$cache_dir'" RETURN
 
-  jq -rs --arg sid "$session_id" '
+  # Use ASCII unit separator (\x1f) instead of tab. Bash's `read` collapses
+  # consecutive whitespace IFS chars (TAB included) into a single delimiter,
+  # which silently drops the empty window_name field — making raw_title read
+  # as the window_name and the actual title vanish entirely.
+  local US=$'\x1f'
+  jq -rs --arg sid "$session_id" --arg US "$US" '
     . as $all
     | [.[] | select(.session_id == $sid)] as $sevents
     | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
@@ -246,9 +229,9 @@ preview_session() {
                           and ($sstart == null or .ts >= $sstart)
                           and ($send == null or .ts <= $send))]
        end)
-    | .[] | "\(.ts)\t\(.window_name // "")\t\(.title)"
+    | .[] | "\(.ts)\($US)\(.window_name // "")\($US)\(.title)"
   ' "$log" \
-  | while IFS=$'\t' read -r ts ev_wname raw_title; do
+  | while IFS="$US" read -r ts ev_wname raw_title; do
       [ -z "$raw_title" ] && continue
       # Use the window_name AT THE TIME of the title event when present.
       # Falls back to the window's rollup name (from meta) for live events
@@ -301,11 +284,61 @@ format_window_rows() {
   done
 }
 
+format_find_session_rows() {
+  # Reads find-sessions output (US-separated, 9 cols) on stdin.
+  # Emits TSV: session_id<TAB>window_uuid<TAB>cwd<TAB>display
+  # display columns: age(8L) state(5L) source(15L) label
+  local US=$'\x1f'
+  while IFS="$US" read -r sid wuuid puuid started ended cwd source wname last_title; do
+    local age status line label
+    age="$(humanize_age "${started:-$ended}")"
+    if [ -z "$ended" ]; then status="open"; else status="ended"; fi
+    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
+    label="${label:-(no title)}"
+    line="$(printf '%-8s %-5s %-15s %s' \
+      "$age" "$status" "${source:--}" "$label")"
+    printf '%s\t%s\t%s\t%s\n' "$sid" "$wuuid" "$cwd" "$line"
+  done
+}
+
+# Cycle scope mode by `step` positions in the order list, skipping any mode
+# whose filter context is empty (e.g. no @claude-pane-id on the originating
+# pane → skip "pane" mode). step=+1 = forward (Tab); step=-1 = back (Shift-Tab).
+# Args: current_mode step wuuid puuid cwd. Echoes the next valid mode.
+cycle_mode() {
+  local current="$1" step="$2" w="$3" p="$4" c="$5"
+  local order=(all window pane cwd) i=0
+  for i in "${!order[@]}"; do
+    [ "${order[$i]}" = "$current" ] && break
+  done
+  local n=${#order[@]} j cand val
+  for ((j=1; j<=n; j++)); do
+    cand="${order[$(( ((i + step*j) % n + n) % n ))]}"
+    case "$cand" in
+      all)    echo "$cand"; return ;;
+      window) val="$w" ;;
+      pane)   val="$p" ;;
+      cwd)    val="$c" ;;
+    esac
+    if [ -n "$val" ]; then echo "$cand"; return; fi
+  done
+  echo all
+}
+next_mode() { cycle_mode "$1" 1  "$2" "$3" "$4"; }
+prev_mode() { cycle_mode "$1" -1 "$2" "$3" "$4"; }
+
+# Build a colored, single-line filter indicator for the picker header.
+# Bold cyan, no marker prefix.
+filter_indicator() {
+  local label="$1"
+  printf '\033[1;36m%s\033[0m' "$label"
+}
+
 format_session_rows() {
   # Reads list_sessions_tsv (US-separated) on stdin, emits "session_id<TAB>display" rows.
   # Columns: age(8L) state(5L) source(15L) label
   local US=$'\x1f'
-  while IFS="$US" read -r sid started ended cwd pane source wname last_title; do
+  while IFS="$US" read -r sid started ended cwd pane_uuid source wname last_title; do
     local age status line label
     age="$(humanize_age "${started:-$ended}")"
     if [ -z "$ended" ]; then status="open"; else status="ended"; fi
@@ -338,14 +371,22 @@ action_resume_here() {
 
 action_resume_new_window() {
   local sid="$1" cwd="$2"
-  tmux new-window -c "$cwd" "$(resume_command "$sid" "$cwd")"
+  # Spawn a shell, then type the resume command into it. If we passed the
+  # claude command directly to new-window, tmux would close the window the
+  # moment claude exits — leaving the shell in place keeps the user at a
+  # prompt afterwards.
+  local pane
+  pane="$(tmux new-window -c "$cwd" -P -F '#{pane_id}')"
+  tmux send-keys -t "$pane" " $(resume_command "$sid" "$cwd")" Enter
 }
 
 action_resume_new_session() {
   local sid="$1" cwd="$2"
-  local sname
+  local sname pane
   sname="claude-$(printf '%s' "$sid" | cut -c1-8)"
-  tmux new-session -d -s "$sname" -c "$cwd" "$(resume_command "$sid" "$cwd")"
+  tmux new-session -d -s "$sname" -c "$cwd"
+  pane="$(tmux display-message -p -t "$sname" '#{pane_id}')"
+  tmux send-keys -t "$pane" " $(resume_command "$sid" "$cwd")" Enter
   tmux switch-client -t "$sname" 2>/dev/null || true
 }
 
@@ -364,9 +405,6 @@ action_copy_uuid() {
 # Inner picker — runs inside the popup.
 
 popup_picker() {
-  # --reverse keeps the list at the top of the popup (where it dominates)
-  # with prompt + header just below. Hotkeys live in --header using compact
-  # glyph notation so they don't visually compete with the data rows.
   local fzf_common=(
     --ansi
     --reverse
@@ -375,94 +413,359 @@ popup_picker() {
     --preview-window=right:55%:wrap
   )
 
-  # --- Level 1: windows ---
-  local rows level1_out
-  rows="$(list_windows_tsv | format_window_rows)"
-
-  # Append a virtual "(scrollback search)" row that runs the fallback.
-  local scrollback_rows
-  scrollback_rows="$(scrollback_resolve | while IFS=$'\t' read -r uuid cwd first_msg; do
-    printf 'scrollback:%s\t%-12s  %3s sessions  %-30s  %s\n' \
-      "$uuid" "scrollback" "1" "${cwd:-?}" "${first_msg:-(no first message)}"
-  done)"
-  if [ -n "$scrollback_rows" ]; then
-    rows="$rows"$'\n'"$scrollback_rows"
+  # Originating pane context (used for filter scopes + indicator labels).
+  local orig_pane orig_window_uuid orig_pane_uuid orig_cwd orig_window_index orig_pane_index
+  orig_pane="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
+  if [ -n "$orig_pane" ]; then
+    orig_window_uuid="$(tmux show-options -wv -t "$orig_pane" @claude-window-id 2>/dev/null || true)"
+    orig_pane_uuid="$(tmux show-options -pv -t "$orig_pane" @claude-pane-id 2>/dev/null || true)"
+    orig_cwd="$(tmux display-message -p -t "$orig_pane" '#{pane_current_path}' 2>/dev/null || true)"
+    orig_window_index="$(tmux display-message -p -t "$orig_pane" '#{window_index}' 2>/dev/null || true)"
+    orig_pane_index="$(tmux display-message -p -t "$orig_pane" '#{pane_index}' 2>/dev/null || true)"
   fi
 
-  if [ -z "$rows" ]; then
-    echo "No windows logged yet. Start a claude session and try again." >&2
+  local mode=all
+  local last_window_uuid=""
+
+  while true; do
+    if [ "$mode" = "all" ]; then
+      # ===== Mode "all": two-stage drill (windows → sessions) =====
+      local rows
+      rows="$(list_windows_tsv | format_window_rows)"
+      if [ -z "$rows" ]; then
+        echo "No windows logged yet. Start a claude session and try again." >&2
+        return 1
+      fi
+
+      local start_pos=1
+      if [ -n "$last_window_uuid" ]; then
+        start_pos="$(printf '%s\n' "$rows" \
+          | awk -F'\t' -v u="$last_window_uuid" '$1==u {print NR; exit}')"
+      fi
+      start_pos="${start_pos:-1}"
+
+      local l1_out l1_key l1_sel l1_header l1_footer
+      l1_header="$(filter_indicator 'showing all')"$'\nage        #   label'
+      l1_footer=$'↩ open · ⎋ cancel\n⇥/⇧⇥ change filter'
+      l1_out="$(printf '%s\n' "$rows" \
+        | fzf "${fzf_common[@]}" \
+            --with-nth=2.. --delimiter=$'\t' \
+            --prompt='windows> ' \
+            --header="$l1_header" \
+            --footer="$l1_footer" \
+            --bind "start:pos($start_pos)" \
+            --expect=tab,shift-tab \
+            --preview "$0 preview-window {1}" \
+      )" || return 0
+
+      l1_key="$(printf '%s' "$l1_out" | sed -n 1p)"
+      l1_sel="$(printf '%s' "$l1_out" | sed -n 2p)"
+      if [ "$l1_key" = "tab" ]; then
+        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      elif [ "$l1_key" = "shift-tab" ]; then
+        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      fi
+
+      local window_uuid
+      window_uuid="$(printf '%s' "$l1_sel" | cut -f1)"
+      [ -z "$window_uuid" ] && return 0
+      last_window_uuid="$window_uuid"
+
+      local s_rows
+      s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
+      if [ -z "$s_rows" ]; then
+        echo "(no sessions in window $window_uuid)" >&2
+        return 1
+      fi
+
+      local l2_out l2_key l2_sel l2_header l2_footer
+      l2_header="$(filter_indicator 'showing all')"$'\nage      state source          label'
+      l2_footer=$'↩ resume · ^N win · ^W sess · ^Y copy\n⎋ back · ⇥/⇧⇥ change filter'
+      l2_out="$(printf '%s\n' "$s_rows" \
+        | fzf "${fzf_common[@]}" \
+            --with-nth=2.. --delimiter=$'\t' \
+            --prompt='sessions> ' \
+            --header="$l2_header" \
+            --footer="$l2_footer" \
+            --expect=ctrl-n,ctrl-w,ctrl-y,tab,shift-tab \
+            --preview "$0 preview-session $window_uuid {1}" \
+      )"
+      local rc=$?
+
+      if [ $rc -ne 0 ]; then
+        # esc at level 2 → loop back to level 1 (same mode)
+        continue
+      fi
+
+      l2_key="$(printf '%s' "$l2_out" | sed -n 1p)"
+      l2_sel="$(printf '%s' "$l2_out" | sed -n 2p)"
+      if [ "$l2_key" = "tab" ]; then
+        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      elif [ "$l2_key" = "shift-tab" ]; then
+        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      fi
+
+      local sid
+      sid="$(printf '%s' "$l2_sel" | cut -f1)"
+      [ -z "$sid" ] && continue
+
+      local cwd
+      cwd="$(jq -r --arg sid "$sid" \
+        '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
+        "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
+      [ -z "$cwd" ] && cwd="$HOME"
+
+      case "$l2_key" in
+        ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
+        ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
+        ctrl-y) action_copy_uuid "$sid" ;;
+        *)      action_resume_here "$sid" "$cwd" ;;
+      esac
+      return 0
+
+    else
+      # ===== Scoped modes: flat session list via find-sessions =====
+      local filter_arg filter_val mode_label
+      case "$mode" in
+        window)
+          filter_arg=--window-uuid
+          filter_val="$orig_window_uuid"
+          mode_label="window #${orig_window_index:-?} ${orig_window_uuid:0:8}…"
+          ;;
+        pane)
+          filter_arg=--pane-uuid
+          filter_val="$orig_pane_uuid"
+          mode_label="pane #${orig_window_index:-?}.${orig_pane_index:-?} ${orig_pane_uuid:0:8}…"
+          ;;
+        cwd)
+          filter_arg=--cwd
+          filter_val="$orig_cwd"
+          mode_label="cwd $(tildify "${orig_cwd:-?}")"
+          ;;
+      esac
+
+      if [ -z "$filter_val" ]; then
+        # Skip — context missing for this mode.
+        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      fi
+
+      local f_rows
+      f_rows="$("$0" find-sessions "$filter_arg" "$filter_val" | format_find_session_rows)"
+
+      local f_out f_key f_sel
+      if [ -z "$f_rows" ]; then
+        f_rows=$'\t\t\t  (no sessions in this scope)'
+      fi
+
+      local f_header f_footer
+      f_header="$(filter_indicator "$mode_label")"$'\nage      state source          label'
+      f_footer=$'↩ resume · ^N win · ^W sess · ^Y copy\n⎋ cancel · ⇥/⇧⇥ change filter'
+      f_out="$(printf '%s\n' "$f_rows" \
+        | fzf "${fzf_common[@]}" \
+            --with-nth=4.. --delimiter=$'\t' \
+            --prompt='sessions> ' \
+            --header="$f_header" \
+            --footer="$f_footer" \
+            --expect=ctrl-n,ctrl-w,ctrl-y,tab,shift-tab \
+            --preview "$0 preview-session {2} {1}" \
+      )" || return 0
+
+      f_key="$(printf '%s' "$f_out" | sed -n 1p)"
+      f_sel="$(printf '%s' "$f_out" | sed -n 2p)"
+      if [ "$f_key" = "tab" ]; then
+        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      elif [ "$f_key" = "shift-tab" ]; then
+        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
+        continue
+      fi
+
+      local sid wuuid cwd
+      sid="$(printf '%s' "$f_sel" | cut -f1)"
+      wuuid="$(printf '%s' "$f_sel" | cut -f2)"
+      cwd="$(printf '%s' "$f_sel" | cut -f3)"
+      [ -z "$sid" ] && continue
+      [ -z "$cwd" ] && cwd="$HOME"
+
+      case "$f_key" in
+        ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
+        ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
+        ctrl-y) action_copy_uuid "$sid" ;;
+        *)      action_resume_here "$sid" "$cwd" ;;
+      esac
+      return 0
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# find-sessions: shared query primitive. Used by the picker filter toggle
+# and by the resume wrapper (claude-rescue-resume / @resurrect-processes).
+#
+# Filters (all optional, AND'd together):
+#   --pane-uuid UUID     only sessions whose pane_uuid matches
+#   --window-uuid UUID   only sessions inside this window UUID
+#   --cwd PATH           only sessions whose cwd equals this path
+#   --open-only          only sessions without a matching session_end (still alive)
+#
+# Output: US-separated TSV, sessions sorted newest-first.
+# Columns: session_id, window_uuid, pane_uuid, started, ended, cwd, source, last_title
+find_sessions() {
+  local pane_uuid_f="" window_uuid_f="" cwd_f="" open_only=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pane-uuid)   pane_uuid_f="$2"; shift 2 ;;
+      --window-uuid) window_uuid_f="$2"; shift 2 ;;
+      --cwd)         cwd_f="$2"; shift 2 ;;
+      --open-only)   open_only=1; shift ;;
+      *) echo "find-sessions: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+
+  local meta_dir="$CLAUDE_RESCUE_DATA_HOME/windows"
+  [ -d "$meta_dir" ] || return 0
+
+  shopt -s nullglob
+  local metas=("$meta_dir"/*.meta.json)
+  shopt -u nullglob
+  [ ${#metas[@]} -eq 0 ] && return 0
+
+  # Claude's transcript directory uses the cwd with `/` swapped for `-`,
+  # rooted at $CLAUDE_PROJECTS_DIR (default ~/.claude/projects). Sessions
+  # claude opened but never received a user message in have no transcript
+  # file; resuming such a session via `claude -r <sid>` silently spawns a
+  # fresh session, masking the resume. We unconditionally drop them — there's
+  # no useful behavior for an entry the user can't actually resume.
+  local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+
+  local US=$'\x1f'
+  for f in "${metas[@]}"; do
+    jq -r --arg US "$US" \
+          --arg puuid "$pane_uuid_f" \
+          --arg wuuid "$window_uuid_f" \
+          --arg cwd "$cwd_f" \
+          --argjson open_only "$open_only" '
+      .window_uuid as $wu |
+      .window_name as $wn |
+      (.sessions // [])[] |
+      select(
+        ($puuid == "" or .pane_uuid == $puuid)
+        and ($wuuid == "" or $wu == $wuuid)
+        and ($cwd == "" or .cwd == $cwd)
+        and ($open_only == 0 or .ended == null)
+      )
+      | [.session_id, $wu, (.pane_uuid // ""),
+         (.started // ""), (.ended // ""),
+         (.cwd // ""), (.source // ""),
+         (.window_name // $wn // ""),
+         (.last_title // "")] | join($US)
+    ' "$f"
+  done \
+  | while IFS= read -r row; do
+      local sid="$(printf '%s' "$row" | awk -v FS="$US" '{print $1}')"
+      local rcwd="$(printf '%s' "$row" | awk -v FS="$US" '{print $6}')"
+      [ -z "$sid" ] && continue
+      [ -z "$rcwd" ] && continue
+      local enc="${rcwd//\//-}"
+      [ -f "$projects_root/$enc/$sid.jsonl" ] && printf '%s\n' "$row"
+    done \
+  | sort -t"$US" -k4,4r
+}
+
+print_capture() {
+  # Usage: claude-rescue print [pane_uuid|session_id]
+  #
+  # No arg: print the capture for the current pane's @claude-pane-id.
+  # With arg: try as pane_uuid first (captures/<arg>.txt). If not found,
+  # search meta.json files for a session whose .session_id matches and use
+  # its .pane_uuid.
+  #
+  # Captures are written by claude-rescue-log's hibernate-arm path on hibernation
+  # — they're a snapshot of the pane scrollback at the moment SIGSTOP fired.
+  # Survives reboots, SIGCONT, and pane death; overwritten only by a subsequent
+  # hibernation of the same pane.
+  local arg="${1:-}"
+  local captures_dir="$CLAUDE_RESCUE_DATA_HOME/captures"
+  local pane_uuid="" txt="" meta=""
+
+  if [ -z "$arg" ]; then
+    if [ -z "${TMUX:-}" ]; then
+      echo "claude-rescue print: not inside tmux and no target argument given" >&2
+      return 2
+    fi
+    # Prefer $TMUX_PANE (the pane this script is running IN, set by tmux when
+    # spawning the shell). `tmux display-message -p` without -t returns the
+    # client's CURRENTLY-ACTIVE pane — wrong when print is invoked from a
+    # non-focused pane (e.g. via send-keys from the post-restore-keys path,
+    # or from a daemon/hook context). Only fall back to display-message when
+    # TMUX_PANE is unset (e.g. `tmux run-shell` invocations don't set it).
+    local pane="${TMUX_PANE:-}"
+    [ -z "$pane" ] && pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
+    if [ -z "$pane" ]; then
+      echo "claude-rescue print: cannot determine current pane" >&2
+      return 2
+    fi
+    pane_uuid="$(tmux show-options -pv -t "$pane" @claude-pane-id 2>/dev/null || true)"
+    if [ -z "$pane_uuid" ]; then
+      echo "claude-rescue print: no @claude-pane-id on current pane (no claude session has run here yet)" >&2
+      return 1
+    fi
+  else
+    if [ -f "$captures_dir/$arg.txt" ]; then
+      pane_uuid="$arg"
+    else
+      shopt -s nullglob
+      local metas=("$CLAUDE_RESCUE_DATA_HOME/windows"/*.meta.json)
+      shopt -u nullglob
+      local f resolved
+      for f in "${metas[@]}"; do
+        resolved="$(jq -r --arg sid "$arg" '
+          (.sessions // [])[]
+          | select(.session_id == $sid)
+          | .pane_uuid // empty
+        ' "$f" 2>/dev/null | head -1)"
+        if [ -n "$resolved" ]; then
+          pane_uuid="$resolved"
+          break
+        fi
+      done
+      if [ -z "$pane_uuid" ]; then
+        echo "claude-rescue print: no capture matches '$arg' (tried as pane_uuid and session_id)" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  txt="$captures_dir/$pane_uuid.txt"
+  meta="$captures_dir/$pane_uuid.json"
+  if [ ! -f "$txt" ]; then
+    echo "claude-rescue print: no capture on disk for pane_uuid $pane_uuid" >&2
+    echo "  (this pane has no hibernation snapshot yet)" >&2
     return 1
   fi
 
-  # Loop level 1 ↔ level 2 so esc at level 2 returns to level 1 (esc at
-  # level 1 exits the popup as expected).
-  while true; do
-    local level1_out window_uuid
-    level1_out="$(printf '%s\n' "$rows" \
-      | fzf "${fzf_common[@]}" \
-          --with-nth=2.. --delimiter=$'\t' \
-          --prompt='windows> ' \
-          --header=$'↩ open · ⎋ cancel\nage        #   label' \
-          --preview "$0 preview-window {1}" \
-    )" || return 0
-
-    window_uuid="$(printf '%s' "$level1_out" | cut -f1)"
-    [ -z "$window_uuid" ] && return 0
-
-    # Scrollback fallback: virtual row encodes uuid in the first field as
-    # "scrollback:<session_uuid>". Resume directly without level 2.
-    if [[ "$window_uuid" == scrollback:* ]]; then
-      local sid="${window_uuid#scrollback:}"
-      local cwd
-      cwd="$(scrollback_resolve | awk -F'\t' -v u="$sid" '$1==u {print $2; exit}')"
-      [ -z "$cwd" ] && cwd="$HOME"
-      action_resume_here "$sid" "$cwd"
-      return 0
-    fi
-
-    # --- Level 2: sessions of selected window ---
-    local s_rows
-    s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
-    if [ -z "$s_rows" ]; then
-      echo "(no sessions in window $window_uuid)" >&2
-      return 1
-    fi
-
-    local level2_out key sid
-    level2_out="$(printf '%s\n' "$s_rows" \
-      | fzf "${fzf_common[@]}" \
-          --with-nth=2.. --delimiter=$'\t' \
-          --prompt='sessions> ' \
-          --header=$'↩ resume · ^N win · ^W sess · ^Y copy · ⎋ back\nage      state source          label' \
-          --expect=ctrl-n,ctrl-w,ctrl-y \
-          --preview "$0 preview-session $window_uuid {1}" \
-    )" \
-      && break_inner=1 \
-      || break_inner=0
-
-    if [ "$break_inner" -eq 0 ]; then
-      # esc at level 2 → loop back to level 1
-      continue
-    fi
-
-    key="$(printf '%s' "$level2_out" | sed -n 1p)"
-    sid="$(printf '%s' "$level2_out" | sed -n 2p | cut -f1)"
-    [ -z "$sid" ] && continue
-
-    local cwd
-    cwd="$(jq -r --arg sid "$sid" \
-      '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
-      "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
-    [ -z "$cwd" ] && cwd="$HOME"
-
-    case "$key" in
-      ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
-      ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
-      ctrl-y) action_copy_uuid "$sid" ;;
-      *)      action_resume_here "$sid" "$cwd" ;;
-    esac
-    return 0
-  done
+  if [ -f "$meta" ]; then
+    local m_ts m_sid m_cwd m_pids
+    m_ts="$(jq -r '.ts // ""' "$meta")"
+    m_sid="$(jq -r '.session_id // ""' "$meta")"
+    m_cwd="$(jq -r '.cwd // ""' "$meta")"
+    m_pids="$(jq -r '.pids // [] | join(" ")' "$meta")"
+    {
+      echo "# claude-rescue capture"
+      echo "#   pane_uuid : $pane_uuid"
+      [ -n "$m_ts" ]  && echo "#   captured  : $m_ts"
+      [ -n "$m_sid" ] && echo "#   session   : $m_sid"
+      [ -n "$m_cwd" ] && echo "#   cwd       : $m_cwd"
+      [ -n "$m_pids" ] && echo "#   stopped pids: $m_pids"
+      echo "# ---"
+    } >&2
+  fi
+  cat "$txt"
 }
 
 # ---------------------------------------------------------------------------
@@ -474,8 +777,8 @@ case "$cmd" in
   list-sessions)      shift; list_sessions_tsv "$@" ;;
   preview-window)     shift; preview_window "$@" ;;
   preview-session)    shift; preview_session "$@" ;;
-  scrollback-uuids)   shift; scrollback_uuids "$@" ;;
-  scrollback-resolve) shift; scrollback_resolve "$@" ;;
+  find-sessions)      shift; find_sessions "$@" ;;
+  print)              shift; print_capture "$@" ;;
   '')
     if [ -z "${TMUX:-}" ]; then
       echo "claude-rescue must be run inside tmux" >&2

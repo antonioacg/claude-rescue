@@ -172,10 +172,11 @@ PREVIEW=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/c
 assert_nonempty "picker: preview-window returns content" "$PREVIEW"
 
 # ---------------------------------------------------------------------------
-echo "[install.sh] dry-run accounts for all 3 binaries"
+echo "[install.sh] dry-run accounts for every binary in bin/"
 # Counts both "ln -s" (would link) and "already linked" (idempotent skip).
-DR=$(bash "$REPO/install.sh" --dry-run 2>&1 | grep -cE "ln -s|already linked")
-assert "install.sh dry-run accounts for all 3 binaries" "3" "$DR"
+EXPECTED_BINS=$(find "$REPO/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')
+DR=$(bash "$REPO/scripts/install.sh" --dry-run 2>&1 | grep -cE "ln -s|already linked")
+assert "install.sh dry-run accounts for all binaries" "$EXPECTED_BINS" "$DR"
 
 # ---------------------------------------------------------------------------
 echo "[json] all window logs are valid JSONL"

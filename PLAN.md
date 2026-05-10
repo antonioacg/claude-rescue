@@ -1,5 +1,15 @@
 # claude-rescue — design plan
 
+> **Note (historical):** This is the original design document. The shipped
+> system has since evolved — most notably, the resource-reduction layer is now
+> a **two-stage focus-driven hibernation** (Ctrl+Z soft suspend → `/exit` hard
+> exit) rather than the raw `kill -STOP` / `kill -CONT` approach described
+> below. See `docs/operations/hibernation.md` for the current implementation,
+> `docs/operations/crash-recovery.md` for the resurrect-restore behavior, and
+> `docs/operations/` generally for the live operational surface. The core
+> identity model (`@claude-window-id`, `@claude-pane-id`, per-window event
+> log, picker drill-down) remains as designed here.
+
 A tmux-coupled persistence layer for Claude Code sessions. Survives crashes, indexes session history per tmux window, and provides a Finder-columns drill-down picker via fzf.
 
 ## Problem
@@ -33,7 +43,6 @@ A two-column fzf drill-down navigates this tree. Selecting a session at any leve
   windows/
     <window-uuid>.jsonl       append-only event log
     <window-uuid>.meta.json   cached rollup (cwd, created_at, last_seen, active_sessions[])
-  index.jsonl                 global flat index for fast fzf top-level
   no-tmux/
     <host>__<cwd-hash>.jsonl  fallback bucket for claude run outside tmux
 ```
@@ -91,7 +100,6 @@ The writer is a single small script (`bin/rescue-log`) shared by all event sourc
 1. Reads `@claude-window-id` from the current tmux window (`tmux show-options -wv -t "$pane" @claude-window-id`).
 2. If unset and the event is `session_start`, generates a UUID and stamps it. (Other event kinds bail out if no window-uuid exists — they have no session to attach to.)
 3. Appends the event line and rebuilds the meta rollup.
-4. Updates `index.jsonl` with the latest `last_seen` for the window.
 
 ## fzf picker — Finder-columns drill-down
 
@@ -134,16 +142,9 @@ column 1 (fzf list):                column 2 (--preview):
 
 ## Persistence durability
 
-`@claude-window-id` is a custom user-option set on the tmux window. **Open question to verify before implementation**: does `tmux-resurrect` save `@`-prefixed window options? If yes, recovery is automatic. If no, we need a heal step.
+`@claude-window-id` is a custom user-option set on the tmux window. tmux-resurrect doesn't natively save `@`-prefixed options, so claude-rescue ships its own pair of resurrect hooks: `post-save-layout` writes a sidecar TSV mapping `(session_name, window_index) → @claude-window-id` next to each saved state, and `post-restore-all` re-applies those options from the latest sidecar.
 
-### Heal step (always implement, regardless)
-
-On every `SessionStart`, after reading/setting `@claude-window-id`:
-- Compare `(window_name, primary_cwd)` of the current window against `~/.claude-rescue/index.jsonl`.
-- If a window with matching `(name, cwd)` exists in the index but the current tmux window has no `@claude-window-id`, **adopt** that UUID — assume this is a post-crash restoration of the same window.
-- Log a `kind: "heal"` event for forensics.
-
-This means resurrect's behavior for user-options doesn't gate the design; it just determines how often the heal path fires.
+This is the **only** identity-propagation mechanism. There is no name/cwd-based heal: heuristic matching caused incorrect merges (different windows that happen to share name+cwd) and isn't necessary once the sidecar path is reliable. A window that gets restored gets its UUID back; a window that's freshly opened gets a fresh UUID, even if a closed window had the same shape before. Picker history fragments per UUID — accepted tradeoff.
 
 ## Edge cases
 
@@ -158,8 +159,7 @@ This means resurrect's behavior for user-options doesn't gate the design; it jus
 1. **Writer + Claude hooks + tmux hooks** — `bin/rescue-log`, wire up `SessionStart`/`SessionEnd`/`Stop` in `~/.claude/settings.json`, add `pane-title-changed` / `pane-died` / `client-detached` hooks in `~/.tmux.conf`. Logs start populating immediately, no UI yet. Verify a day's worth of normal use produces sensible logs.
 2. **Pre-flight verification** — confirm `SessionStart` hook input shape includes `session_id`; confirm whether resurrect persists `@`-prefixed user options. Adjust heal step if needed.
 3. **Picker — Level 1 + Level 2** — `bin/claude-rescue` with the two-column drill-down. Bind to `prefix + R` in tmux.
-4. **Live-capture fallback** — if a selected session's UUID isn't found in any log (e.g. the pane crashed before `SessionStart` fired or the user manually cleared logs), fall back to capturing the current pane scrollback live and grepping for UUIDs. Show as a separate "(scrollback search)" entry in the picker.
-5. **SIGSTOP layer (opt-in, separate)** — `pane-focus-out` hook arms a 5-min timer; if the pane stays unfocused, `kill -STOP` any `claude` PID descended from that pane's shell. `pane-focus-in` immediately `kill -CONT`s them. Tradeoff: the open HTTPS connection to Anthropic's API will time out during the pause; on `CONT`, claude may need to reconnect or be restarted. Acceptable for idle panes, harmful mid-stream — gated by a "no output for N seconds" heuristic.
+4. **SIGSTOP layer (opt-in, separate)** — `pane-focus-out` hook arms a 5-min timer; if the pane stays unfocused, `kill -STOP` any `claude` PID descended from that pane's shell. `pane-focus-in` immediately `kill -CONT`s them. Tradeoff: the open HTTPS connection to Anthropic's API will time out during the pause; on `CONT`, claude may need to reconnect or be restarted. Acceptable for idle panes, harmful mid-stream — gated by a "no output for N seconds" heuristic.
 
 ## Repository layout
 
@@ -275,7 +275,7 @@ set -g @resurrect-hook-post-save-layout '~/.config/tmux/hooks/save-userops.sh "$
 set -g @resurrect-hook-post-restore-all '~/.config/tmux/hooks/restore-userops.sh'
 ```
 
-**Heal step demoted to fallback**: the resurrect-hook approach handles the common case (continuum-driven save/restore). The `(window_name, primary_cwd)` heal path stays in the writer to handle edge cases — manual `tmux kill-server` without a recent save, lost sidecar files, importing windows from a different machine. A `kind: "heal"` event is logged when it fires, so we can audit how often the primary mechanism fails.
+**Heal removed**: an earlier draft included a `(window_name, primary_cwd)` heuristic matcher that would re-adopt a prior UUID for "same-shape" windows. It was removed because (a) the sidecar already covers the kill+restore case deterministically, and (b) heal could incorrectly merge two genuinely-different windows that happened to share the same name and cwd. A new window with no live `@claude-window-id` always mints a fresh UUID; closed-and-reopened workflows show as separate picker entries.
 
 ### Q2 — Claude Code `SessionStart` hook input: confirmed
 
@@ -347,13 +347,12 @@ Bundled into the initial release. Implementation:
 
 ## Updated implementation order
 
-1. **Pre-flight: install.sh skeleton + `bin/rescue-log` writer** — single script that handles all event kinds: `session_start`, `session_end`, `title`, `title-commit`, `pane-died`, `client-detached`, `stopped`, `resume_unstop`, `heal`. Includes the heal step. Writes to `$CLAUDE_RESCUE_HOME` (defaults to `~/.claude-rescue/`).
+1. **Pre-flight: install.sh skeleton + `bin/rescue-log` writer** — single script that handles all event kinds: `session_start`, `session_end`, `title`, `title-commit`, `pane-died`, `client-detached`, `stopped`, `resume_unstop`. Writes to `$CLAUDE_RESCUE_HOME` (defaults to `~/.claude-rescue/`).
 2. **tmux hooks file** (`tmux/rescue.tmux.conf`): `pane-title-changed`, `pane-died`, `client-detached`, `pane-focus-out`, `pane-focus-in`. Sourced from a guarded line in `~/.tmux.conf`.
 3. **Claude hooks snippet** (`claude/hooks-snippet.json`): `SessionStart` (matchers for `startup`, `resume`, `clear|compact`), `SessionEnd`. Stdout redirected to /dev/null, stderr to a debug log.
 4. **Picker** (`bin/claude-rescue`): two-column drill-down, popup launch, four exit keys.
 5. **SIGSTOP arm/cancel scripts** invoked from the focus hooks.
-6. **Live-capture fallback** in the picker: if a session UUID isn't in any log, capture current pane scrollback and grep for known UUID patterns.
-7. **Backfill importer** (`bin/rescue-backfill`) — confirmed in scope.
+6. **Backfill importer** (`bin/rescue-backfill`) — confirmed in scope.
 
 ## Backfill importer — design
 
@@ -364,7 +363,6 @@ A one-shot script (`bin/rescue-backfill`) that reconstructs as much history as p
 | Source                                                          | Provides                                                                                  |
 |------------------------------------------------------------------|--------------------------------------------------------------------------------------------|
 | `~/.local/share/tmux/resurrect/default/tmux_resurrect_*.txt`     | Per-snapshot: session/window structure, `pane_title`, `pane_command`, `pane_current_path`, timestamp embedded in filename |
-| `~/.local/share/tmux/resurrect/default/pane_contents.tar.gz`     | Per-pane scrollback at last save — searchable for session UUIDs printed by claude          |
 | `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`          | Authoritative list of all sessions Claude itself knows about, with first user message, model, timestamps |
 
 ### Algorithm
@@ -373,10 +371,9 @@ A one-shot script (`bin/rescue-backfill`) that reconstructs as much history as p
 2. **For each snapshot, parse `pane` lines**: extract `(session_name, window_index, pane_index, pane_title, pane_command, pane_current_path)`.
 3. **Track per-pane title transitions across snapshots**: when a pane's title differs from the previous snapshot for the same `(session_name, window_index, pane_index)`, emit a synthetic `kind: "title"` event timestamped at the *current* snapshot's time. This gives us a coarse but real title timeline at the resurrect-save cadence (1 minute, in your config).
 4. **Extract resumed session UUIDs** from `pane_command` lines containing `-r <uuid>` or `--resume <uuid>` — directly attributable to that pane at that snapshot. Emit `kind: "session_start"` at the snapshot timestamp with `source: "resume_backfill"`.
-5. **Extract fresh-session UUIDs from saved scrollbacks**: extract `pane_contents.tar.gz`, grep each pane's saved buffer for the claude session-id banner pattern. (The latest pane_contents.tar.gz only contains the most recent save's scrollbacks — older scrollbacks are overwritten on each save. This means we can capture session UUIDs for currently-running claude panes that were started fresh, but not for historical fresh starts that have already ended.)
-6. **Cross-reference with `~/.claude/projects/`**: for every backfilled `session_id`, verify a transcript JSONL exists. If yes, read its first user message for a richer label and confirm `cwd`. If no transcript exists, the UUID is dead — log it but don't include in the picker.
-7. **Map historical panes to current `@claude-window-id`s**: for windows that still exist (matched by `(session_name, current pane_current_path)`), associate backfilled events with the live UUID. For windows that have since been closed, mint synthetic UUIDs prefixed `bf-<short-hash>` so they appear in the picker as a separate "(backfilled)" branch — distinguishable from live windows but resumable.
-8. **Write all backfilled events** as a separate pass into `~/.claude-rescue/windows/<window-uuid>.jsonl` with `kind` values suffixed `_backfill` (`title_backfill`, `session_start_backfill`) so a later forensic pass can tell synthesized events apart from observed ones.
+5. **Cross-reference with `~/.claude/projects/`**: for every backfilled `session_id`, verify a transcript JSONL exists. If yes, read its first user message for a richer label and confirm `cwd`. If no transcript exists, the UUID is dead — log it but don't include in the picker.
+6. **Map historical panes to current `@claude-window-id`s**: for windows that still exist (matched by `(session_name, current pane_current_path)`), associate backfilled events with the live UUID. For windows that have since been closed, mint synthetic UUIDs prefixed `bf-<short-hash>` so they appear in the picker as a separate "(backfilled)" branch — distinguishable from live windows but resumable.
+7. **Write all backfilled events** as a separate pass into `~/.claude-rescue/windows/<window-uuid>.jsonl` with `kind` values suffixed `_backfill` (`title_backfill`, `session_start_backfill`) so a later forensic pass can tell synthesized events apart from observed ones.
 
 ### Idempotence
 
@@ -385,9 +382,9 @@ Backfill writes a marker `~/.claude-rescue/.backfill-done` after success with th
 ### Limitations to document
 
 - Title resolution is bounded by the resurrect save interval (1 minute in current config). Faster transitions are lost.
-- Fresh sessions whose scrollback was overwritten by a later resurrect save are unrecoverable from resurrect alone — but if Claude's own JSONL transcript still exists, we can list it as an "orphaned" session in the picker (no associated window/title history, but still resumable).
+- Fresh-session UUIDs not seen via `--resume` in any saved snapshot are unrecoverable through backfill — but if Claude's own JSONL transcript still exists, we can list it as an "orphaned" session in the picker (no associated window/title history, but still resumable).
 - Pane index and window index can drift between snapshots if windows were rearranged. Tracking is by `(session_name, window_name, pane_index)` rather than `window_index` to mitigate.
 
 ## Open questions before coding
 
-None — all design questions resolved above. Remaining unknowns are implementation-level (e.g. exact regex for the streaming-spinner indicator, exact process-tree walking logic, exact format of claude's session-id banner in scrollback) and will be answered while building against the isolated test server.
+None — all design questions resolved above. Remaining unknowns are implementation-level (e.g. exact regex for the streaming-spinner indicator, exact process-tree walking logic) and will be answered while building against the isolated test server.

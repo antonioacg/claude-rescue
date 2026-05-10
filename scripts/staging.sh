@@ -13,10 +13,17 @@
 #     from your default server).
 #
 # Usage:
-#   test/staging.sh setup     install + start staging server (default)
-#   test/staging.sh attach    tmux -L claude-rescue-staging attach
-#   test/staging.sh status    show what's running and where logs are
-#   test/staging.sh teardown  kill server, optionally remove staging dir + symlinks
+#   scripts/staging.sh setup [--fast]  install + start staging server (default)
+#   scripts/staging.sh attach          tmux -L claude-rescue-staging attach
+#   scripts/staging.sh status          show what's running and where logs are
+#   scripts/staging.sh teardown        kill server, optionally remove staging dir + symlinks
+#
+# --fast: also sets the hibernation tunables on the staging server's global env
+# for fast interactive testing (SOFT_DELAY=15s, HARD_DELAY=60s, DEFER_TIMES=0).
+# That gives ~15s focus-out → soft hibernate, ~45s after that → hard escalation
+# (claude /exit + clr <sid> pre-fill). Without --fast, staging uses production
+# defaults (60min / 24h) — useful when you want to mirror live behavior.
+# Interim until #46 (config-file with hot-reload) lands.
 
 set -uo pipefail
 
@@ -25,11 +32,22 @@ STAGING_DIR="${CLAUDE_RESCUE_STAGING_DIR:-$HOME/claude-rescue-staging}"
 SOCK="claude-rescue-staging"
 DATA_DIR="$STAGING_DIR/data"
 
+# Parse flags out of $@, leaving positional args for the case dispatch below.
+FAST=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --fast) FAST=1 ;;
+    *)      ARGS+=("$arg") ;;
+  esac
+done
+set -- "${ARGS[@]}"
+
 # ---------------------------------------------------------------------------
 
 cmd_setup() {
   echo "==> 1. Installing binaries into ~/.local/bin/"
-  bash "$REPO/install.sh" --apply
+  bash "$REPO/scripts/install.sh" --apply
   echo ""
 
   echo "==> 2. Creating staging env at $STAGING_DIR"
@@ -62,6 +80,50 @@ cmd_setup() {
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-rescue-log user_prompt_submit >/dev/null 2>>${DATA_DIR}/rescue-log.err",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-rescue-log pre_tool_use >/dev/null 2>>${DATA_DIR}/rescue-log.err",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-rescue-log post_tool_use >/dev/null 2>>${DATA_DIR}/rescue-log.err",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "claude-rescue-log stop >/dev/null 2>>${DATA_DIR}/rescue-log.err",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
@@ -79,23 +141,43 @@ JSON
 # pull in your real session state.
 set -g @continuum-boot-started 1
 
+# Register claude-rescue hooks BEFORE sourcing ~/.tmux.conf. TPM/continuum
+# bootstrap inside the user's config can fire a save (and historically
+# auto-restore) the moment plugins initialise; if our @resurrect-hook-*
+# options aren't set yet, that pass runs without invoking us — leaving the
+# sidecar unwritten and @claude-window-id un-reapplied across restarts.
+source-file -q "$REPO/tmux/rescue.tmux.conf"
+
 # Load your real config — theme, status bar position, TPM, plugins, keybindings.
 source-file -q "\$HOME/.tmux.conf"
 
 # Now override for staging isolation. These run AFTER ~/.tmux.conf so they win.
-set -g @resurrect-dir "$STAGING_DIR/resurrect"
+# Note: do NOT override @resurrect-dir. The user's main config computes a
+# socket-aware XDG path (e.g. ~/.local/share/tmux/resurrect/<socket-name>),
+# which is already isolated from the main socket and XDG-clean. Overriding
+# here was order-fragile w.r.t. TPM init, sometimes losing to the main path
+# anyway and creating two-source ambiguity across server restarts.
 set -g @resurrect-capture-pane-contents 'on'
 set -g @continuum-restore 'off'
 set -g @continuum-save-interval '1'
 
+# Wire claude-rescue's deterministic resume wrapper into resurrect's
+# @resurrect-processes mapping. On restore, each pane that was running
+# claude is restarted via claude-rescue-resume — which queries the pane's
+# (sidecar-restored) @claude-pane-id, looks up the latest open session via
+# find-sessions, and (when not in dry-run) execs `claude … -r <session_id>`.
+# This replaces the legacy scrollback-grep claude-restore.sh path.
+#
+# In dry-run mode (current default in claude-rescue-resume) the wrapper
+# prints what it would exec and drops into a shell, so kill+restore tests
+# can validate the lookup chain without actually starting claude.
+set -g @resurrect-processes "\"~claude->claude-rescue-resume *\""
+
 # Distinguishable status hint so you can tell staging from your main at a glance.
 set -ag status-right ' [staging]'
 
-# Picker keybinding
+# Picker keybinding (set after main config so user's prefix is in effect).
 bind R run-shell "claude-rescue"
-
-# claude-rescue hooks (sourced last so nothing in main config can clobber them).
-source-file -q "$REPO/tmux/rescue.tmux.conf"
 TMUX
 
   echo "    staging dir ready"
@@ -121,6 +203,17 @@ TMUX
     echo "    started"
   fi
 
+  # --fast: apply fast hibernation delays AFTER the server is up. set-env -g
+  # mutates the server's global env; every `tmux run-shell -b` (which is how
+  # the focus hooks invoke hibernate-arm/resume) inherits these values.
+  if [ "$FAST" -eq 1 ]; then
+    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_SOFT_DELAY 15
+    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HARD_DELAY 60
+    tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HIBERNATE_DEFER_TIMES 0
+    echo "    --fast: SOFT_DELAY=15s HARD_DELAY=60s HIBERNATE_DEFER_TIMES=0"
+    echo "            (soft fires ~15s after focus-out; hard escalates ~45s later)"
+  fi
+
   echo ""
   echo "=========================================================="
   echo " Staging is ready. Attach with:"
@@ -138,7 +231,7 @@ TMUX
   echo "     jq -c . $DATA_DIR/windows/*.jsonl"
   echo ""
   echo " When done:"
-  echo "     $REPO/test/staging.sh teardown"
+  echo "     $REPO/scripts/staging.sh teardown"
   echo "=========================================================="
 }
 
@@ -160,6 +253,10 @@ cmd_status() {
     echo ""
     echo "  Windows:"
     tmux -L "$SOCK" list-windows -aF '    #{session_name}:#{window_index} name=#{window_name} uuid=#{@claude-window-id}'
+    echo ""
+    echo "  CLAUDE_RESCUE_* env on the server (empty → production defaults):"
+    tmux -L "$SOCK" show-environment -g 2>/dev/null | grep '^CLAUDE_RESCUE_' | sed 's/^/    /' \
+      || echo "    (none set)"
   else
     echo "  not running (use 'setup')"
   fi

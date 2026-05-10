@@ -4,21 +4,30 @@
 #
 # Event subcommands (writer):
 #   session_start              Read JSON from stdin (Claude SessionStart hook).
+#                                Event carries optional `claude_pid` field when
+#                                find_my_claude_pid finds an ancestor claude.
 #   session_end                Read JSON from stdin (Claude SessionEnd hook).
+#                                Event carries optional `claude_pid` (same source).
+#   user_prompt_submit         Mark current pane busy (UserPromptSubmit hook).
+#                                Busy marker body is `{ts, claude_pid?}` JSON.
+#   pre_tool_use               Refresh busy mtime (PreToolUse hook).
+#   post_tool_use              Refresh busy mtime (PostToolUse hook).
+#   stop                       Clear busy marker (Stop hook).
 #   title <pane_id> <title>    Schedule a debounced title commit.
 #   title-commit <pane_id>     Internal: commit a debounced title if still settled.
 #   pane-died <pane_id>        Final flush before tmux reaps a pane.
 #   client-detached            Logged at server-wide level (no pane).
-#   stopped <pane_id> <pids>   SIGSTOP layer event.
-#   resume_unstop <pane_id>    SIGSTOP layer event.
+#   hibernated <pane_id> <pids> <mode>  Hibernation layer event (soft|hard|skip).
+#   unhibernated <pane_id> <mode>       Hibernation layer event.
 #
 # Resurrect hooks:
 #   resurrect-save <state_file>   Write @claude-window-id sidecar (post-save-layout).
 #   resurrect-restore             Re-apply @claude-window-id from sidecar (post-restore-all).
 #
-# SIGSTOP layer:
-#   sigstop-arm <pane_id> <pane_pid>   Schedule SIGSTOP after focus-out delay.
-#   sigstop-resume <pane_id>           Cancel pending arm + SIGCONT any stopped PIDs.
+# Hibernation layer (focus-driven pane suspension):
+#   hibernate-arm <pane_id> <pane_pid>   Schedule soft Ctrl+Z after SOFT_DELAY,
+#                                         hard Ctrl+C after HARD_DELAY total.
+#   hibernate-resume <pane_id>           Cancel arm + fg the soft-suspended job.
 #
 # All output goes to stderr. Stdout is reserved (Claude hooks pipe stdout into context).
 
@@ -66,11 +75,12 @@ cmd_session_start() {
     return 0
   fi
 
-  local window_uuid
+  local window_uuid pane_uuid
   window_uuid="$(ensure_window_uuid "$pane_id")" || {
     log_err "session_start: failed to ensure window uuid for $pane_id"
     return 0
   }
+  pane_uuid="$(ensure_pane_uuid "$pane_id")"
 
   # Force-flush any pending title for this pane (so /clear or /compact preserve last task).
   flush_pending_title "$pane_id" "$window_uuid"
@@ -78,27 +88,31 @@ cmd_session_start() {
   # On /clear or /compact: emit synthetic session_end for the prior session in this pane.
   if [ "$source" = "clear" ] || [ "$source" = "compact" ]; then
     local prior
-    prior="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+    prior="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
     if [ -n "$prior" ]; then
       append_event "$window_uuid" "$(jq -nc \
-        --arg ts "$(now_iso)" --arg sid "$prior" --arg pane "$pane_id" --arg reason "$source" \
-        '{ts:$ts, kind:"session_end", session_id:$sid, pane_id:$pane, reason:$reason}')"
+        --arg ts "$(now_iso)" --arg sid "$prior" \
+        --arg puuid "$pane_uuid" --arg reason "$source" \
+        '{ts:$ts, kind:"session_end", session_id:$sid, pane_uuid:$puuid, reason:$reason}')"
     fi
   fi
 
-  local session_name window_index window_name pane_cwd
+  local session_name window_index window_name pane_cwd claude_pid
   IFS=$'\t' read -r session_name window_index window_name pane_cwd \
     < <(tmux_pane_info "$pane_id" || echo $'\t\t\t')
+  claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
 
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg sid "$session_id" --arg pane "$pane_id" \
+    --arg ts "$(now_iso)" --arg sid "$session_id" \
+    --arg puuid "$pane_uuid" \
     --arg cwd "${cwd:-$pane_cwd}" --arg src "$source" --arg model "$model" \
     --arg tr "$transcript" --arg sn "$session_name" --arg wn "$window_name" \
-    '{ts:$ts, kind:"session_start", session_id:$sid, pane_id:$pane,
+    --arg cpid "${claude_pid:-}" \
+    '{ts:$ts, kind:"session_start", session_id:$sid, pane_uuid:$puuid,
       cwd:$cwd, source:$src, model:$model, transcript_path:$tr,
-      session_name:$sn, window_name:$wn}')"
+      session_name:$sn, window_name:$wn} +
+     (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
 
-  update_index "$window_uuid" "$session_name" "$window_name" "${cwd:-$pane_cwd}"
   rebuild_meta "$window_uuid"
 }
 
@@ -129,9 +143,17 @@ cmd_session_end() {
 
   flush_pending_title "$pane_id" "$window_uuid"
 
+  local pane_uuid claude_pid
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg sid "$session_id" --arg pane "$pane_id" --arg reason "exit" \
-    '{ts:$ts, kind:"session_end", session_id:$sid, pane_id:$pane, reason:$reason}')"
+    --arg ts "$(now_iso)" --arg sid "$session_id" \
+    --arg puuid "$pane_uuid" --arg reason "exit" \
+    --arg cpid "${claude_pid:-}" \
+    '{ts:$ts, kind:"session_end", session_id:$sid, pane_uuid:$puuid, reason:$reason} +
+     (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
+  # Safety net: clear the busy marker if Stop didn't fire (e.g. claude crashed).
+  clear_busy "$pane_uuid"
   rebuild_meta "$window_uuid"
 }
 
@@ -170,15 +192,16 @@ cmd_title_commit() {
     return 0
   fi
 
-  local window_uuid session_id
+  local window_uuid session_id pane_uuid
   window_uuid="$(tmux_get_window_uuid "$pane_id")"
   [ -z "$window_uuid" ] && return 0
-  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
 
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$now" --arg t "$title" --arg pane "$pane_id" \
-    --arg sid "${session_id:-}" \
-    '{ts:$ts, kind:"title", pane_id:$pane, title:$t} +
+    --arg ts "$now" --arg t "$title" \
+    --arg puuid "$pane_uuid" --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
      (if $sid == "" then {} else {session_id:$sid} end)')"
   printf '%s' "$title" > "$last"
   rebuild_meta "$window_uuid"
@@ -188,14 +211,16 @@ cmd_pane_died() {
   local pane_id="$1"
   [ -z "$pane_id" ] && return 0
   # Pane is gone, but window options may still resolve via the parent window.
-  local window_uuid
+  local window_uuid pane_uuid
   window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
   [ -z "$window_uuid" ] && return 0
+  # Pane option likely already gone with the pane; best-effort.
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
 
   flush_pending_title "$pane_id" "$window_uuid"
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg pane "$pane_id" \
-    '{ts:$ts, kind:"pane_died", pane_id:$pane}')"
+    --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
+    '{ts:$ts, kind:"pane_died", pane_uuid:$puuid}')"
   rebuild_meta "$window_uuid"
 }
 
@@ -205,31 +230,36 @@ cmd_client_detached() {
   printf '%s\n' "$(now_iso)" >> "$marker"
 }
 
-cmd_stopped() {
-  local pane_id="$1" pids="${2:-}"
+cmd_hibernated() {
+  # Args: $1 = pane_id, $2 = pids (or skip reason like "skip:busy"),
+  #       $3 = mode ("soft"|"hard"|"skip")
+  local pane_id="$1" pids="${2:-}" mode="${3:-soft}"
   [ -z "$pane_id" ] && return 0
-  local window_uuid session_id
+  local window_uuid session_id pane_uuid
   window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
   [ -z "$window_uuid" ] && return 0
-  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg pane "$pane_id" --arg pids "$pids" \
-    --arg sid "${session_id:-}" \
-    '{ts:$ts, kind:"stopped", pane_id:$pane, pids:$pids} +
+    --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
+    --arg pids "$pids" --arg sid "${session_id:-}" --arg mode "$mode" \
+    '{ts:$ts, kind:"hibernated", pane_uuid:$puuid, pids:$pids, mode:$mode} +
      (if $sid == "" then {} else {session_id:$sid} end)')"
 }
 
-cmd_resume_unstop() {
-  local pane_id="$1"
+cmd_unhibernated() {
+  # Args: $1 = pane_id, $2 = mode previously hibernated as ("soft"|"hard")
+  local pane_id="$1" mode="${2:-}"
   [ -z "$pane_id" ] && return 0
-  local window_uuid session_id
+  local window_uuid session_id pane_uuid
   window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
   [ -z "$window_uuid" ] && return 0
-  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg pane "$pane_id" \
-    --arg sid "${session_id:-}" \
-    '{ts:$ts, kind:"resume_unstop", pane_id:$pane} +
+    --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
+    --arg sid "${session_id:-}" --arg mode "$mode" \
+    '{ts:$ts, kind:"unhibernated", pane_uuid:$puuid, mode:$mode} +
      (if $sid == "" then {} else {session_id:$sid} end)')"
 }
 
@@ -237,14 +267,22 @@ cmd_resume_unstop() {
 
 # Returns the session_id of the most recent session_start in this window+pane
 # that has not been followed by a session_end (or empty if none).
+# Pane is identified by its durable pane_uuid (@claude-pane-id), not the
+# transient tmux %N pane_id.
 latest_open_session_in_pane() {
-  local window_uuid="$1" pane_id="$2"
+  # Returns the session_id of the most recent session_start in this window+pane,
+  # ordered by event timestamp (NOT insertion order). The previous reduce-based
+  # implementation returned the first-seen session_id whose latest event was a
+  # start, which misattributed when a pane switched between sessions without an
+  # explicit SessionEnd (claude doesn't fire SessionEnd when the user resumes
+  # a different session — only on /clear, /compact, and exit).
+  local window_uuid="$1" pane_uuid="$2"
   local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
   [ -f "$log" ] || return 0
-  jq -rs --arg pane "$pane_id" '
-    [.[] | select(.pane_id == $pane and (.kind == "session_start" or .kind == "session_end"))]
-    | reduce .[] as $e ({}; . + {($e.session_id): $e.kind})
-    | to_entries | map(select(.value == "session_start")) | .[-1].key // empty
+  [ -z "$pane_uuid" ] && return 0
+  jq -rs --arg puuid "$pane_uuid" '
+    [.[] | select(.pane_uuid == $puuid and (.kind | startswith("session_start")))]
+    | sort_by(.ts) | last | .session_id // empty
   ' "$log"
 }
 
@@ -258,12 +296,13 @@ flush_pending_title() {
   if [ -f "$last" ] && [ "$(cat "$last")" = "$title" ]; then
     return 0
   fi
-  local session_id
-  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+  local session_id pane_uuid
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
   append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg t "$title" --arg pane "$pane_id" \
-    --arg sid "${session_id:-}" \
-    '{ts:$ts, kind:"title", pane_id:$pane, title:$t, forced:true} +
+    --arg ts "$(now_iso)" --arg t "$title" \
+    --arg puuid "$pane_uuid" --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t, forced:true} +
      (if $sid == "" then {} else {session_id:$sid} end)')"
   printf '%s' "$title" > "$last"
 }
@@ -302,11 +341,19 @@ cmd_resurrect_save() {
   [ -n "$state_file" ] || return 0
   [ -f "$state_file" ] || return 0
 
-  # 1. Sidecar — preserves @claude-window-id across server restarts.
+  # 1. Sidecar — preserves @claude-window-id AND @claude-pane-id across server
+  # restarts. Format is type-prefixed TSV; restore reads each line by leading
+  # column. Legacy 4-column rows (no leading type) are still understood by
+  # the restore handler for backwards compat.
+  #   window<TAB>session<TAB>window_idx<TAB>window_name<TAB>uuid
+  #   pane<TAB>session<TAB>window_idx<TAB>pane_idx<TAB>pane_uuid
   local sidecar="${state_file%.txt}.claude-userops.tsv"
-  tmux list-windows -aF $'#{session_name}\t#{window_index}\t#{window_name}\t#{@claude-window-id}' \
-    | awk -F'\t' 'NF==4 && $4 != "" { print }' \
-    > "$sidecar.tmp"
+  {
+    tmux list-windows -aF $'window\t#{session_name}\t#{window_index}\t#{window_name}\t#{@claude-window-id}' \
+      | awk -F'\t' 'NF==5 && $5 != "" { print }'
+    tmux list-panes -aF $'pane\t#{session_name}\t#{window_index}\t#{pane_index}\t#{@claude-pane-id}' \
+      | awk -F'\t' 'NF==5 && $5 != "" { print }'
+  } > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
 
   # 2. Per-pane sample — emit title transitions and detect pane death.
@@ -320,7 +367,7 @@ cmd_resurrect_save() {
   # empty fields like an unset pane_title — shifting subsequent fields and
   # making @claude-window-id read empty. Non-whitespace IFS preserves them.
   local US=$'\x1f'
-  while IFS="$US" read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid; do
+  while IFS="$US" read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid pane_uuid; do
     [ -z "$pane_id" ] && continue
     [ -z "$window_uuid" ] && continue
     printf '%s\n' "$pane_id" >> "$current_panes_file"
@@ -332,15 +379,15 @@ cmd_resurrect_save() {
 
     if [ -n "$pane_title" ] && [ "$pane_title" != "$prev_title" ]; then
       local session_id
-      session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_id")"
+      session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
       append_event "$window_uuid" "$(jq -nc \
-        --arg ts "$(now_iso)" --arg t "$pane_title" --arg pane "$pane_id" \
-        --arg sid "${session_id:-}" \
-        '{ts:$ts, kind:"title", pane_id:$pane, title:$t} +
+        --arg ts "$(now_iso)" --arg t "$pane_title" \
+        --arg puuid "$pane_uuid" --arg sid "${session_id:-}" \
+        '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
          (if $sid == "" then {} else {session_id:$sid} end)')"
       printf '%s' "$pane_title" > "$last_file"
     fi
-  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}")
+  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}${US}#{@claude-pane-id}")
 
   # 2b. Detect panes that disappeared since last sample (deferred pane-died).
   # Defensive guard: if this sample saw ZERO live panes with @claude-window-id,
@@ -369,25 +416,28 @@ cmd_resurrect_save() {
     if ! grep -qxF "$original_pane_id" "$current_panes_file" 2>/dev/null; then
       # Pane no longer exists; emit pane_died if we have a window UUID for it.
       local last_window_uuid_file="$snapshot_dir/$stale_pane.window_uuid"
-      [ -f "$last_window_uuid_file" ] || { rm -f "$stale_file" "$owner_file"; continue; }
-      local last_window_uuid
+      local last_pane_uuid_file="$snapshot_dir/$stale_pane.pane_uuid"
+      [ -f "$last_window_uuid_file" ] || { rm -f "$stale_file" "$owner_file" "$last_pane_uuid_file"; continue; }
+      local last_window_uuid last_pane_uuid
       last_window_uuid="$(cat "$last_window_uuid_file")"
+      last_pane_uuid="$(cat "$last_pane_uuid_file" 2>/dev/null || true)"
       append_event "$last_window_uuid" "$(jq -nc \
-        --arg ts "$(now_iso)" --arg pane "$original_pane_id" \
-        '{ts:$ts, kind:"pane_died", pane_id:$pane, source:"resurrect_sample"}')"
-      rm -f "$stale_file" "$owner_file" "$last_window_uuid_file"
+        --arg ts "$(now_iso)" --arg puuid "$last_pane_uuid" \
+        '{ts:$ts, kind:"pane_died", pane_uuid:$puuid, source:"resurrect_sample"}')"
+      rm -f "$stale_file" "$owner_file" "$last_window_uuid_file" "$last_pane_uuid_file"
     fi
   done
 
-  # 2c. Update owner + window_uuid sidecars for currently-live panes.
+  # 2c. Update owner + window_uuid + pane_uuid sidecars for currently-live panes.
   # Same US separator as above to handle empty pane_title correctly.
-  while IFS="$US" read -r pane_id _ _ _ _ _ window_uuid; do
+  while IFS="$US" read -r pane_id _ _ _ _ _ window_uuid pane_uuid; do
     [ -z "$pane_id" ] && continue
     [ -z "$window_uuid" ] && continue
     local san="${pane_id//[^A-Za-z0-9]/_}"
     printf '%s' "$pane_id" > "$snapshot_dir/$san.owner"
     printf '%s' "$window_uuid" > "$snapshot_dir/$san.window_uuid"
-  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}")
+    printf '%s' "$pane_uuid" > "$snapshot_dir/$san.pane_uuid"
+  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}${US}#{@claude-pane-id}")
 
   rm -f "$current_panes_file"
 
@@ -400,7 +450,12 @@ cmd_resurrect_save() {
 
 cmd_resurrect_restore() {
   # Hooked into tmux-resurrect via @resurrect-hook-post-restore-all.
-  # Re-applies @claude-window-id from the sidecar TSV.
+  # Re-applies @claude-window-id and @claude-pane-id from the sidecar TSV.
+  # Accepts two formats:
+  #   legacy (4 cols): session<TAB>window_idx<TAB>window_name<TAB>@claude-window-id
+  #   current (5 cols, type-prefixed):
+  #     window<TAB>session<TAB>window_idx<TAB>window_name<TAB>uuid
+  #     pane<TAB>session<TAB>window_idx<TAB>pane_idx<TAB>uuid
   local resurrect_dir
   resurrect_dir="$(tmux show-options -gv @resurrect-dir 2>/dev/null || true)"
   if [ -z "$resurrect_dir" ]; then
@@ -415,34 +470,217 @@ cmd_resurrect_restore() {
   local state_file="$resurrect_dir/$state_basename"
   local sidecar="${state_file%.txt}.claude-userops.tsv"
   [ -f "$sidecar" ] || return 0
-  while IFS=$'\t' read -r session_name window_index window_name uuid; do
-    [ -n "$uuid" ] || continue
-    tmux set-option -wt "$session_name:$window_index" @claude-window-id "$uuid" 2>/dev/null || true
+
+  while IFS=$'\t' read -r col1 col2 col3 col4 col5; do
+    if [ -z "$col5" ]; then
+      # Legacy 4-col line: window only.
+      [ -n "$col4" ] || continue
+      tmux set-option -wt "$col1:$col2" @claude-window-id "$col4" 2>/dev/null || true
+    else
+      case "$col1" in
+        window)
+          [ -n "$col5" ] || continue
+          tmux set-option -wt "$col2:$col3" @claude-window-id "$col5" 2>/dev/null || true
+          ;;
+        pane)
+          [ -n "$col5" ] || continue
+          tmux set-option -pt "$col2:$col3.$col4" @claude-pane-id "$col5" 2>/dev/null || true
+          ;;
+      esac
+    fi
   done < "$sidecar"
+
+  # === Crash-promote: any pane that was soft-hibernated when the server died
+  # is effectively hard-hibernated now (claude died with the crash). Rewrite
+  # the marker so hibernate-resume on next focus-in is a no-op (no spurious
+  # `fg<Enter>` to a fresh shell with no suspended job).
+  local marker current_mode
+  for marker in "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.json; do
+    [ -f "$marker" ] || continue
+    current_mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
+    if [ "$current_mode" = "soft" ]; then
+      jq --arg mode "hard" --arg ts "$(now_iso)" \
+         '. + {mode:$mode, hard_ts:$ts, hard_source:"crash-promote"}' \
+         "$marker" > "$marker.tmp" && mv "$marker.tmp" "$marker"
+    fi
+  done
+  # Stale arm pid files refer to processes from the dead server.
+  rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid
+
+  # === Post-restore UX: for each pane with a hard-hibernation marker AND no
+  # live claude process, run `claude-rescue print` (shows the captured
+  # snapshot) and pre-fill `clr <sid>` (no Enter — user reviews and presses
+  # Enter to resume). Skip if claude is alive in the pane: tmux-resurrect
+  # reports pane_current_command='claude' even when claude was Ctrl+Z'd to
+  # background, so soft-hibernated panes get auto-resumed by the resurrect
+  # @resurrect-processes wrapper. In that case, sending keys would feed text
+  # into the running claude — not what we want.
+  #
+  # Done in a backgrounded subshell to avoid blocking the pre-restore hook;
+  # sleeps long enough for resurrect to finish launching pane processes and
+  # the shell (or restored claude) to render its prompt.
+  (
+    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/restore-keys.err"
+    sleep 5
+
+    local pane_id pane_uuid hib_marker mode hard_source sid cap_meta
+    while IFS=$'\t' read -r pane_id pane_uuid; do
+      [ -n "$pane_uuid" ] || continue
+      hib_marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+      [ -f "$hib_marker" ] || continue
+      mode="$(jq -r '.mode // empty' "$hib_marker" 2>/dev/null)"
+      [ "$mode" = "hard" ] || continue
+
+      # Discriminate by INTENT, not by current state. A crash-promoted marker
+      # means a soft-hibernated pane that resurrect is bringing back via the
+      # wrapper — the foreground process is racing through
+      # shell → claude-rescue-resume → claude, and pane_current_command could
+      # report any of those depending on timing. Sending keys into that pipeline
+      # corrupts the resume. Skip; marker will be cleaned up on the next
+      # pane-focus-in (hibernate-resume sees mode=hard, no-ops, deletes file).
+      hard_source="$(jq -r '.hard_source // empty' "$hib_marker" 2>/dev/null)"
+      if [ "$hard_source" = "crash-promote" ]; then
+        continue
+      fi
+
+      cap_meta="$CLAUDE_RESCUE_DATA_HOME/captures/$pane_uuid.json"
+      sid="$(jq -r '.session_id // empty' "$cap_meta" 2>/dev/null)"
+
+      # 1. Print the captured snapshot (uses default-arg path which reads
+      #    @claude-pane-id re-applied from the sidecar above).
+      tmux send-keys -t "$pane_id" "claude-rescue print" Enter 2>/dev/null || true
+      sleep 0.5
+      # 2. Pre-fill resume command (no Enter). User hits Enter to start.
+      if [ -n "$sid" ]; then
+        tmux send-keys -t "$pane_id" "clr $sid" 2>/dev/null || true
+      fi
+
+      rm -f "$hib_marker"
+    done < <(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}' 2>/dev/null)
+  ) &
+  disown 2>/dev/null || true
 }
 
-# --- SIGSTOP layer (focus-driven STOP/CONT for idle claude processes) -------
+# --- Busy markers (deterministic claude-busy state, hook-driven) ------------
+# UserPromptSubmit / PreToolUse / PostToolUse mark the pane busy by touching
+# $CACHE/busy/<pane_uuid>. Stop / SessionEnd clear it. cmd_hibernate_arm reads
+# this instead of grep'ing the streaming spinner glyph from the pane title —
+# deterministic, theme-independent, no race against terminal repaint timing.
+#
+# The marker is keyed by pane_uuid (durable identity), so resurrect+restore
+# across server restarts preserves attribution. Freshness window
+# (CLAUDE_RESCUE_BUSY_FRESHNESS, default 1800s) prevents a crashed claude
+# that never fired Stop from leaving the pane permanently "busy".
 
-cmd_sigstop_arm() {
-  # Args: $1 = pane_id, $2 = pane_pid (root of the pane's process tree).
-  # Spawns a backgrounded timer that, after CLAUDE_RESCUE_STOP_DELAY (default 300s):
-  #   - defers up to N times if the pane title contains the streaming spinner,
-  #   - walks the pane's process tree, finds processes named "claude",
-  #   - issues kill -STOP and records PIDs to $CLAUDE_RESCUE_CACHE_HOME/stopped/<pane>.json.
-  # If a corresponding sigstop-resume runs first, the timer is cancelled.
+mark_busy() {
+  # Args: $1 = pane_uuid, $2 = optional claude_pid
+  # Writes a tiny JSON body {claude_pid, ts} into the marker so a stale or
+  # confused marker can be traced back to which claude wrote it. The freshness
+  # check in is_busy() still uses file mtime — we ignore the JSON body for
+  # busy/idle decision; it's purely for troubleshooting.
+  local pane_uuid="$1" claude_pid="${2:-}"
+  [ -z "$pane_uuid" ] && return 0
+  local f="$CLAUDE_RESCUE_CACHE_HOME/busy/$pane_uuid"
+  jq -nc --arg ts "$(now_iso)" --arg cpid "$claude_pid" \
+    '{ts:$ts} + (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)' \
+    > "$f" 2>/dev/null || : > "$f" 2>/dev/null || true
+}
+
+clear_busy() {
+  local pane_uuid="$1"
+  [ -z "$pane_uuid" ] && return 0
+  rm -f "$CLAUDE_RESCUE_CACHE_HOME/busy/$pane_uuid"
+}
+
+# Returns 0 if pane is busy AND marker mtime is within the freshness window.
+is_busy() {
+  local pane_uuid="$1"
+  [ -z "$pane_uuid" ] && return 1
+  local f="$CLAUDE_RESCUE_CACHE_HOME/busy/$pane_uuid"
+  [ -f "$f" ] || return 1
+  local freshness="${CLAUDE_RESCUE_BUSY_FRESHNESS:-1800}"
+  local now mt
+  now=$(date +%s)
+  mt=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)
+  [ "$((now - mt))" -lt "$freshness" ]
+}
+
+# Shared body for the four busy-tracking claude hooks. Reads (and discards)
+# stdin — claude pipes hook-event JSON there, and not draining can stall the
+# claude side on small writes. Looks up the calling claude's pid so the busy
+# marker file body can be cross-referenced with session_start events for
+# troubleshooting.
+__busy_hook() {
+  local action="$1"  # "mark" | "clear"
+  cat >/dev/null 2>&1 || true
+  local pane_id="${TMUX_PANE:-}"
+  [ -z "$pane_id" ] && return 0
+  [ -z "${TMUX:-}" ] && return 0
+  local pane_uuid
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+  [ -z "$pane_uuid" ] && return 0
+  case "$action" in
+    mark)
+      local claude_pid
+      claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
+      mark_busy "$pane_uuid" "$claude_pid"
+      ;;
+    clear) clear_busy "$pane_uuid" ;;
+  esac
+}
+
+cmd_user_prompt_submit() { __busy_hook mark ; }
+cmd_pre_tool_use()       { __busy_hook mark ; }   # refreshes mtime mid-run
+cmd_post_tool_use()      { __busy_hook mark ; }   # refreshes mtime mid-run
+cmd_stop()               { __busy_hook clear ; }
+
+# --- Hibernation layer (two-stage focus-driven pane suspension) -------------
+#
+# Stage 1 (SOFT): after CLAUDE_RESCUE_SOFT_DELAY (default 60min) of focus-out,
+#   capture the pane scrollback to disk, then `tmux send-keys C-z`. The pane's
+#   tty driver issues SIGTSTP to the foreground process group, claude (and any
+#   uv/python tool children) stop cleanly, and the shell takes the terminal
+#   back. Resume via shell job control (fg) preserves session and unfreezes
+#   children correctly — unlike a raw `kill -STOP` / `kill -CONT` pair which
+#   does not restore tcsetpgrp and can leave claude+children stuck in T after
+#   the resume signal is delivered.
+#
+# Stage 2 (HARD): if the pane stays defocused and soft-hibernated for
+#   CLAUDE_RESCUE_HARD_DELAY (default 24h), wake claude with `fg<Enter>` then
+#   send `C-c` twice for a clean exit. Frees all resources. The capture file
+#   stays on disk for `claude-rescue print` so the user can recall context and
+#   resume the session from the picker.
+#
+# Resume (focus-in): hibernate-resume is called by the pane-focus-in tmux
+#   hook. Soft → `fg<Enter>`. Hard → no-op (claude is gone; capture remains).
+#
+# Capture is the universal first step: written before the soft signal fires,
+# so even if the send-keys path is broken, we still have the snapshot. The
+# hard upgrade reuses the same capture (claude was suspended in between and
+# couldn't have changed pane content).
+
+cmd_hibernate_arm() {
+  # Args: $1 = pane_id, $2 = pane_pid (root of pane's process tree).
   local pane_id="${1:-}" pane_pid="${2:-}"
   [ -n "$pane_id" ] || return 0
   [ -n "$pane_pid" ] || return 0
 
-  local DELAY="${CLAUDE_RESCUE_STOP_DELAY:-300}"
-  local DEFER_TIMES="${CLAUDE_RESCUE_STOP_DEFER_TIMES:-3}"
-  local DEFER_SECONDS="${CLAUDE_RESCUE_STOP_DEFER_SECONDS:-60}"
-  local SPINNER_REGEX="${CLAUDE_RESCUE_SPINNER_REGEX:-✳}"
+  # Fast guard: panes that have never run claude have no @claude-pane-id and
+  # nothing worth hibernating. Skips a 60-minute disowned timer for every
+  # focus-out on a plain shell pane.
+  local _puuid
+  _puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+  [ -n "$_puuid" ] || return 0
+
+  local SOFT_DELAY="${CLAUDE_RESCUE_SOFT_DELAY:-3600}"
+  local HARD_DELAY="${CLAUDE_RESCUE_HARD_DELAY:-86400}"
+  local DEFER_TIMES="${CLAUDE_RESCUE_HIBERNATE_DEFER_TIMES:-3}"
+  local DEFER_SECONDS="${CLAUDE_RESCUE_HIBERNATE_DEFER_SECONDS:-60}"
   local TARGET_COMM="${CLAUDE_RESCUE_TARGET_COMM:-claude}"
 
   local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.arm.pid"
-  local stopped_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.json"
+  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$_puuid.json"
 
   # If a timer is already running for this pane, leave it.
   if [ -f "$arm_pid_file" ]; then
@@ -455,18 +693,21 @@ cmd_sigstop_arm() {
   fi
 
   (
-    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/sigstop-arm.err"
-    sleep "$DELAY"
+    exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/hibernate.err"
 
-    local title active pids cur child cmd queue
+    # ===== STAGE 1: SOFT (capture + Ctrl+Z) =====
+    sleep "$SOFT_DELAY"
+
+    # Busy-aware defer (UserPromptSubmit/Pre|PostToolUse touch the busy file;
+    # Stop clears it). Skips title-spinner regex which depended on the
+    # configured theme's streaming glyph.
+    local active pids cur child cmd queue
     for _ in $(seq 1 "$DEFER_TIMES"); do
-      title="$(tmux display-message -p -t "$pane_id" -F '#{pane_title}' 2>/dev/null || echo "")"
-      if [[ "$title" =~ $SPINNER_REGEX ]]; then sleep "$DEFER_SECONDS"; else break; fi
+      if is_busy "$_puuid"; then sleep "$DEFER_SECONDS"; else break; fi
     done
 
-    title="$(tmux display-message -p -t "$pane_id" -F '#{pane_title}' 2>/dev/null || echo "")"
-    if [[ "$title" =~ $SPINNER_REGEX ]]; then
-      cmd_stopped "$pane_id" "skip:streaming" 2>/dev/null || true
+    if is_busy "$_puuid"; then
+      cmd_hibernated "$pane_id" "skip:busy" "skip" 2>/dev/null || true
       rm -f "$arm_pid_file"
       exit 0
     fi
@@ -477,6 +718,9 @@ cmd_sigstop_arm() {
       exit 0
     fi
 
+    # Walk pane process tree for record-keeping. We don't actually signal
+    # individual PIDs anymore (Ctrl+Z via terminal handles the whole pgid),
+    # but we record what claude PIDs were live at hibernation time.
     pids=""
     queue=("$pane_pid")
     while [ ${#queue[@]} -gt 0 ]; do
@@ -494,13 +738,117 @@ cmd_sigstop_arm() {
       exit 0
     fi
 
-    local pid
-    for pid in $pids; do kill -STOP "$pid" 2>/dev/null || true; done
-    jq -nc --arg pane "$pane_id" --arg ts "$(now_iso)" --arg pids "$pids" \
-      '{pane_id:$pane, ts:$ts, pids:($pids | gsub("^ +| +$";"") | split(" "))}' \
-      > "$stopped_file"
+    # === Capture pane scrollback FIRST (before any signal). Universal — the
+    # hard-upgrade stage reuses this exact capture. ===
+    local window_uuid session_id cwd capture_txt capture_meta
+    window_uuid="$(tmux_get_window_uuid "$pane_id" 2>/dev/null || true)"
+    session_id=""
+    [ -n "$window_uuid" ] && \
+      session_id="$(latest_open_session_in_pane "$window_uuid" "$_puuid" 2>/dev/null || true)"
+    cwd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_path}' 2>/dev/null || echo "")"
+    capture_txt="$CLAUDE_RESCUE_DATA_HOME/captures/$_puuid.txt"
+    capture_meta="$CLAUDE_RESCUE_DATA_HOME/captures/$_puuid.json"
+    if tmux capture-pane -peJ -S - -t "$pane_id" > "$capture_txt.tmp" 2>/dev/null; then
+      mv "$capture_txt.tmp" "$capture_txt"
+    else
+      rm -f "$capture_txt.tmp"
+    fi
+    jq -nc \
+      --arg pane_uuid "$_puuid" \
+      --arg window_uuid "${window_uuid:-}" \
+      --arg session_id "${session_id:-}" \
+      --arg pane_id "$pane_id" \
+      --arg ts "$(now_iso)" \
+      --arg cwd "$cwd" \
+      --arg pids "$pids" \
+      '{pane_uuid:$pane_uuid, window_uuid:$window_uuid, session_id:$session_id,
+        pane_id:$pane_id, ts:$ts, cwd:$cwd,
+        pids:($pids | gsub("^ +| +$";"") | split(" "))}' \
+      > "$capture_meta.tmp" \
+      && mv "$capture_meta.tmp" "$capture_meta"
 
-    cmd_stopped "$pane_id" "$pids" 2>/dev/null || true
+    # === Soft hibernate: send Ctrl+Z. The tty driver issues SIGTSTP to the
+    # foreground process group, the shell takes terminal control back. ===
+    tmux send-keys -t "$pane_id" C-z 2>/dev/null || true
+
+    jq -nc --arg pane "$pane_id" --arg puuid "$_puuid" --arg ts "$(now_iso)" \
+           --arg pids "$pids" --arg mode "soft" \
+      '{pane_id:$pane, pane_uuid:$puuid, ts:$ts, mode:$mode,
+        pids:($pids | gsub("^ +| +$";"") | split(" "))}' \
+      > "$hibernated_file"
+
+    cmd_hibernated "$pane_id" "$pids" "soft" 2>/dev/null || true
+
+    # ===== STAGE 2: HARD (fg + Ctrl+C × 2) =====
+    local hard_remaining=$((HARD_DELAY - SOFT_DELAY))
+    if [ "$hard_remaining" -le 0 ]; then
+      rm -f "$arm_pid_file"
+      exit 0
+    fi
+    sleep "$hard_remaining"
+
+    # Bail out if the hibernated marker is gone (resume already happened) or
+    # already hard, or pane is currently focused.
+    [ -f "$hibernated_file" ] || { rm -f "$arm_pid_file"; exit 0; }
+    local current_mode
+    current_mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+    [ "$current_mode" = "soft" ] || { rm -f "$arm_pid_file"; exit 0; }
+
+    active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
+    if [ "$active" = "11" ]; then
+      rm -f "$arm_pid_file"
+      exit 0
+    fi
+
+    # Wake claude (fg restores tcsetpgrp + SIGCONT). Then send `/exit<Enter>`
+    # which is claude's own slash command — fires SessionEnd cleanly, flushes
+    # transcript, claude exits gracefully. Fall back to SIGTERM then SIGKILL
+    # if claude is still alive (e.g. mid-stream and ignoring slash commands).
+    tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
+    sleep 1
+    tmux send-keys -t "$pane_id" "/exit" Enter 2>/dev/null || true
+    sleep 3
+
+    # Check claude is gone; if not, escalate.
+    local pid still_alive=""
+    for pid in $pids; do
+      if kill -0 "$pid" 2>/dev/null; then
+        still_alive="$still_alive $pid"
+      fi
+    done
+    if [ -n "${still_alive// /}" ]; then
+      for pid in $still_alive; do kill -TERM "$pid" 2>/dev/null || true; done
+      sleep 2
+      still_alive=""
+      for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then
+          still_alive="$still_alive $pid"
+        fi
+      done
+      if [ -n "${still_alive// /}" ]; then
+        for pid in $still_alive; do kill -KILL "$pid" 2>/dev/null || true; done
+      fi
+    fi
+
+    jq --arg mode "hard" --arg ts "$(now_iso)" \
+       '. + {mode:$mode, hard_ts:$ts}' \
+       "$hibernated_file" > "$hibernated_file.tmp" \
+       && mv "$hibernated_file.tmp" "$hibernated_file"
+
+    # Pre-fill `clr <session_id>` at the now-shell prompt (no Enter — user
+    # hits Enter when ready). The pane already shows the pre-suspend content
+    # (claude exited via /exit which doesn't clear the screen), so no need
+    # to also send `claude-rescue print`. The crash-restore path (post
+    # resurrect-restore) is the one that needs the explicit print since the
+    # pane is reborn empty.
+    local resume_sid
+    resume_sid="$(jq -r '.session_id // empty' "$capture_meta" 2>/dev/null)"
+    if [ -n "$resume_sid" ]; then
+      sleep 1
+      tmux send-keys -t "$pane_id" "clr $resume_sid" 2>/dev/null || true
+    fi
+
+    cmd_hibernated "$pane_id" "$pids" "hard" 2>/dev/null || true
     rm -f "$arm_pid_file"
   ) &
   echo $! > "$arm_pid_file"
@@ -508,14 +856,19 @@ cmd_sigstop_arm() {
   trap '' HUP
 }
 
-cmd_sigstop_resume() {
-  # Cancel any pending arm timer for the pane and SIGCONT any previously-paused PIDs.
+cmd_hibernate_resume() {
+  # Cancel any pending hibernate-arm timer and unfreeze the pane based on the
+  # mode it was hibernated as. Soft → `fg<Enter>` (shell resumes the suspended
+  # claude job, tcsetpgrp restored). Hard → no-op (claude is gone; capture
+  # remains for `claude-rescue print`).
   local pane_id="${1:-}"
   [ -n "$pane_id" ] || return 0
 
+  local pane_uuid
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+
   local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.arm.pid"
-  local stopped_file="$CLAUDE_RESCUE_CACHE_HOME/stopped/$san.json"
+  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
 
   if [ -f "$arm_pid_file" ]; then
     local arm_pid
@@ -526,16 +879,24 @@ cmd_sigstop_resume() {
     rm -f "$arm_pid_file"
   fi
 
-  if [ -f "$stopped_file" ]; then
-    local pids pid
-    pids="$(jq -r '.pids[]' "$stopped_file" 2>/dev/null | tr '\n' ' ')"
-    for pid in $pids; do
-      [ -n "$pid" ] || continue
-      kill -CONT "$pid" 2>/dev/null || true
-    done
-    rm -f "$stopped_file"
-    cmd_resume_unstop "$pane_id"
-  fi
+  [ -z "$pane_uuid" ] && return 0
+  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  [ -f "$hibernated_file" ] || return 0
+
+  local mode
+  mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+  case "$mode" in
+    soft)
+      tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
+      ;;
+    hard)
+      # claude is gone; pane is at shell prompt. `claude-rescue print` shows
+      # the captured snapshot; user can resume via the picker.
+      :
+      ;;
+  esac
+  rm -f "$hibernated_file"
+  cmd_unhibernated "$pane_id" "$mode" 2>/dev/null || true
 }
 
 # --- Dispatch ---------------------------------------------------------------
@@ -544,16 +905,20 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   session_start)      cmd_session_start "$@" ;;
   session_end)        cmd_session_end "$@" ;;
+  user_prompt_submit) cmd_user_prompt_submit "$@" ;;
+  pre_tool_use)       cmd_pre_tool_use "$@" ;;
+  post_tool_use)      cmd_post_tool_use "$@" ;;
+  stop)               cmd_stop "$@" ;;
   title)              cmd_title "$@" ;;
   title-commit)       cmd_title_commit "$@" ;;
   pane-died)          cmd_pane_died "$@" ;;
   client-detached)    cmd_client_detached "$@" ;;
-  stopped)            cmd_stopped "$@" ;;
-  resume_unstop)      cmd_resume_unstop "$@" ;;
+  hibernated)         cmd_hibernated "$@" ;;
+  unhibernated)       cmd_unhibernated "$@" ;;
   resurrect-save)     cmd_resurrect_save "$@" ;;
   resurrect-restore)  cmd_resurrect_restore "$@" ;;
-  sigstop-arm)        cmd_sigstop_arm "$@" ;;
-  sigstop-resume)     cmd_sigstop_resume "$@" ;;
+  hibernate-arm)      cmd_hibernate_arm "$@" ;;
+  hibernate-resume)   cmd_hibernate_resume "$@" ;;
   '')                 log_err "no subcommand"; exit 2 ;;
   *)                  log_err "unknown subcommand: $cmd"; exit 2 ;;
 esac

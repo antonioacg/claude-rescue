@@ -25,11 +25,13 @@ RESCUE_DATA_DIRS=(
   "$CLAUDE_RESCUE_DATA_HOME"
   "$CLAUDE_RESCUE_DATA_HOME/windows"
   "$CLAUDE_RESCUE_DATA_HOME/no-tmux"
+  "$CLAUDE_RESCUE_DATA_HOME/captures"
 )
 RESCUE_CACHE_DIRS=(
   "$CLAUDE_RESCUE_CACHE_HOME"
   "$CLAUDE_RESCUE_CACHE_HOME/tmp"
-  "$CLAUDE_RESCUE_CACHE_HOME/stopped"
+  "$CLAUDE_RESCUE_CACHE_HOME/hibernated"
+  "$CLAUDE_RESCUE_CACHE_HOME/busy"
 )
 
 ensure_dirs() {
@@ -40,6 +42,28 @@ ensure_dirs() {
 }
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# Walk up the process tree from $$ looking for an ancestor whose comm is
+# "claude". Used by hook handlers (SessionStart, SessionEnd, etc.) to capture
+# the originating claude PID into events for troubleshooting.
+#
+# Claude invokes hooks via `/bin/sh -c "<command>"`, so the script's parent is
+# sh and the grandparent is claude. The walk is bounded (max 8 hops) so we
+# don't loop on detached / re-parented processes.
+find_my_claude_pid() {
+  local pid=$$ depth=0 comm
+  while [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [ -z "$pid" ] && return 1
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+    if [ "$comm" = "claude" ]; then
+      echo "$pid"
+      return 0
+    fi
+    depth=$((depth + 1))
+  done
+  return 1
+}
 
 log_err() {
   # tmux's run-shell -b swallows stderr; write directly to a file in cache.
@@ -65,23 +89,39 @@ tmux_set_window_uuid() {
   tmux set-option -wt "$pane_id" @claude-window-id "$uuid" >/dev/null
 }
 
+# Pane UUID: same identity model as window UUID but pane-scoped (`-p`).
+# Minted on first SessionStart in a fresh pane; preserved across kill+restore
+# via the resurrect sidecar. No lock — a single pane has only one process
+# firing SessionStart at a time, so check-then-mint is race-free.
+tmux_get_pane_uuid() {
+  local pane_id="$1"
+  tmux show-options -pv -t "$pane_id" @claude-pane-id 2>/dev/null || true
+}
+
+tmux_set_pane_uuid() {
+  local pane_id="$1" uuid="$2"
+  tmux set-option -pt "$pane_id" @claude-pane-id "$uuid" >/dev/null
+}
+
+ensure_pane_uuid() {
+  local pane_id="$1"
+  local existing
+  existing="$(tmux_get_pane_uuid "$pane_id")"
+  if [ -n "$existing" ]; then
+    echo "$existing"
+    return 0
+  fi
+  local fresh
+  fresh="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  tmux_set_pane_uuid "$pane_id" "$fresh"
+  echo "$fresh"
+}
+
 # Returns TSV: session_name<TAB>window_index<TAB>window_name<TAB>pane_current_path
 tmux_pane_info() {
   local pane_id="$1"
   tmux display-message -p -t "$pane_id" \
     -F $'#{session_name}\t#{window_index}\t#{window_name}\t#{pane_current_path}' 2>/dev/null
-}
-
-# Heal lookup: find a recent index entry matching (window_name, primary_cwd).
-# Empty result if no match.
-heal_lookup() {
-  local window_name="$1" cwd="$2"
-  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
-  [ -f "$idx" ] || return 0
-  jq -rs --arg wn "$window_name" --arg cwd "$cwd" '
-    map(select(.window_name == $wn and .primary_cwd == $cwd))
-    | sort_by(.last_seen) | reverse | .[0].window_uuid // empty
-  ' "$idx"
 }
 
 # Acquire a mkdir-based lock keyed by (session_name, window_name). Returns
@@ -107,8 +147,15 @@ release_window_lock() {
   [ -n "$lockdir" ] && rmdir "$lockdir" 2>/dev/null || true
 }
 
-# Get-or-create the window UUID for a pane. Logs a heal event when adopting.
-# Serialized per (session_name, window_name) to avoid the double-mint race.
+# Get the window UUID for a pane, minting a fresh one if not yet set.
+# Identity model: a UUID is born on first SessionStart in a window with no
+# @claude-window-id. Reuse happens ONLY via the resurrect sidecar
+# (kill+restore propagates the option). No name/cwd-based matching: those
+# heuristics caused incorrect merges and aren't needed once the sidecar path
+# is reliable.
+#
+# The per-(session_name, window_name) lock prevents two near-simultaneous
+# SessionStart hooks (e.g. multi-pane window) from each minting a fresh UUID.
 ensure_window_uuid() {
   local pane_id="$1"
   local existing
@@ -118,6 +165,7 @@ ensure_window_uuid() {
     return 0
   fi
 
+  # session_name + window_name are only needed to key the mint-race lock.
   local info session_name window_index window_name cwd
   info="$(tmux_pane_info "$pane_id")" || true
   if [ -z "$info" ]; then
@@ -136,45 +184,11 @@ ensure_window_uuid() {
     return 0
   fi
 
-  local healed
-  healed="$(heal_lookup "$window_name" "$cwd")"
-  if [ -n "$healed" ]; then
-    tmux_set_window_uuid "$pane_id" "$healed"
-    append_event "$healed" "$(jq -nc \
-      --arg ts "$(now_iso)" --arg pane "$pane_id" \
-      --arg sn "$session_name" --arg wn "$window_name" --arg cwd "$cwd" \
-      '{ts:$ts, kind:"heal", pane_id:$pane, session_name:$sn, window_name:$wn, cwd:$cwd}')"
-    update_index "$healed" "$session_name" "$window_name" "$cwd"
-    release_window_lock "$lockdir"
-    echo "$healed"
-    return 0
-  fi
-
   local fresh
   fresh="$(uuidgen | tr '[:upper:]' '[:lower:]')"
   tmux_set_window_uuid "$pane_id" "$fresh"
-  update_index "$fresh" "$session_name" "$window_name" "$cwd"
   release_window_lock "$lockdir"
   echo "$fresh"
-}
-
-# Update index.jsonl entry for window_uuid (last_seen, latest session_name/window_name/cwd).
-update_index() {
-  local window_uuid="$1" session_name="$2" window_name="$3" cwd="$4"
-  local idx="$CLAUDE_RESCUE_DATA_HOME/index.jsonl"
-  local tmp
-  tmp="$(mktemp "$idx.XXXXXX")"
-  {
-    if [ -f "$idx" ]; then
-      jq -c --arg uuid "$window_uuid" 'select(.window_uuid != $uuid)' "$idx" || true
-    fi
-    jq -nc \
-      --arg uuid "$window_uuid" \
-      --arg sn "$session_name" --arg wn "$window_name" \
-      --arg cwd "$cwd" --arg ts "$(now_iso)" \
-      '{window_uuid:$uuid, session_name:$sn, window_name:$wn, primary_cwd:$cwd, last_seen:$ts}'
-  } > "$tmp"
-  mv "$tmp" "$idx"
 }
 
 # Rebuild meta.json rollup for a window from its event log.
@@ -215,7 +229,7 @@ rebuild_meta() {
               started:      (map(select(.kind | startswith("session_start"))) | .[0].ts // null),
               ended:        (map(select(.kind | startswith("session_end")))   | .[0].ts // null),
               cwd:          (map(select(.cwd != null and .cwd != "")) | .[0].cwd // null),
-              pane_id:      (map(select(.pane_id != null)) | .[0].pane_id // null),
+              pane_uuid:    (map(select(.pane_uuid != null)) | .[0].pane_uuid // null),
               source:       (map(select(.source != null)) | .[0].source // null),
               session_name: (map(select(.session_name != null and .session_name != "")) | .[0].session_name // null),
               window_name:  (map(select(.window_name != null and .window_name != ""))   | .[0].window_name // null),
@@ -293,6 +307,42 @@ rebuild_meta() {
                 }
               end
           )
+        ),
+
+        # Distinct cwds touched anywhere in this window, with the latest
+        # event ts that referenced each. Useful when a window has had panes
+        # in multiple project dirs over its lifetime. Uses $all (the full
+        # event array) — `.` here is the rolling meta object, not events.
+        cwds: (
+          [$all[] | select(.cwd != null and .cwd != "") | {cwd, ts}]
+          | group_by(.cwd)
+          | map({cwd: .[0].cwd, last_seen: (map(.ts) | max)})
+          | sort_by(.last_seen) | reverse
+        ),
+
+        # Per-pane summary keyed by pane_uuid (durable identity). Events
+        # without pane_uuid (legacy or pre-SessionStart) are excluded — the
+        # writer no longer emits transient tmux pane_id, so there is no
+        # secondary identity to group by.
+        panes: (
+          [$all[] | select(.pane_uuid != null and .pane_uuid != "")]
+          | group_by(.pane_uuid)
+          | map({
+              pane_uuid: .[0].pane_uuid,
+              first_seen: (map(.ts) | min),
+              last_seen:  (map(.ts) | max),
+              cwds: (
+                [.[] | select(.cwd != null and .cwd != "") | {cwd: .cwd, ts: .ts}]
+                | group_by(.cwd)
+                | map({cwd: .[0].cwd, last_seen: (map(.ts) | max)})
+                | sort_by(.last_seen) | reverse
+              ),
+              session_count: (
+                [.[] | select(.kind | startswith("session_start")) | .session_id]
+                | unique | length
+              )
+            })
+          | sort_by(.last_seen) | reverse
         )
       }
   ' "$log" > "$tmp"

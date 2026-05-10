@@ -64,8 +64,6 @@ real-time. Title is just for picker preview labels, where minute granularity
 is enough to distinguish work-streams.
 
 Revisit if:
-- We add the SIGSTOP layer (which needs `pane-focus-in`/`pane-focus-out` —
-  same propagation problem), and decide we want immediate behavior.
 - Users report missing titles for short-lived tasks.
 
 ---
@@ -91,7 +89,7 @@ Cosmetic. No behavioral impact — both still mark the session ended.
 
 These three subcommands are no longer wired to any tmux hook (we replaced
 them with the resurrect-driven sampling). They still work if invoked
-manually and are exercised by `test/validate.sh`, but production never
+manually and are exercised by `scripts/validate.sh`, but production never
 calls them.
 
 Options:
@@ -106,33 +104,27 @@ path covers everything we want.
 
 ---
 
-## 4. SIGSTOP / SIGCONT layer activation
+## 4. Hibernation layer (shipped)
 
-`cmd_sigstop_arm` and `cmd_sigstop_resume` exist in claude-rescue-log,
-but the corresponding `pane-focus-out`/`pane-focus-in` hooks are
-commented out in `tmux/rescue.tmux.conf`:
+The original SIGSTOP/SIGCONT design didn't survive contact with macOS — raw
+`kill -CONT` doesn't restore `tcsetpgrp`, so claude+children would re-stop on
+TTIN/TTOU as soon as they touched the controlling tty. Replaced with a
+**two-stage focus-driven hibernation** that uses terminal-driven SIGTSTP via
+`tmux send-keys C-z` (soft) and claude's `/exit` slash command (hard).
 
-```tmux
-# set-hook -g pane-focus-out 'run-shell -b "claude-rescue-log sigstop-arm …"'
-# set-hook -g pane-focus-in  'run-shell -b "claude-rescue-log sigstop-resume …"'
-```
+`pane-focus-out` and `pane-focus-in` DO register at `-g` on tmux 3.6+ — the
+propagation worry noted in #1 turned out to apply only to a small set of
+hooks (`pane-title-changed`, `pane-died`), not to focus events.
 
-Same scope problem as #1 — pane-focus-* hooks are pane-scoped and don't
-register `-g`. If we activate this, we need the same propagation pattern
-described in #1.
-
-Validated end-to-end on a fake `sleep` process during initial development
-(STOP→T, CONT→S). Connection-loss caveat documented in PLAN.md: a
-stopped Claude process resuming after >60s will likely need to retry the
-HTTPS connection to Anthropic's API.
-
-Activate when memory pressure is the bigger concern than UX simplicity.
+See `docs/operations/hibernation.md` for env vars, file paths, manual test
+recipes; `docs/operations/crash-recovery.md` for what happens to hibernated
+panes across a tmux crash + resurrect-restore.
 
 ---
 
 ## 5. Interactive picker UX testing
 
-`test/validate.sh` exercises the picker's data plane (list-windows,
+`scripts/validate.sh` exercises the picker's data plane (list-windows,
 list-sessions, preview-window, preview-session) but not the actual fzf
 popup interaction (drill-down, exit keys: enter / ctrl-n / ctrl-w / ctrl-y).
 
@@ -140,7 +132,7 @@ Status: untested in interactive mode. Will likely surface small ergonomic
 issues (column widths, color contrast, header text) that need a real
 human at the keyboard to identify.
 
-`test/staging.sh` provides the environment to do this — bind `prefix + R`
+`scripts/staging.sh` provides the environment to do this — bind `prefix + R`
 already wired in staging.conf.
 
 ---
@@ -172,3 +164,26 @@ it's worth documenting and considering: should we switch to
 `run_onchange_` keyed on the install script's checksum? Tradeoff is
 auto-application of upstream changes (good for trust-the-author
 projects, risky for ones in flux).
+
+---
+
+## 8. `@continuum-save-interval 0` doesn't disable autosave
+
+Setting `@continuum-save-interval 0` on a live tmux server does **not**
+suppress the continuum save daemon — it keeps ticking at its default
+cadence. To actually pause autosaves during diagnostics or staged
+restore tests, set the interval to a large number (e.g. `99999`) so
+the daemon's wait-loop never hits zero.
+
+Observed during test #14 / #17 development: while debugging the
+sidecar-vs-state race, setting interval to 0 left autosaves firing
+every minute, clobbering `last` with empty saves. Switching to 99999
+fixed it.
+
+Source confirmation lives in
+`~/.config/tmux/plugins/tmux-continuum/scripts/continuum_save.sh` —
+0 is treated as "use default", not "disabled".
+
+Action: either patch tmux-continuum upstream to honour 0, document the
+quirk in `config.sh.example`, or wrap a "freeze autosaves" helper into
+`scripts/staging.sh` for diagnostic flows.

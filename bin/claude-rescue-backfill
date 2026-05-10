@@ -298,12 +298,6 @@ for log in "$CLAUDE_RESCUE_DATA_HOME/windows/"*.jsonl; do
   [ -f "$log" ] || continue
   uuid="$(basename "$log" .jsonl)"
   rebuild_meta "$uuid"
-  meta="$CLAUDE_RESCUE_DATA_HOME/windows/$uuid.meta.json"
-  [ -f "$meta" ] || continue
-  sn="$(jq -r '.session_name // ""' "$meta")"
-  wn="$(jq -r '.window_name // ""' "$meta")"
-  cwd="$(jq -r '.primary_cwd // ""' "$meta")"
-  update_index "$uuid" "$sn" "$wn" "$cwd"
 done
 
 # Marker = highest ts in the processed list.
@@ -317,4 +311,4 @@ new_max="$(awk '
 ' "$snapshot_list")"
 [ -n "$new_max" ] && printf '%s' "$new_max" > "$MARKER"
 
-echo "backfill complete. windows indexed: $(wc -l < "$CLAUDE_RESCUE_DATA_HOME/index.jsonl" 2>/dev/null | tr -d ' ' || echo 0)" >&2
+echo "backfill complete. windows: $(find "$CLAUDE_RESCUE_DATA_HOME/windows" -maxdepth 1 -name '*.meta.json' 2>/dev/null | wc -l | tr -d ' ')" >&2

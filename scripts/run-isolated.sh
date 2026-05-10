@@ -2,7 +2,7 @@
 # Run a command against an isolated tmux server with a fresh CLAUDE_RESCUE_DATA_HOME.
 #
 # Usage:
-#   test/run-isolated.sh <subcommand> [args...]
+#   scripts/run-isolated.sh <subcommand> [args...]
 #
 # Subcommands:
 #   start                  Start the isolated server (idempotent).

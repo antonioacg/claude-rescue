@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 LOCAL_BIN="$HOME/.local/bin"
 MODE="${1:-}"
 

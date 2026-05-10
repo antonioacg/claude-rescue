@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# claude-rescue-resume — wraps `claude` for tmux-resurrect's @resurrect-processes.
+#
+# Looks up the latest open session for the originating pane's @claude-pane-id
+# (the durable identity reapplied by claude-rescue's resurrect-restore hook
+# from the sidecar) and adds `-r <session_id>` to the args. Deterministic:
+# no scrollback parsing, no transcript heuristics, no timing dependence on
+# whether claude has printed its session UUID yet.
+#
+# DEBUG MODE — prints a banner with the resolved pane_uuid / session_id /
+# constructed claude command, then drops into a shell instead of exec'ing.
+# Useful for validating the lookup chain without actually starting claude.
+# Activate either with `--debug` as the first arg or by setting
+# CLAUDE_RESCUE_RESUME_DEBUG=1 in the environment.
+
+set -uo pipefail
+
+# Resolve $0 through any symlinks so we find lib/common.sh regardless of how
+# this binary was invoked (direct, via ~/.local/bin/ symlink, etc.).
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
+# --- Flag handling: consume --debug if first arg ---------------------------
+debug=0
+if [ "${1:-}" = "--debug" ]; then
+  debug=1
+  shift
+fi
+[ "${CLAUDE_RESCUE_RESUME_DEBUG:-}" = "1" ] && debug=1
+
+# --- Rebuild args ---------------------------------------------------------
+# Two jobs:
+#   1. Glue multi-word flag values back together. tmux-resurrect's send-keys
+#      feeds the saved pane_full_command into the shell as a plain string,
+#      which gets tokenised on whitespace, so flag values that originally
+#      contained spaces (e.g. `--append-system-prompt "Session start: ..."`)
+#      arrive split. Without re-gluing them, those tokens leak into claude
+#      as user-message input ("start:" being the most visible symptom).
+#   2. Strip session-creation flags that don't belong on a deterministic
+#      resume:
+#        --fork              would create another fork on top of the resume
+#        -r / --resume UUID  saved value may be stale; lookup is authoritative
+#        -c / --continue     "resume the most recent session"; we know the exact one
+#      The resume target is then added explicitly via -r <session_id> from the
+#      find-sessions lookup below.
+# Logic mirrors ~/.config/tmux/scripts/claude-restore.sh for the value-gluing.
+uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+rebuilt=()
+existing_uuid=""
+i=1
+while [ $i -le $# ]; do
+  arg="${!i}"
+  if [[ "$arg" =~ ^${uuid_re}$ ]]; then
+    rebuilt+=("$arg")
+  elif [ "$arg" = "-r" ] || [ "$arg" = "--resume" ]; then
+    # Drop the flag; capture the UUID arg as a fallback target.
+    next=$((i + 1))
+    if [ $next -le $# ]; then existing_uuid="${!next}"; i=$next; fi
+  elif [ "$arg" = "--fork-session" ]; then
+    # Drop the flag; capture the UUID arg as a fallback target (the saved
+    # session was a fork of THAT one — resuming the fork's session_id is the
+    # right behaviour, but if our pane_uuid lookup misses, falling back to
+    # the parent is better than nothing).
+    next=$((i + 1))
+    if [ $next -le $# ] && [[ "${!next}" =~ ^${uuid_re}$ ]]; then
+      existing_uuid="${existing_uuid:-${!next}}"
+      i=$next
+    fi
+  elif [ "$arg" = "--fork" ] || [ "$arg" = "-c" ] || [ "$arg" = "--continue" ]; then
+    # Creation-time hints; drop on resume.
+    :
+  elif [[ "$arg" == -* ]]; then
+    rebuilt+=("$arg")
+    # Glue following non-flag, non-UUID tokens into a single space-joined value.
+    value=""
+    while [ $((i + 1)) -le $# ]; do
+      ni=$((i + 1))
+      next="${!ni}"
+      if [[ "$next" == -* ]] || [[ "$next" =~ ^${uuid_re}$ ]]; then
+        break
+      fi
+      value="${value:+$value }$next"
+      i=$((i + 1))
+    done
+    [ -n "$value" ] && rebuilt+=("$value")
+  else
+    rebuilt+=("$arg")
+  fi
+  i=$((i + 1))
+done
+set -- "${rebuilt[@]}"
+
+# --- Query pane uuid + look up the resume target via find-sessions --------
+pane_uuid=""
+if [ -n "${TMUX_PANE:-}" ]; then
+  pane_uuid="$(tmux show-options -pv -t "$TMUX_PANE" @claude-pane-id 2>/dev/null || true)"
+fi
+
+found_sid=""
+found_cwd=""
+if [ -z "$existing_uuid" ] && [ -n "$pane_uuid" ]; then
+  # `--open-only` is intentionally NOT used: it filters by absence of a
+  # session_end event, but a SIGKILL'd claude leaves the session "open" in
+  # our log without a transcript. find-sessions already filters to sessions
+  # that have a transcript on disk (that's the real "resumable" criterion);
+  # take the most recent of those.
+  US=$'\x1f'
+  row="$("$REPO/bin/claude-rescue" find-sessions \
+          --pane-uuid "$pane_uuid" 2>/dev/null | head -1)"
+  if [ -n "$row" ]; then
+    # find-sessions cols: session_id, window_uuid, pane_uuid, started, ended, cwd, source, window_name, last_title
+    found_sid="$(printf '%s' "$row" | awk -v FS="$US" '{print $1}')"
+    found_cwd="$(printf '%s' "$row" | awk -v FS="$US" '{print $6}')"
+  fi
+fi
+
+# --- Decide final args ----------------------------------------------------
+# Resolve the resume target with this priority:
+#   1. find-sessions lookup result (most authoritative — derived from our
+#      append-only event log keyed by the durable pane_uuid)
+#   2. UUID stripped from the saved -r/--resume args (fallback for legacy
+#      data that pre-dates pane_uuid attribution)
+#   3. None — exec claude without -r, starting a fresh session
+final_args=("$@")
+target_uuid=""
+if [ -n "$found_sid" ]; then
+  target_uuid="$found_sid"
+elif [ -n "$existing_uuid" ]; then
+  target_uuid="$existing_uuid"
+fi
+if [ -n "$target_uuid" ]; then
+  final_args+=(-r "$target_uuid")
+fi
+
+# --- Debug mode: banner + drop to shell instead of exec'ing claude --------
+if [ "$debug" -eq 1 ]; then
+  {
+    echo "============================================================"
+    echo " claude-rescue-resume — DEBUG"
+    echo "============================================================"
+    echo " TMUX_PANE        : ${TMUX_PANE:-<unset>}"
+    echo " @claude-pane-id  : ${pane_uuid:-<not set>}"
+    echo " find-sessions    : ${found_sid:-<no match>}"
+    echo " existing -r arg  : ${existing_uuid:-<none>}"
+    echo " resume target    : ${target_uuid:-<none — would start a fresh session>}"
+    echo " session cwd      : ${found_cwd:-<n/a>}"
+    echo
+    echo " would exec:"
+    printf '   claude'
+    printf ' %q' "${final_args[@]}"
+    printf '\n'
+    echo "============================================================"
+    echo
+  } >&2
+  exec "${SHELL:-/bin/zsh}" -i
+fi
+
+# --- Live: exec claude with the resolved args ------------------------------
+exec claude "${final_args[@]}"

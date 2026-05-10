@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# validate-hibernation.sh — autonomous validation of the hibernation lifecycle.
+#
+# Tears down any running staging, brings up a fresh server, populates the
+# fixture, then drives the hibernation scenarios via tmux run-shell (focus
+# events don't fire reliably without an attached client, so we invoke the
+# arm/resume subcommands directly — same code path the focus hooks trigger).
+#
+# Scenarios:
+#   1. Soft hibernation fires on an idle claude pane (capture + Ctrl+Z + marker)
+#   2. Soft resume restores the suspended claude
+#   3. Hard escalation fires after HARD_DELAY (claude exits + clr pre-fill)
+#   4. Fast guard skips panes without @claude-pane-id (nvim)
+#
+# Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
+# fixture boot. Exit 0 on all-pass, non-zero on any failure.
+
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SOCK="claude-rescue-staging"
+STAGING_DIR="${CLAUDE_RESCUE_STAGING_DIR:-$HOME/claude-rescue-staging}"
+DATA_DIR="$STAGING_DIR/data"
+CACHE_DIR="$DATA_DIR/cache"
+
+SOFT_DELAY="${CLAUDE_RESCUE_SOFT_DELAY:-8}"
+HARD_DELAY="${CLAUDE_RESCUE_HARD_DELAY:-16}"
+DEFER_TIMES="${CLAUDE_RESCUE_HIBERNATE_DEFER_TIMES:-0}"
+
+PASS=0
+FAIL=0
+RESULTS=()
+
+# ---------------------------------------------------------------------------
+
+assert() {
+  local desc="$1" expected="$2" actual="$3"
+  if [ "$expected" = "$actual" ]; then
+    RESULTS+=("PASS  $desc")
+    PASS=$((PASS + 1))
+  else
+    RESULTS+=("FAIL  $desc  (expected '$expected' got '$actual')")
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_nonempty() {
+  local desc="$1" actual="$2"
+  if [ -n "$actual" ]; then
+    RESULTS+=("PASS  $desc")
+    PASS=$((PASS + 1))
+  else
+    RESULTS+=("FAIL  $desc  (got empty)")
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_empty() {
+  local desc="$1" actual="$2"
+  if [ -z "$actual" ]; then
+    RESULTS+=("PASS  $desc")
+    PASS=$((PASS + 1))
+  else
+    RESULTS+=("FAIL  $desc  (expected empty, got '$actual')")
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+cleanup() {
+  if tmux -L "$SOCK" has-session 2>/dev/null; then
+    local pid
+    pid="$(pgrep -f "tmux.*-L $SOCK" | head -1)"
+    [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
+  fi
+}
+trap cleanup EXIT
+
+# Return the @claude-pane-id of a pane.
+pane_uuid_of() {
+  tmux -L "$SOCK" show-options -pv -t "$1" @claude-pane-id 2>/dev/null
+}
+
+# Read the hibernated marker's pids array (one pid per line).
+marker_pids() {
+  jq -r '.pids[]?' "$CACHE_DIR/hibernated/$1.json" 2>/dev/null
+}
+
+# Return the foreground command of a pane (claude | zsh | nvim | ...).
+fg_cmd() {
+  tmux -L "$SOCK" display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null
+}
+
+# Read the first character of `ps stat` for a pid (T = stopped, S = sleeping, etc.).
+# Empty if pid is dead or unreadable.
+pid_stat() {
+  ps -o stat= -p "$1" 2>/dev/null | tr -d ' ' | cut -c1
+}
+
+# 1 if all pids in $@ respond to kill -0 (alive); 0 otherwise.
+pids_all_alive() {
+  local p
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    kill -0 "$p" 2>/dev/null || { echo 0; return; }
+  done
+  echo 1
+}
+
+# 1 if NO pid in $@ responds to kill -0 (all dead); 0 if any alive.
+pids_all_dead() {
+  local p
+  for p in "$@"; do
+    [ -n "$p" ] || continue
+    kill -0 "$p" 2>/dev/null && { echo 0; return; }
+  done
+  echo 1
+}
+
+# ---------------------------------------------------------------------------
+# Bring up clean state.
+
+echo "[setup] tearing down + fresh staging + fixture..."
+cleanup
+rm -rf "$DATA_DIR"
+rm -rf "$HOME/.local/share/tmux/resurrect/$SOCK"
+bash "$REPO/scripts/staging.sh" setup >/dev/null 2>&1
+bash "$REPO/scripts/staging-fixture.sh" >/dev/null 2>&1 \
+  || { echo "FATAL: staging-fixture.sh failed" >&2; exit 1; }
+
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_SOFT_DELAY "$SOFT_DELAY"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HARD_DELAY "$HARD_DELAY"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_HIBERNATE_DEFER_TIMES "$DEFER_TIMES"
+
+# Snapshot the panes we'll test against.
+P0=%0    # main:1.1, claude in staging
+P3=%3    # main:3.1, nvim
+P0_UUID="$(pane_uuid_of $P0)"
+[ -z "$P0_UUID" ] && { echo "FATAL: $P0 has no @claude-pane-id" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+echo "[1] soft hibernation fires on idle claude pane"
+
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep $((SOFT_DELAY + 4))
+
+MARKER="$CACHE_DIR/hibernated/$P0_UUID.json"
+assert "scenario 1: hibernated marker exists" "1" "$([ -f "$MARKER" ] && echo 1 || echo 0)"
+assert "scenario 1: marker mode=soft" "soft" "$(jq -r '.mode // empty' "$MARKER" 2>/dev/null)"
+assert "scenario 1: capture .txt written" "1" "$([ -f "$DATA_DIR/captures/$P0_UUID.txt" ] && echo 1 || echo 0)"
+assert "scenario 1: capture .json sidecar written" "1" "$([ -f "$DATA_DIR/captures/$P0_UUID.json" ] && echo 1 || echo 0)"
+CAP_CWD="$(jq -r '.cwd // empty' "$DATA_DIR/captures/$P0_UUID.json" 2>/dev/null)"
+assert "scenario 1: capture cwd matches pane cwd" "$STAGING_DIR" "$CAP_CWD"
+assert_nonempty "scenario 1: capture session_id non-empty" "$(jq -r '.session_id // empty' "$DATA_DIR/captures/$P0_UUID.json" 2>/dev/null)"
+
+# Foreground process is the shell (claude Ctrl+Z'd to background).
+assert "scenario 1: pane_current_command is zsh (claude no longer foreground)" "zsh" "$(fg_cmd $P0)"
+
+# The arm function recorded the claude pids it found into the marker.
+# Snapshot them — we'll re-check liveness through the resume + hard cycles.
+read -r -a SOFT_PIDS <<< "$(marker_pids "$P0_UUID" | tr '\n' ' ')"
+assert "scenario 1: marker recorded ≥1 claude pid" "1" "$([ "${#SOFT_PIDS[@]}" -gt 0 ] && echo 1 || echo 0)"
+assert "scenario 1: all marker pids alive after soft (suspended, not killed)" "1" "$(pids_all_alive "${SOFT_PIDS[@]}")"
+# Bonus: the marker's first pid should be in T state (kernel-level confirmation).
+assert "scenario 1: marker's first pid in T (stopped) state" "T" "$(pid_stat "${SOFT_PIDS[0]:-}")"
+
+# ---------------------------------------------------------------------------
+echo "[2] soft resume unfreezes claude"
+
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-resume #{pane_id}'
+sleep 2
+
+assert "scenario 2: marker removed after resume" "0" "$([ -f "$MARKER" ] && echo 1 || echo 0)"
+assert_nonempty "scenario 2: capture preserved across resume" "$(ls "$DATA_DIR/captures/$P0_UUID.txt" 2>/dev/null)"
+assert "scenario 2: pane_current_command back to claude" "claude" "$(fg_cmd $P0)"
+assert "scenario 2: snapshot pids still alive" "1" "$(pids_all_alive "${SOFT_PIDS[@]}")"
+
+# ---------------------------------------------------------------------------
+echo "[3] hard escalation fires after HARD_DELAY"
+
+# Re-arm and let it ride through soft → hard.
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+# Wait long enough for both stages + buffer for the /exit kill sequence.
+sleep $((HARD_DELAY + 8))
+
+assert "scenario 3: marker mode=hard after escalation" "hard" "$(jq -r '.mode // empty' "$MARKER" 2>/dev/null)"
+assert_nonempty "scenario 3: hard_ts recorded" "$(jq -r '.hard_ts // empty' "$MARKER" 2>/dev/null)"
+# Pick up the latest pids the second arm recorded (might match SOFT_PIDS, might be more if claude spawned children).
+read -r -a HARD_PIDS <<< "$(marker_pids "$P0_UUID" | tr '\n' ' ')"
+assert "scenario 3: all marker pids dead after hard" "1" "$(pids_all_dead "${HARD_PIDS[@]}")"
+# Pane should be back at zsh with `clr <sid>` pre-filled.
+assert "scenario 3: pane_current_command is zsh" "zsh" "$(fg_cmd $P0)"
+PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t $P0 | tail -5)"
+HAS_CLR="$(printf '%s' "$PANE_CONTENT" | grep -c '^.*❯ clr [0-9a-f]\{8\}-' || true)"
+assert "scenario 3: 'clr <sid>' pre-filled at shell prompt" "1" "$HAS_CLR"
+
+# ---------------------------------------------------------------------------
+echo "[4] fast guard skips panes without @claude-pane-id"
+
+P3_UUID="$(pane_uuid_of $P3)"
+assert_empty "scenario 4: nvim pane has no @claude-pane-id" "$P3_UUID"
+
+P3_NVIM_PID="$(tmux -L "$SOCK" display-message -p -t $P3 '#{pane_pid}' 2>/dev/null)"
+tmux -L "$SOCK" run-shell -t $P3 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep $((SOFT_DELAY + 3))
+
+# Sanitized pane id for the arm pid file naming.
+P3_SAN="${P3//[^A-Za-z0-9]/_}"
+assert "scenario 4: no arm pid file for nvim pane" "0" \
+  "$([ -f "$CACHE_DIR/hibernated/$P3_SAN.arm.pid" ] && echo 1 || echo 0)"
+# Marker keyed by pane_uuid — empty for nvim, so the file path would be /captures/.json (malformed). Just check no file was added.
+NVIM_MARKERS="$(find "$CACHE_DIR/hibernated" -type f -newer "$MARKER" 2>/dev/null | wc -l | tr -d ' ')"
+assert "scenario 4: no new marker after fast-guard reject" "0" "$NVIM_MARKERS"
+
+# ---------------------------------------------------------------------------
+# Summary
+
+echo ""
+echo "==================="
+echo "Validation summary:"
+echo "==================="
+for r in "${RESULTS[@]}"; do echo "  $r"; done
+echo ""
+echo "TOTAL: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1
