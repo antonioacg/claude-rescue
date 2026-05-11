@@ -102,9 +102,15 @@ Three issues with the current single-project structure:
 
 ## Non-goals
 
-- Replacing tmux-resurrect or tmux-continuum. The generic plugin uses
-  resurrect's hooks for sidecar persistence; it does not duplicate
-  resurrect's scope.
+- Replacing tmux-resurrect or tmux-continuum **at this PRD's scope**.
+  The generic plugin uses resurrect's hooks for sidecar persistence;
+  it does not duplicate resurrect's scope. **Note:** a follow-up PRD
+  (`prd-resurrect-absorption.md`) argues this non-goal should be
+  revisited once the daemon and split are in place. The argument is
+  that we've already customized both plugins extensively, and the
+  daemon owns a richer state model than either provides. Treat the
+  non-goal here as scope-limit for the split itself, not as a
+  permanent commitment.
 - Doing the split *now*. This PRD captures architectural direction;
   execution waits until the hibernation feature has real-world miles.
 - Rewriting the picker as a generic tool. The session picker stays
