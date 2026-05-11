@@ -12,6 +12,7 @@ shutdown) and what reborn panes look like after `tmux-resurrect` restores.
 | Event log | `$DATA/windows/<window_uuid>.jsonl` | ✓ filesystem |
 | Meta rollup | `$DATA/windows/<window_uuid>.meta.json` | ✓ filesystem |
 | Captures | `$DATA/captures/<pane_uuid>.{txt,json}` | ✓ filesystem |
+| Active session file | `$DATA/active/<pane_uuid>` | ✓ filesystem, but **bulk-cleared at `resurrect-restore` time** — entries reflected the dying server; the wrapper repopulates them via `cmd_session_start` |
 | Busy marker | `$CACHE/busy/<pane_uuid>` | ✓ filesystem (and ages out via `BUSY_FRESHNESS`) |
 | Hibernated marker | `$CACHE/hibernated/<pane_uuid>.json` | ✓ filesystem |
 | Arm pid file | `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | ✓ filesystem, but the pid is dead → cleaned up on restore |
@@ -46,6 +47,34 @@ pane processes, otherwise `claude-rescue-resume` would not see
      before the user presses Enter would lose the recipe. Marker survives
      until `cmd_session_start` (user pressed Enter or typed `cl` for a new
      session) or `cmd_pane_died` (pane closed without resuming).
+
+## Wrapper resume-target priority
+
+`claude-rescue-resume` (the wrapper that tmux-resurrect re-launches in
+place of `claude --add-dir ...`) resolves the `-r <session_id>` to pass
+to claude in this order:
+
+1. **`$DATA/active/<pane_uuid>`** — hook-driven, written by every
+   `cmd_session_start` (including in-claude `/resume` that switches
+   sessions). Authoritative for "what session does this pane currently
+   hold open". Bulk-cleared at `cmd_resurrect_restore` time so the
+   wrapper repopulates it from the next `SessionStart`.
+2. **`find-sessions --pane-uuid <uuid>`** — scans the event log, returns
+   the most-recent session with a transcript on disk. Catches the case
+   where the active file was cleared (e.g. after `SessionEnd`) but the
+   user wants to resume the prior session.
+3. **UUID stripped from the saved `-r/--resume` cmdline** — legacy
+   fallback. tmux-resurrect freezes the command line at save time;
+   in-claude `/resume` makes this stale.
+4. **No `-r`** — fresh session.
+
+The active file (1) was added specifically to fix the
+post-rollout bug where users who ran `/resume` inside claude and
+switched sessions found the wrong conversation resumed after a
+crash-restore — the saved `-r` cmdline still pointed at the
+original session_id. Priority (2) covers it too in steady state, but
+(1) is faster and survives the race where the event log hasn't been
+flushed yet.
 
 ## Resurrect's command-resolution behavior
 

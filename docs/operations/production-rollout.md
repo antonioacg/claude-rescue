@@ -406,6 +406,16 @@ are critical for diagnosing failures and should be read together:
   @resurrect-hook-pre-restore-pane-processes` returns the handler
   name (back to step 4d if `invalid option`).
 
+- **`~/.local/share/claude-rescue/active/`** — one file per claude
+  pane, named after `@claude-pane-id`, contents = current claude
+  `session_id`. Bulk-cleared at `cmd_resurrect_restore` (entries
+  belonged to the dying server) and repopulated as each restored
+  claude fires SessionStart. A healthy restore of N claude panes
+  ends with `find ~/.local/share/claude-rescue/active -type f |
+  wc -l` ≈ N (give it ~10s after attach for late SessionStarts).
+  If significantly less, some panes never reached SessionStart —
+  same diagnostic path as wrapper.log < N "invoked" lines.
+
 ### Verify (run from any attached terminal)
 
 Run from the operator pane against `-L default`, or from the fresh

@@ -77,6 +77,25 @@ Operational consequence: a state dump taken immediately after
 The next attach (e.g. the operator reattaching after `kill-server`)
 covers all currently-running claude panes in one sweep.
 
+### arm-sweep voluntary-exit detection
+
+Beyond just arming new timers, `arm-sweep` also reaps state for panes
+where claude exited via a path that didn't fire `SessionEnd` (SIGKILL,
+some versions' dialog-dismiss, hard crashes). For each pane that has
+`@claude-pane-id` set but whose `pane_current_command != claude` AND no
+busy marker AND no hibernation marker, the sweep:
+
+- removes the pane's `arm.pid` (if any),
+- clears `$DATA/active/<pane_uuid>`,
+- unsets `@claude-pane-id` (the pane's identity is gone with claude).
+
+The guards matter: a soft-hibernated pane shows `pane_current_command =
+zsh` (claude is Ctrl+Z'd in T state), and the in-flight arm subshell is
+load-bearing for the hard escalation — so the hibernation-marker guard
+prevents the sweep from tearing down a legitimately hibernating pane.
+Same for hard-marker panes: the marker is crash-restore insurance that
+must survive until `cmd_session_start` cleans it up.
+
 ### Why Ctrl+Z, not `kill -STOP`?
 
 Raw `kill -STOP` followed by `kill -CONT` does NOT restore the tty foreground
@@ -101,8 +120,9 @@ runs only if `/exit` doesn't exit within ~3s.
 |---|---|---|
 | `$DATA/captures/<pane_uuid>.txt` | durable, overwritten on next hibernation | full pane scrollback at suspend time (ANSI preserved) |
 | `$DATA/captures/<pane_uuid>.json` | durable | `{pane_uuid, window_uuid, session_id, pane_id, ts, cwd, pids}` |
+| `$DATA/active/<pane_uuid>` | from cmd_session_start until cmd_session_end / cmd_pane_died / arm-sweep voluntary-exit detection | current claude `session_id` for this pane. `claude-rescue-resume`'s priority-1 lookup (beats tmux-resurrect's frozen saved `-r <sid>`). Rewritten by every cmd_session_start, including in-claude `/resume` |
 | `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{pane_id, pane_uuid, ts, mode, pids[], hard_ts?, hard_source?}` |
-| `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running | the bash subshell pid holding the soft+hard sleeps |
+| `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running. Reaped by hibernate-resume (soft mode), hibernate-arm self-cleanup (busy / focused / hard-complete), cmd_session_end, cmd_pane_died, cmd_resurrect_restore bulk sweep, and arm-sweep voluntary-exit detection. | the bash subshell pid holding the soft+hard sleeps |
 | `$CACHE/busy/<pane_uuid>` | mtime-based freshness window | `{ts, claude_pid?}` JSON — body is for troubleshooting; the `is_busy()` check reads only the file's `mtime` |
 
 ## Identifier stability across tmux operations
@@ -252,7 +272,7 @@ The busy marker is driven by claude's own hook system (configured via
 | `UserPromptSubmit` | `mark_busy(pane_uuid, claude_pid)` — write `{ts, claude_pid}` body (the claude PID is captured via `find_my_claude_pid`, the PPID walk that finds the ancestor claude that fired the hook) |
 | `PreToolUse` / `PostToolUse` | refresh — rewrites the JSON body with current `ts`, bumping the file's mtime so the marker stays "fresh" during long agentic loops |
 | `Stop` | `clear_busy(pane_uuid)` — `rm -f` the marker |
-| `SessionEnd` | safety-net `clear_busy` (in case Stop didn't fire) |
+| `SessionEnd` | safety-net `clear_busy`; reap `arm.pid` (orphan-on-voluntary-exit fix) and the active session-id file. Keeps `@claude-pane-id` so the hibernation marker stays addressable if claude returns. |
 
 `is_busy()` returns true only when the marker file exists AND its mtime is
 within `CLAUDE_RESCUE_BUSY_FRESHNESS` (default 1800s = 30min). A claude that
