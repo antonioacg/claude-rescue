@@ -36,18 +36,26 @@ pane processes, otherwise `claude-rescue-resume` would not see
    - if `hard_source == "crash-promote"` — skip (the resurrect wrapper is
      restoring claude via `shell → claude-rescue-resume → claude`;
      `pane_current_command` is a moving target through that pipeline, so we
-     gate on **intent** stored in the marker, not on current state);
+     gate on **intent** stored in the marker, not on current state). Marker
+     cleanup is then handled by `cmd_session_start` when the wrapper-launched
+     claude fires its SessionStart hook;
    - otherwise (timer-driven hard) — `tmux send-keys "claude-rescue print" Enter`
-     then `tmux send-keys "clr <session_id>"` (no Enter — pre-filled at the prompt);
-   - then `rm` the marker so a future focus-in is a true no-op.
+     then `tmux send-keys "clr <session_id>"` (no Enter — pre-filled at the prompt).
+     The marker is **NOT** deleted here: `clr <sid>` on the prompt is live
+     readline input that tmux-resurrect doesn't capture, so a second crash
+     before the user presses Enter would lose the recipe. Marker survives
+     until `cmd_session_start` (user pressed Enter or typed `cl` for a new
+     session) or `cmd_pane_died` (pane closed without resuming).
 
 ## Resurrect's command-resolution behavior
 
 tmux-resurrect saves each pane's process via `pane_current_command` (field 10)
 **and** the full command line (field 11). On restore, it consults the
-`@resurrect-processes` mapping. The pattern `~claude->claude-rescue-resume *`
+`@resurrect-processes` mapping. The pattern `claude->claude-rescue-resume *`
 is keyed on the **first word of the full command line** (after stripping the
-leading `:`). So:
+leading `:`). The leading `~` (substring-regex form) is deliberately **omitted**
+— with it, anything whose full command contained `claude` anywhere (e.g.
+`nvim /tmp/file-claude.md`) would match and get wrapped, which is wrong. So:
 
 | Save-time state | Field 10 | Field 11 begins with | Restore behavior |
 |---|---|---|---|

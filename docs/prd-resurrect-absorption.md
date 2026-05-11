@@ -238,8 +238,11 @@ register rewriters for different `comm` values.
 This replaces:
 - Resurrect's `@resurrect-processes` pattern matching (regex
   against saved command string).
-- Resurrect's `~claude->claude-rescue-resume *` substitution
-  syntax (its own DSL we've documented bugs in).
+- Resurrect's `claude->claude-rescue-resume *` substitution
+  syntax (its own DSL we've documented bugs in — e.g. the `~`
+  prefix variant did substring-regex against the full saved
+  command, wrongly matching `nvim /tmp/foo-claude.md` and
+  wrapping unrelated panes; dropped in commit d0c2352).
 - Resurrect's per-shell-tool override mechanism.
 
 ### Schema

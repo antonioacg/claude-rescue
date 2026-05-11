@@ -178,14 +178,14 @@ clean up on exit, exit non-zero on any failure.
 
 | Script | Scope | Server |
 |---|---|---|
-| `scripts/validate.sh` | 11 unit-level scenarios from the original PLAN: window UUID minting, `/clear` handling, multi-pane sharing, title debounce, pane-died flush, resurrect cycle, window swap, no-tmux fallback, picker data plane, install dry-run, JSONL validity | isolated `claude-rescue-validate` socket, temp data dir — doesn't touch staging |
-| `scripts/validate-hibernation.sh` | 22 assertions across soft hibernation, soft resume, hard escalation (with `clr <sid>` pre-fill), and the fast guard on non-claude panes | uses staging: teardown + `staging.sh setup` + `staging-fixture.sh` + drives via `tmux run-shell` |
-| `scripts/validate-crash-restore.sh` | 15 assertions across the two crash-restore paths: (1) soft-saved-as-claude → wrapper auto-resumes session, marker auto-promoted with `hard_source: "crash-promote"`; (2) hard-saved-as-zsh → post-restore-keys subshell prints capture + pre-fills `clr <sid>` | uses staging: rebuilds between the two scenarios via `bring_up_fresh` |
+| `scripts/validate.sh` | 15 unit-level scenarios from the original PLAN: window UUID minting, `/clear` handling, multi-pane sharing, title debounce, pane-died flush, resurrect cycle, window swap, no-tmux fallback, picker data plane, install dry-run, JSONL validity | isolated `claude-rescue-validate` socket, temp data dir — doesn't touch staging |
+| `scripts/validate-hibernation.sh` | 49 assertions across (1) soft hibernation, (2) soft resume, (3) hard escalation with `clr <sid>` pre-fill, (3b/3c) hard marker lifecycle (survives focus-in, cleaned by `cmd_session_start`), (4) fast guard on non-claude panes, (5) orphan arm subshell self-bails on identity mismatch, (6) `arm-sweep` arms every backgrounded claude pane idempotently, (7) `hibernate-resume` preserves the in-flight arm subshell when marker is `mode=hard` | uses staging: teardown + `staging.sh setup` + `staging-fixture.sh` + drives via `tmux run-shell` |
+| `scripts/validate-crash-restore.sh` | 28 assertions across the three crash-restore paths: (1) soft-saved-as-claude → wrapper auto-resumes session, marker auto-promoted with `hard_source: "crash-promote"`, cleaned by post-resume `session_start`; (2) hard-saved-as-zsh → post-restore-keys subshell prints capture + pre-fills `clr <sid>`, **marker survives** (crash-restore insurance); (3) hard → focus-in → fresh `cl` (new session) → hard again → crash → restore → NEW session_id is what gets pre-filled, not the original | uses staging: rebuilds between scenarios via `bring_up_fresh` |
 
 ```bash
 bash scripts/validate.sh                 # ~30s, isolated, safe to run anytime
-bash scripts/validate-hibernation.sh     # ~90s, destroys current staging
-bash scripts/validate-crash-restore.sh   # ~3 min, destroys current staging twice
+bash scripts/validate-hibernation.sh     # ~3 min, destroys current staging
+bash scripts/validate-crash-restore.sh   # ~4 min, destroys current staging multiple times
 ```
 
 The `validate-hibernation.sh` and `validate-crash-restore.sh` runs leave

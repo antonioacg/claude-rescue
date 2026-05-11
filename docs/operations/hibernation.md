@@ -166,6 +166,21 @@ After C2: press Enter on the `clr <sid>` prompt (or type `cl` to start a fresh s
 9. Wait `SOFT_DELAY + 5s`.
 10. **Verify:** no arm pid file, no hibernated marker, no capture file for that pane. Fast guard checks `@claude-pane-id` and returns early.
 
+### F0. Focus-in during hard cleanup preserves `clr <sid>` pre-fill
+
+A subtle race: between cmd_hibernate_arm writing the hard marker and sending
+`clr <sid>` to the prompt, the user might focus the pane. cmd_hibernate_resume
+sees a live arm subshell whose argv matches the orphan-safety pattern — but
+killing it now would drop the in-flight `clr` send-keys.
+
+The fix: cmd_hibernate_resume reads the marker mode first. For `mode=hard`,
+the arm subshell is left alone (it's finishing critical cleanup). For
+`mode=soft` (or no marker), the kill happens as before.
+
+To reproduce: arm with SOFT=2 HARD=4, wait ~3s (after soft but before hard),
+focus the pane during the brief window between hard marker write and clr
+send. Verify the `clr <sid>` text still arrives on the prompt.
+
 ### F. arm-sweep fires on attach (covers backgrounded panes)
 
 The fixture has 3 claude panes plus an nvim pane. After fixture exit the

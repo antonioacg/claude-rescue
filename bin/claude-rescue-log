@@ -26,8 +26,18 @@
 #
 # Hibernation layer (focus-driven pane suspension):
 #   hibernate-arm <pane_id> <pane_pid>   Schedule soft Ctrl+Z after SOFT_DELAY,
-#                                         hard Ctrl+C after HARD_DELAY total.
+#                                         hard `/exit` (with SIGTERM/SIGKILL
+#                                         fallback) after HARD_DELAY total.
 #   hibernate-resume <pane_id>           Cancel arm + fg the soft-suspended job.
+#                                         For mode=hard, leaves the in-flight
+#                                         arm subshell alone so its `clr <sid>`
+#                                         pre-fill completes.
+#   arm-sweep                             Walk every pane and arm any backgrounded
+#                                         claude pane that isn't already armed.
+#                                         Triggered on client-attached /
+#                                         client-session-changed so the user
+#                                         doesn't have to physically visit
+#                                         each pane to start the countdown.
 #
 # All output goes to stderr. Stdout is reserved (Claude hooks pipe stdout into context).
 
