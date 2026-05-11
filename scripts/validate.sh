@@ -244,20 +244,53 @@ assert "install.sh dry-run accounts for all binaries" "$EXPECTED_BINS" "$DR"
 # Regression: tmux's `source-file` does NOT expand `~`. A directive like
 # `source-file -q '~/dev/.../rescue.tmux.conf'` silently fails (the `-q`
 # eats the error), leaving all hooks unset. Prod rollout hit this and
-# burned a diagnostic loop. If the user's rendered ~/.tmux.conf exists,
-# scan it for the bad pattern.
+# burned a diagnostic loop.
+#
+# Scan both the applied configs AND the chezmoi source (if present), so
+# the bug is caught BEFORE chezmoi apply renders it onto disk. Either
+# location existing without the other is fine (fresh-checkout machines
+# have no chezmoi; non-managed machines have no chezmoi source).
 echo "[tmux-conf] source-file directives don't rely on tilde expansion"
-if [ -f "$HOME/.tmux.conf" ]; then
-  BAD_TILDE=$(grep -nE "^[[:space:]]*source-file[[:space:]]+(-q[[:space:]]+)?['\"]~" "$HOME/.tmux.conf" || true)
-  if [ -n "$BAD_TILDE" ]; then
-    RESULTS+=("FAIL  ~/.tmux.conf has source-file with tilde path: $BAD_TILDE  (use \$HOME or absolute)")
-    FAIL=$((FAIL + 1))
-  else
-    RESULTS+=("PASS  ~/.tmux.conf source-file directives use \$HOME or absolute paths")
-    PASS=$((PASS + 1))
+shopt -s globstar nullglob
+TMUX_SCAN_PATHS=()
+[ -f "$HOME/.tmux.conf" ] && TMUX_SCAN_PATHS+=("$HOME/.tmux.conf")
+[ -d "$HOME/.config/tmux" ] && TMUX_SCAN_PATHS+=( "$HOME"/.config/tmux/**/*.conf "$HOME"/.config/tmux/**/*.tmux )
+CHEZMOI_SRC="$HOME/.local/share/chezmoi"
+if [ -d "$CHEZMOI_SRC" ]; then
+  [ -f "$CHEZMOI_SRC/dot_tmux.conf" ]      && TMUX_SCAN_PATHS+=("$CHEZMOI_SRC/dot_tmux.conf")
+  [ -f "$CHEZMOI_SRC/dot_tmux.conf.tmpl" ] && TMUX_SCAN_PATHS+=("$CHEZMOI_SRC/dot_tmux.conf.tmpl")
+  if [ -d "$CHEZMOI_SRC/dot_config/tmux" ]; then
+    TMUX_SCAN_PATHS+=(
+      "$CHEZMOI_SRC"/dot_config/tmux/**/*.conf
+      "$CHEZMOI_SRC"/dot_config/tmux/**/*.tmux
+      "$CHEZMOI_SRC"/dot_config/tmux/**/*.conf.tmpl
+      "$CHEZMOI_SRC"/dot_config/tmux/**/*.tmux.tmpl
+    )
   fi
+fi
+shopt -u globstar nullglob
+
+# Match: source-file [-q] then optional quote then literal ~ — covers
+# single-quoted, double-quoted, and bare tilde paths. All three are
+# silently broken because tmux doesn't expand ~ regardless of quoting.
+TILDE_PAT="^[[:space:]]*source-file([[:space:]]+-q)?[[:space:]]+['\"]?~"
+TMUX_BAD_REPORT=""
+for f in "${TMUX_SCAN_PATHS[@]}"; do
+  [ -f "$f" ] || continue
+  HITS=$(grep -nE "$TILDE_PAT" "$f" 2>/dev/null || true)
+  if [ -n "$HITS" ]; then
+    TMUX_BAD_REPORT="$TMUX_BAD_REPORT$f: $HITS; "
+  fi
+done
+
+if [ -n "$TMUX_BAD_REPORT" ]; then
+  RESULTS+=("FAIL  source-file with tilde path (tmux won't expand): $TMUX_BAD_REPORT  (use \$HOME or absolute)")
+  FAIL=$((FAIL + 1))
+elif [ "${#TMUX_SCAN_PATHS[@]}" -eq 0 ]; then
+  RESULTS+=("PASS  no tmux configs to scan (fresh checkout)")
+  PASS=$((PASS + 1))
 else
-  RESULTS+=("PASS  ~/.tmux.conf not present — skipped tilde scan")
+  RESULTS+=("PASS  ${#TMUX_SCAN_PATHS[@]} tmux config(s) scanned, no tilde-path source-file directives")
   PASS=$((PASS + 1))
 fi
 
