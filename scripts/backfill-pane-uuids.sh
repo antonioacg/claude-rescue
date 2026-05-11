@@ -110,6 +110,7 @@ echo "0 0 0" > "$tmpdir/counts"  # minted skipped errored
 
 prev_cwd=""
 group_idx=0
+group_size=0
 jsonls_file="$tmpdir/group-jsonls.txt"
 
 while IFS=$'\t' read -r cwd pane_id sess win_idx win_name pane_idx; do
@@ -131,6 +132,11 @@ while IFS=$'\t' read -r cwd pane_id sess win_idx win_name pane_idx; do
       # Newest first.
       LC_ALL=C sort -rn -k1,1 "$jsonls_file" -o "$jsonls_file"
     fi
+    # How many Type-D panes share this cwd? Drives the (unique)/(heuristic)
+    # annotation on MINT lines — single-pane cwds get a deterministic
+    # newest-transcript→pane mapping; multi-pane cwds get an arbitrary
+    # Nth-to-Nth mapping that the operator may need to disambiguate later.
+    group_size="$(awk -F'\t' -v c="$cwd" '$1==c' "$tmpdir/type-d.tsv" | wc -l | tr -d ' ')"
     prev_cwd="$cwd"
     group_idx=0
   fi
@@ -177,9 +183,14 @@ while IFS=$'\t' read -r cwd pane_id sess win_idx win_name pane_idx; do
     win_uuid_was_minted=1
   fi
 
-  printf 'MINT %s (%s:w%s.p%s) cwd=%s pane_uuid=%s window_uuid=%s%s sid=%s\n' \
+  if [ "$group_size" -eq 1 ]; then
+    confidence="(unique)"
+  else
+    confidence="(heuristic $((group_idx + 1))/$group_size)"
+  fi
+  printf 'MINT %s (%s:w%s.p%s) cwd=%s pane_uuid=%s window_uuid=%s%s sid=%s %s\n' \
     "$pane_id" "$sess" "$win_idx" "$pane_idx" "$cwd" "$pane_uuid" "$win_uuid" \
-    "$([ $win_uuid_was_minted -eq 1 ] && echo ' (new)' || echo ' (existing)')" "$sid"
+    "$([ $win_uuid_was_minted -eq 1 ] && echo ' (new)' || echo ' (existing)')" "$sid" "$confidence"
 
   if [ "$dry" -eq 1 ]; then
     awk '{print ($1+1)" "$2" "$3}' "$tmpdir/counts" > "$tmpdir/counts.new" && mv "$tmpdir/counts.new" "$tmpdir/counts"
