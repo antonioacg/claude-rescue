@@ -105,6 +105,38 @@ runs only if `/exit` doesn't exit within ~3s.
 | `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running | the bash subshell pid holding the soft+hard sleeps |
 | `$CACHE/busy/<pane_uuid>` | mtime-based freshness window | `{ts, claude_pid?}` JSON — body is for troubleshooting; the `is_busy()` check reads only the file's `mtime` |
 
+## Identifier stability across tmux operations
+
+The hibernation state files are keyed on a mix of tmux's internal
+`pane_id` (`%N`) and our minted `@claude-pane-id` UUID. Whether those
+keys survive normal tmux reorganization (move/break/join/rename)
+versus a server reboot is the deciding factor for whether files end up
+orphaned or pointing at the wrong thing.
+
+| Identifier | Across pane-move, break-pane, join-pane, session move, window/session rename | Across `kill-server` |
+|---|---|---|
+| `pane_id` (`%N`) | **Stable** — assigned at pane creation, lifetime = pane lifetime | Reassigned (server reboots, fresh numbering) |
+| `@claude-pane-id` (UUID) | **Stable** — pane-scoped tmux option, travels with the pane | Preserved via the resurrect sidecar (`pre-restore-pane-processes` hook re-applies it) |
+| `@claude-window-id` (UUID) | Window-scoped: a pane moved to a *different* window inherits *that* window's `@claude-window-id` (which may be unset or different) | Preserved via sidecar |
+| Window/pane *index* (e.g. `1.2`) | **Changes on every move/rename** | Generally preserved if `set-option -g renumber-windows` is off |
+
+Hibernation keys its filesystem state
+(`_<sanitized_pane_id>.arm.pid`, capture files, hibernated markers) on
+`pane_id` and `@claude-pane-id` precisely so it survives normal tmux
+reorganization. Across `kill-server`, stale arm.pid files are cleaned
+in `cmd_resurrect_restore` (`bin/claude-rescue-log` line 538) before
+the next `arm-sweep` mints fresh ones for the new `%N` numbering. The
+`@claude-pane-id` is preserved via the sidecar so resume lookups via
+`find-sessions` continue to work after the rename.
+
+**Cross-window pane moves and the window log.** When a pane is moved
+to a different window, its *new* events get appended to the new
+window's `windows/<wuuid>.jsonl`, while pre-move events stay in the
+old one. `find-sessions` aggregates across all jsonls and filters by
+`pane_uuid`, so resume lookup is unaffected. The picker's per-window
+views would show the pane's history split between two windows.
+Cosmetic, not a correctness issue.
+
 ## Env vars
 
 | Var | Default | Purpose |
