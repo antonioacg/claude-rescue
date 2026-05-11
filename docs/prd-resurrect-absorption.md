@@ -86,6 +86,19 @@ approach is hitting its ceiling:
    process-restoration logic that we can't do better with our
    `@pane-uuid`-keyed state model.
 
+6. **Resurrect's built-in rotation breaks at scale.**
+   `@resurrect-delete-backup-after` cleans up old `.txt` snapshots
+   via a shell glob expansion. Once the snapshot directory exceeds
+   ~6000 files, the glob hits "argument list too long" and rotation
+   silently stops. The directory then grows unboundedly. With
+   `@continuum-save-interval=1` (one save per minute, our current
+   production setting) the directory hits 6000 files in under a
+   week — meaning rotation has been broken every week we've run
+   continuum. We've been working around this with manual cleanup;
+   absorbing the save/restore stack lets us fix it properly with a
+   tiered retention scheme that doesn't depend on glob expansion at
+   all (see "Retention strategy" below).
+
 ## Goals
 
 - `tmux-pane-rescue` natively handles **layout save**: serialize
@@ -287,6 +300,59 @@ Note what's first-class here that resurrect bolts on:
 reference. These are the data we currently smuggle in through
 sidecar TSVs.
 
+### Retention strategy (RRD-style)
+
+Snapshot rotation uses round-robin-database-style tiered retention
+instead of resurrect's linear "keep last N days" model. Two design
+properties:
+
+- **Bounded file count regardless of save frequency.** Continuum at
+  1-minute save interval produces ~10,000 files per week. With
+  tiered retention, the on-disk count stays in the low hundreds
+  forever.
+- **No shell-glob enumeration in the cleanup path.** The bug in
+  problem statement #6 ("argument list too long") happens because
+  resurrect's cleanup expands `$dir/*.txt` into argv. Our cleanup
+  uses `find` with predicate-driven deletion, which never
+  materialises the file list as command arguments.
+
+Tiers (default values, all configurable per-server):
+
+| Tier         | Retention window | Sample rate                | File count |
+|--------------|------------------|----------------------------|------------|
+| Fine         | last 1 hour      | every save (1-minute)      | ~60        |
+| Medium       | last 24 hours    | one per 10-minute window   | ~144       |
+| Coarse       | last 7 days      | one per hour               | ~168       |
+| Archive      | last 30 days     | one per day                | ~30        |
+| Long-term    | indefinite       | one per week (opt-in)      | small, grows linearly |
+
+Total ~400 files under defaults, plus the weekly long-term archive
+if enabled. Storage grows logarithmically with time, then linearly
+in the long-term tier (one file per week = ~52 files per year).
+
+Configuration via tmux options (with sensible flat-retention preset
+for users who want the resurrect-style "just keep N most-recent"
+behaviour):
+
+```tmux
+set -g @pane-rescue-retain-fine-hours 1
+set -g @pane-rescue-retain-medium-window-minutes 10
+set -g @pane-rescue-retain-coarse-window-hours 1
+set -g @pane-rescue-retain-archive-window-days 1
+set -g @pane-rescue-retain-longterm 'weekly'   # 'weekly' | 'monthly' | 'off'
+
+# OR: opt out of tiering entirely
+set -g @pane-rescue-retention 'flat'
+set -g @pane-rescue-retention-flat-keep 200
+```
+
+Cleanup runs on a daemon-driven schedule (default: once per save,
+cheap because most saves don't cross a tier boundary). Per-pane
+capture files have their own simpler retention — one current
+capture per pane, no historical capture archive — but this raises
+a real question (see Open questions below) about whether a 5-day-old
+snapshot's `capture_ref` correctly resolves.
+
 ### Backwards compatibility / import path
 
 A one-shot importer reads existing `tmux-resurrect` save files
@@ -375,6 +441,21 @@ Document the migration. Users uninstall resurrect + continuum.
   focus-out), but a user with 50 active panes is still looking at
   ~50 × N-line captures × 50KB each. Need a per-user cap with
   LRU eviction. Cf. the disk-budget metric in the split PRD.
+
+- **Tiered snapshots vs single capture files: the
+  `capture_ref` integrity gap.** Snapshots in the Archive tier
+  live for 30 days. Capture files (one per pane, overwritten on
+  every focus-out) live for as long as the pane lives. A
+  3-day-old snapshot's `capture_ref` points at a capture file
+  that has since been overwritten with content from 3 days
+  later — restoring that snapshot would replay a stale capture.
+  Options: (a) inline capture content into the snapshot at
+  save time (bigger snapshots, but self-contained); (b) version
+  capture files alongside snapshots, with parallel retention
+  tiers; (c) accept the drift and document the "captures show
+  current state, not snapshot-time state" semantic. Lean (a) for
+  archive-tier snapshots only, (c) for finer tiers where the
+  drift is hours not days. Needs design.
 
 - **What about other tmux state we currently inherit from
   resurrect?** Buffer history, window flags, copy-mode state.
