@@ -140,8 +140,20 @@ Expected changes:
   `copy-claude-response`, `git-lock-cleanup`, `format-csharp` hooks survive.
 - `~/.tmux.conf` — `@resurrect-processes` pattern updated (tilde dropped
   from the claude entry; nvim with "claude" in the path no longer matches).
+- `~/.tmux.conf` — `bind R run-shell "claude-rescue"` added so `prefix + R`
+  opens the session picker (matching the bind staging.sh wires for the
+  staging server).
 - Other deltas your dotfiles happen to have. Inspect; nothing unexpected
   should be in the diff scoped to this rollout.
+
+> **If the second Mac's chezmoi is currently on `main`** (it was at the
+> time of the 2026-05-11 rollout on the first Mac), all four of the
+> previous claude-rescue chezmoi commits — `51486e9` (swap claude-restore
+> → claude-rescue-resume + hook order), `9248c7c` (busy hooks wiring),
+> `c93b68a` (drop tilde from @resurrect-processes), `7137b48` (source-file
+> path: `$HOME` not `~`) — plus the new `a978ced` (picker keybind) all
+> ship together when this Mac merges `feat/claude-rescue-prod-deploy`.
+> Don't cherry-pick subsets.
 
 If you see anything surprising, stop and investigate.
 
