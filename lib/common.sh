@@ -26,6 +26,7 @@ RESCUE_DATA_DIRS=(
   "$CLAUDE_RESCUE_DATA_HOME/windows"
   "$CLAUDE_RESCUE_DATA_HOME/no-tmux"
   "$CLAUDE_RESCUE_DATA_HOME/captures"
+  "$CLAUDE_RESCUE_DATA_HOME/active"
 )
 RESCUE_CACHE_DIRS=(
   "$CLAUDE_RESCUE_CACHE_HOME"
@@ -159,6 +160,55 @@ ensure_pane_uuid() {
   fresh="$(uuidgen | tr '[:upper:]' '[:lower:]')"
   tmux_set_pane_uuid "$pane_id" "$fresh"
   echo "$fresh"
+}
+
+# Unset the pane-scoped @claude-pane-id. Called from the arm-sweep voluntary-
+# exit branch when claude vanished without firing SessionEnd (SIGKILL, dialog
+# dismiss in some claude versions, etc.) AND no hibernation marker is in
+# flight. A SessionEnd-driven exit intentionally KEEPS the option so the
+# hibernation marker (keyed by pane_uuid) stays addressable and cmd_session_start
+# can clean it up if claude returns. ensure_pane_uuid mints a fresh UUID next
+# time SessionStart fires in the pane.
+tmux_unset_pane_uuid() {
+  local pane_id="$1"
+  tmux set-option -upt "$pane_id" @claude-pane-id 2>/dev/null || true
+}
+
+# Active session-id file: $DATA/active/<pane_uuid> contains the current claude
+# session_id for that pane. Authoritative source for `claude-rescue-resume`,
+# preferred over the saved tmux-resurrect `-r <sid>` cmdline (which freezes at
+# save time and goes stale on in-claude `/resume`).
+#
+# Under DATA, not CACHE, so it survives a tmux server restart and isn't subject
+# to `~/.cache` cleanup. Cleared by cmd_session_end / cmd_pane_died / arm-sweep.
+active_session_file() {
+  printf '%s/active/%s' "$CLAUDE_RESCUE_DATA_HOME" "$1"
+}
+
+write_active_session() {
+  local pane_uuid="$1" sid="$2"
+  [ -n "$pane_uuid" ] || return 0
+  [ -n "$sid" ] || return 0
+  local f tmp
+  f="$(active_session_file "$pane_uuid")"
+  tmp="$f.tmp.$$"
+  printf '%s\n' "$sid" > "$tmp" && mv -f "$tmp" "$f"
+}
+
+clear_active_session() {
+  local pane_uuid="$1"
+  [ -n "$pane_uuid" ] || return 0
+  rm -f "$(active_session_file "$pane_uuid")"
+}
+
+read_active_session() {
+  local pane_uuid="$1"
+  [ -n "$pane_uuid" ] || return 0
+  local f
+  f="$(active_session_file "$pane_uuid")"
+  [ -r "$f" ] || return 0
+  # Trim trailing newline; tolerate the file disappearing under us.
+  head -1 "$f" 2>/dev/null | tr -d '\n'
 }
 
 # Returns TSV: session_name<TAB>window_index<TAB>window_name<TAB>pane_current_path

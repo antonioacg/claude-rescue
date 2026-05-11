@@ -22,6 +22,14 @@
 #      — killing the subshell mid-flight would drop the pre-fill). For
 #      mode=soft (or no marker), the kill still happens — that's how
 #      focus-in cancels a pending hibernation.
+#   8. SessionEnd reaps arm.pid + active session file (the bug that left 27
+#      orphan arm.pid files in production after users dismissed claude's
+#      "Resume from summary?" dialog). @claude-pane-id is KEPT — it's the
+#      identity bridge the hibernation marker (and find-sessions) depend on.
+#   9. arm-sweep detects voluntary-exit (pane has @claude-pane-id but is not
+#      running claude, no busy marker, no hibernation marker) and cleans up
+#      arm.pid + active file + unsets @claude-pane-id. Catches hook-skipping
+#      exit paths (SIGKILL, hard crashes) that SessionEnd never sees.
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -479,6 +487,103 @@ assert "scenario 7: arm.pid file removed after soft-mode resume" "0" \
 
 # Cleanup so a re-run starts fresh.
 rm -f "$P2_MARKER"
+
+# ---------------------------------------------------------------------------
+echo "[8] SessionEnd reaps arm.pid + active session file (keeps @claude-pane-id)"
+
+# Re-use %2. Restore its @claude-pane-id (scenario 5 / 7 cleanup may have left
+# residual state). Arm a timer to populate arm.pid, seed an active session
+# file by hand, then fire SessionEnd and verify all three side effects.
+P2_UUID="$(pane_uuid_of $P2)"
+if [ -z "$P2_UUID" ]; then
+  # Mint one — earlier scenarios may have unset it.
+  P2_UUID="$(uuidgen | tr A-Z a-z)"
+  tmux -L "$SOCK" set-option -pt $P2 @claude-pane-id "$P2_UUID"
+fi
+P2_SAN="${P2//[^A-Za-z0-9]/_}"
+P2_ARM_FILE="$CACHE_DIR/hibernated/$P2_SAN.arm.pid"
+
+# Clean slate.
+rm -f "$P2_ARM_FILE"
+rm -f "$DATA_DIR/active/$P2_UUID"
+
+# Arm a hibernation timer for this pane (creates arm.pid).
+tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep 1
+assert "scenario 8: arm.pid created by hibernate-arm" "1" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+
+# Seed an active session file (simulates a prior cmd_session_start write).
+mkdir -p "$DATA_DIR/active"
+SID8="11111111-2222-3333-4444-555555555555"
+printf '%s\n' "$SID8" > "$DATA_DIR/active/$P2_UUID"
+
+# Fire cmd_session_end (claude exiting cleanly: /exit, dialog dismiss, etc.).
+# Write the JSON to a temp file so the run-shell command is shell-quote-safe;
+# session_end reads stdin via redirection.
+#
+# TMUX_PANE has to be set explicitly: staging.sh sets `set-environment -gu
+# TMUX_PANE` so claude run *inside* this staging server doesn't pick up an
+# outer tmux's pane. run-shell -t resolves `#{}` formats against the target
+# but does NOT export TMUX_PANE to the child process — production claude
+# already exports it from its own pane context, so the production hook path
+# works fine. The test has to mimic that explicitly.
+S8_JSON_FILE="$DATA_DIR/scenario8.json"
+printf '{"session_id":"%s","cwd":"/tmp","hook_event_name":"SessionEnd"}' "$SID8" > "$S8_JSON_FILE"
+tmux -L "$SOCK" run-shell -t $P2 "TMUX_PANE=$P2 claude-rescue-log session_end < $S8_JSON_FILE"
+sleep 2
+
+assert "scenario 8: SessionEnd removed arm.pid (no orphan)" "0" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+assert "scenario 8: SessionEnd removed active session file" "0" \
+  "$([ -f "$DATA_DIR/active/$P2_UUID" ] && echo 1 || echo 0)"
+# @claude-pane-id stays — the hibernation marker is keyed by it and cmd_session_start
+# needs it as the cleanup bridge if claude returns to this pane.
+assert "scenario 8: SessionEnd preserved @claude-pane-id (identity bridge)" "$P2_UUID" \
+  "$(pane_uuid_of $P2)"
+
+# ---------------------------------------------------------------------------
+echo "[9] arm-sweep detects voluntary-exit (no marker, no busy, cmd != claude)"
+
+# Use %3 (nvim — pane_current_command is nvim, not claude). Set a fake
+# @claude-pane-id on it to simulate "this pane used to run claude, but claude
+# exited via a path that didn't fire SessionEnd". Seed an active file + arm.pid
+# for that fake identity. arm-sweep should detect this and clean up all three.
+S9_FAKE_UUID="99999999-aaaa-bbbb-cccc-dddddddddddd"
+tmux -L "$SOCK" set-option -pt $P3 @claude-pane-id "$S9_FAKE_UUID"
+
+mkdir -p "$DATA_DIR/active"
+printf '%s\n' "deadbeef-1111-2222-3333-444444444444" > "$DATA_DIR/active/$S9_FAKE_UUID"
+
+P3_SAN="${P3//[^A-Za-z0-9]/_}"
+P3_ARM_FILE="$CACHE_DIR/hibernated/$P3_SAN.arm.pid"
+echo "$$" > "$P3_ARM_FILE"
+
+# Run the sweep (same code path client-attached fires in production).
+tmux -L "$SOCK" run-shell -b 'claude-rescue-log arm-sweep'
+sleep 1
+
+assert "scenario 9: arm-sweep cleared active file for non-claude pane" "0" \
+  "$([ -f "$DATA_DIR/active/$S9_FAKE_UUID" ] && echo 1 || echo 0)"
+assert "scenario 9: arm-sweep cleared arm.pid for non-claude pane" "0" \
+  "$([ -f "$P3_ARM_FILE" ] && echo 1 || echo 0)"
+assert_empty "scenario 9: arm-sweep unset @claude-pane-id on non-claude pane" \
+  "$(pane_uuid_of $P3)"
+
+# Negative control: a backgrounded *claude* pane that still has its uuid must
+# NOT have any of the three cleaned up. Pick one of the other claude panes
+# (the sweep just ran — they should be armed, not cleaned).
+P0_UUID_NOW="$(pane_uuid_of $P0)"
+assert "scenario 9: claude pane @claude-pane-id preserved by sweep" "1" \
+  "$([ -n "$P0_UUID_NOW" ] && echo 1 || echo 0)"
+
+# Cleanup arm.pids the sweep created for the other claude panes.
+for f in "$CACHE_DIR"/hibernated/*.arm.pid; do
+  [ -f "$f" ] || continue
+  pid="$(cat "$f" 2>/dev/null)"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$f"
+done
 
 # ---------------------------------------------------------------------------
 # Summary

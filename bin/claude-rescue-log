@@ -123,6 +123,12 @@ cmd_session_start() {
       session_name:$sn, window_name:$wn} +
      (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
 
+  # Update the pane's active session_id. Fires on every source (startup,
+  # resume, clear, compact), so an in-claude `/resume` that switches sessions
+  # overwrites this with the new sid — claude-rescue-resume reads it next
+  # crash-restore in preference to tmux-resurrect's frozen saved `-r <sid>`.
+  write_active_session "$pane_uuid" "$session_id"
+
   # claude is alive in this pane — any hibernated marker is now stale. This is
   # the cleanup point for hard-mode markers (focus-in is intentionally a no-op
   # so the marker survives as crash-restore insurance until claude is back).
@@ -155,17 +161,41 @@ cmd_session_end() {
     return 0
   fi
 
+  # Reap session-tied state up front, independent of whether the window log
+  # is reachable. This MUST happen even when @claude-window-id is missing
+  # (e.g. claude crashed before SessionStart fired, or the window option
+  # was lost), so orphan arm.pid / active files don't accumulate.
+  #   - arm.pid: a pending hibernation timer would otherwise tick down to a
+  #     plain zsh and send Ctrl+Z (benign no-op, but wrong). 27 such orphans
+  #     observed in production after users dismissed "Resume from summary?".
+  #   - active session_id file: no live session, no truth to record. Wrapper
+  #     falls back to find-sessions (priority 2) keyed by the still-set
+  #     @claude-pane-id.
+  #   - busy marker: safety net if Stop didn't fire (e.g. claude crashed).
+  #
+  # KEEP @claude-pane-id intact. The hard-hibernation marker is keyed by
+  # pane_uuid, and cmd_session_start uses it as the cleanup key when claude
+  # returns to this pane (e.g. via the `clr <sid>` pre-fill). Unsetting it
+  # here would orphan the marker — ensure_pane_uuid would mint a fresh UUID
+  # at next SessionStart and never find the old marker. find-sessions
+  # lookups for prior history also need the durable pane identity.
+  local pane_uuid
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  local san="${pane_id//[^A-Za-z0-9]/_}"
+  rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  clear_active_session "$pane_uuid"
+  clear_busy "$pane_uuid"
+
   local window_uuid
   window_uuid="$(tmux_get_window_uuid "$pane_id")"
   if [ -z "$window_uuid" ]; then
-    log_err "session_end: no @claude-window-id on pane $pane_id; ignoring"
+    log_err "session_end: no @claude-window-id on pane $pane_id; cleanup done but skipping event log"
     return 0
   fi
 
   flush_pending_title "$pane_id" "$window_uuid"
 
-  local pane_uuid claude_pid
-  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  local claude_pid
   claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
   append_event "$window_uuid" "$(jq -nc \
     --arg ts "$(now_iso)" --arg sid "$session_id" \
@@ -173,8 +203,7 @@ cmd_session_end() {
     --arg cpid "${claude_pid:-}" \
     '{ts:$ts, kind:"session_end", session_id:$sid, pane_uuid:$puuid, reason:$reason} +
      (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
-  # Safety net: clear the busy marker if Stop didn't fire (e.g. claude crashed).
-  clear_busy "$pane_uuid"
+
   rebuild_meta "$window_uuid"
 }
 
@@ -247,6 +276,7 @@ cmd_pane_died() {
   # cleanup (only if we resolved a pane_uuid above).
   if [ -n "$pane_uuid" ]; then
     rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+    clear_active_session "$pane_uuid"
   fi
   local san="${pane_id//[^A-Za-z0-9]/_}"
   rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
@@ -578,6 +608,12 @@ cmd_resurrect_restore() {
   done
   # Stale arm pid files refer to processes from the dead server.
   rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid
+
+  # Stale active-session files refer to claude processes that died with the
+  # server. Restored panes are about to run claude-rescue-resume → SessionStart,
+  # which writes a fresh active file. Clear the directory rather than leave
+  # entries pointing at sessions whose pane_uuid mapping may have shifted.
+  rm -f "$CLAUDE_RESCUE_DATA_HOME"/active/*
 
   # === Post-restore UX: for each pane with a hard-hibernation marker AND no
   # live claude process, run `claude-rescue print` (shows the captured
@@ -1058,11 +1094,36 @@ cmd_hibernate_resume() {
 # we know the client is engaging with the server, we arm all eligible
 # backgrounded panes idempotently (per-pane arm.pid check skips already-armed).
 cmd_arm_sweep() {
-  local pane_id win_act pane_act puuid pane_pid san arm_pid_file
-  while IFS=$'\t' read -r pane_id win_act pane_act puuid pane_pid; do
+  local pane_id win_act pane_act puuid pane_pid cur_cmd san arm_pid_file
+  while IFS=$'\t' read -r pane_id win_act pane_act puuid pane_pid cur_cmd; do
     [ -n "$pane_id" ] || continue
     # Fast guard: pane never ran claude → no work.
     [ -n "$puuid" ] || continue
+
+    # Voluntary-exit detection: pane has a claude UUID but isn't running
+    # claude. Catches the SIGKILL / dismiss-"Resume from summary?" / any
+    # hook-skipping exit path. Treat as if SessionEnd fired: drop arm.pid,
+    # drop active-session file, unset @claude-pane-id.
+    #
+    # Guards (any one → skip cleanup):
+    #   - busy marker present: claude is transiently invisible from
+    #     pane_current_command (e.g. spawned a tool subprocess like a wrapper).
+    #   - hibernation marker present: soft means claude is Ctrl+Z'd (T state,
+    #     pane_current_command reports the shell, but the arm subshell is
+    #     load-bearing for the hard escalation). Hard means claude really
+    #     exited, but the marker is the crash-restore insurance that survives
+    #     until cmd_session_start cleans it — don't unset puuid out from under
+    #     it (the marker is keyed by puuid).
+    if [ "$cur_cmd" != "claude" ] \
+       && ! is_busy "$puuid" \
+       && [ ! -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json" ]; then
+      san="${pane_id//[^A-Za-z0-9]/_}"
+      rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+      clear_active_session "$puuid"
+      tmux_unset_pane_uuid "$pane_id"
+      continue
+    fi
+
     # Currently focused (active pane in an active window): leave it alone.
     [ "$win_act$pane_act" = "11" ] && continue
     san="${pane_id//[^A-Za-z0-9]/_}"
@@ -1083,7 +1144,7 @@ cmd_arm_sweep() {
       rm -f "$arm_pid_file"
     fi
     cmd_hibernate_arm "$pane_id" "$pane_pid" 2>/dev/null || true
-  done < <(tmux list-panes -aF $'#{pane_id}\t#{window_active}\t#{pane_active}\t#{@claude-pane-id}\t#{pane_pid}' 2>/dev/null)
+  done < <(tmux list-panes -aF $'#{pane_id}\t#{window_active}\t#{pane_active}\t#{@claude-pane-id}\t#{pane_pid}\t#{pane_current_command}' 2>/dev/null)
 }
 
 # --- Dispatch ---------------------------------------------------------------

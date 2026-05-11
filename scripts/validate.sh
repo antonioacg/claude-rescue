@@ -275,6 +275,53 @@ assert "scenario 10: restore reads sentinel'd sidecar without set-option failure
 tmux -L "$SOCK" set-window-option -g automatic-rename on
 
 # ---------------------------------------------------------------------------
+# Active session_id file lifecycle. Written by cmd_session_start on every
+# source, removed by cmd_session_end / cmd_pane_died. SessionEnd also unsets
+# @claude-pane-id so a pane no longer running claude carries no claude
+# identity. resurrect-restore bulk-clears the dir.
+echo "[scenario 11] active session_id file lifecycle"
+
+tmux -L "$SOCK" new-window -t t1
+S11_P=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S11_P"
+
+# (a) Initial SessionStart writes the active file.
+SID11A=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S11_P" "$SID11A" "/tmp/s11" startup
+sleep 2
+S11_PUUID=$(tmux -L "$SOCK" show-options -pv -t "$S11_P" @claude-pane-id)
+assert_nonempty "scenario 11: @claude-pane-id minted on first SessionStart" "$S11_PUUID"
+S11_ACTIVE_A=$(cat "$HOME_DIR/active/$S11_PUUID" 2>/dev/null | tr -d '\n')
+assert "scenario 11a: active file contains initial sid" "$SID11A" "$S11_ACTIVE_A"
+
+# (b) Second SessionStart (simulating in-claude /resume) overwrites with new sid.
+SID11B=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S11_P" "$SID11B" "/tmp/s11" resume
+sleep 2
+S11_ACTIVE_B=$(cat "$HOME_DIR/active/$S11_PUUID" 2>/dev/null | tr -d '\n')
+assert "scenario 11b: in-claude /resume overwrites active file" "$SID11B" "$S11_ACTIVE_B"
+
+# (c) SessionEnd clears active file but KEEPS @claude-pane-id (identity bridge
+# for the hibernation marker and find-sessions lookups when claude returns).
+tmux -L "$SOCK" send-keys -t "$S11_P" \
+  "echo '{\"session_id\":\"$SID11B\",\"cwd\":\"/tmp/s11\",\"hook_event_name\":\"SessionEnd\"}' | claude-rescue-log session_end" \
+  Enter
+sleep 2
+[ -f "$HOME_DIR/active/$S11_PUUID" ] && S11_AFTER=present || S11_AFTER=absent
+assert "scenario 11c: SessionEnd clears active file" "absent" "$S11_AFTER"
+S11_PUUID_AFTER=$(tmux -L "$SOCK" show-options -pv -t "$S11_P" @claude-pane-id 2>/dev/null)
+assert "scenario 11c: SessionEnd preserves @claude-pane-id" "$S11_PUUID" "$S11_PUUID_AFTER"
+
+# (d) resurrect-restore bulk-clears the active dir.
+mkdir -p "$HOME_DIR/active"
+S11_ORPHAN="orphan-puuid-$$-$(date +%s)"
+touch "$HOME_DIR/active/$S11_ORPHAN"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-restore"
+sleep 1
+[ -f "$HOME_DIR/active/$S11_ORPHAN" ] && S11_ORPHAN_STATE=present || S11_ORPHAN_STATE=absent
+assert "scenario 11d: resurrect-restore bulk-clears active dir" "absent" "$S11_ORPHAN_STATE"
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"

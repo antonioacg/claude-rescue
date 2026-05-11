@@ -132,9 +132,21 @@ if [ -n "${TMUX_PANE:-}" ]; then
   pane_uuid="$(tmux show-options -pv -t "$TMUX_PANE" @claude-pane-id 2>/dev/null || true)"
 fi
 
+# Priority-1: hook-driven active session_id file. Written by cmd_session_start
+# on every source (including in-claude /resume), so it tracks the user's
+# current session even when tmux-resurrect's saved `-r <sid>` cmdline has gone
+# stale. Survives a tmux server restart (lives under $DATA, indexed by the
+# durable pane_uuid that the sidecar preserves).
+active_sid=""
+if [ -n "$pane_uuid" ]; then
+  active_sid="$(read_active_session "$pane_uuid")"
+fi
+
+# Priority-2: find-sessions over the event log. Falls back to the most-recent
+# session for this pane_uuid that has a transcript on disk.
 found_sid=""
 found_cwd=""
-if [ -z "$existing_uuid" ] && [ -n "$pane_uuid" ]; then
+if [ -z "$active_sid" ] && [ -z "$existing_uuid" ] && [ -n "$pane_uuid" ]; then
   # `--open-only` is intentionally NOT used: it filters by absence of a
   # session_end event, but a SIGKILL'd claude leaves the session "open" in
   # our log without a transcript. find-sessions already filters to sessions
@@ -152,14 +164,18 @@ fi
 
 # --- Decide final args ----------------------------------------------------
 # Resolve the resume target with this priority:
-#   1. find-sessions lookup result (most authoritative — derived from our
-#      append-only event log keyed by the durable pane_uuid)
-#   2. UUID stripped from the saved -r/--resume args (fallback for legacy
+#   1. $DATA/active/<pane_uuid> — hook-driven, tracks in-claude /resume
+#   2. find-sessions lookup result — derived from the append-only event log,
+#      keyed by the durable pane_uuid (fallback when the active file was
+#      cleared by SessionEnd or never written)
+#   3. UUID stripped from the saved -r/--resume args (fallback for legacy
 #      data that pre-dates pane_uuid attribution)
-#   3. None — exec claude without -r, starting a fresh session
+#   4. None — exec claude without -r, starting a fresh session
 final_args=("$@")
 target_uuid=""
-if [ -n "$found_sid" ]; then
+if [ -n "$active_sid" ]; then
+  target_uuid="$active_sid"
+elif [ -n "$found_sid" ]; then
   target_uuid="$found_sid"
 elif [ -n "$existing_uuid" ]; then
   target_uuid="$existing_uuid"
@@ -176,6 +192,7 @@ if [ "$debug" -eq 1 ]; then
     echo "============================================================"
     echo " TMUX_PANE        : ${TMUX_PANE:-<unset>}"
     echo " @claude-pane-id  : ${pane_uuid:-<not set>}"
+    echo " active-file      : ${active_sid:-<not set>}"
     echo " find-sessions    : ${found_sid:-<no match>}"
     echo " existing -r arg  : ${existing_uuid:-<none>}"
     echo " resume target    : ${target_uuid:-<none — would start a fresh session>}"
@@ -192,5 +209,5 @@ if [ "$debug" -eq 1 ]; then
 fi
 
 # --- Live: exec claude with the resolved args ------------------------------
-__rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>}"
+__rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>}"
 exec claude "${final_args[@]}"

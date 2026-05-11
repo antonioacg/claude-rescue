@@ -21,6 +21,11 @@
 #        - the NEW session_id is what gets pre-filled, not the original.
 #          Catches a regression where session_start fails to clean the old
 #          marker (would leave the stale sid on the prompt after restore).
+#   4. Wrapper priority — active-file beats stale saved -r:
+#        - $DATA/active/<pane_uuid> with a fresh sid wins over a stale -r arg
+#          baked into the saved tmux-resurrect cmdline. Catches the regression
+#          where in-claude `/resume` switches sessions and the wrapper resumes
+#          the wrong (frozen-at-save-time) conversation after a crash-restore.
 #
 # Exit 0 on all-pass, non-zero on any failure. Cleans up on exit.
 
@@ -341,6 +346,58 @@ if [ -n "$RESTORED_P0" ]; then
     RESULTS+=("PASS  scenario 3: original sid not present in prompt (clean lifecycle)")
     PASS=$((PASS + 1))
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Scenario 4: claude-rescue-resume prefers $DATA/active/<pane_uuid> over the
+# saved tmux-resurrect `-r <sid>` cmdline. The frozen cmdline goes stale when
+# the user does in-claude `/resume` and switches sessions; the active file is
+# rewritten by every cmd_session_start and is the authoritative source.
+echo "[scenario 4] claude-rescue-resume prefers active-file over stale saved -r"
+
+# Find any pane with @claude-pane-id set. Scenarios 1-3 leave the staging
+# server in various restored states; we just need *some* pane that the
+# wrapper can read its uuid from. Pick the first one that satisfies.
+S4_PANE_ROW="$(tmux -L "$SOCK" list-panes -aF '#{pane_id}	#{@claude-pane-id}' 2>/dev/null \
+  | awk -F'\t' '$2 != "" { print $1 "|" $2; exit }')"
+S4_PANE="${S4_PANE_ROW%|*}"
+S4_PUUID="${S4_PANE_ROW#*|}"
+
+if [ -z "$S4_PANE" ] || [ -z "$S4_PUUID" ]; then
+  RESULTS+=("FAIL  scenario 4: no pane with @claude-pane-id found; cannot exercise wrapper")
+  FAIL=$((FAIL + 1))
+else
+  FRESH_SID="aaaabbbb-1111-2222-3333-444455556666"
+  STALE_SID="ffffeeee-9999-8888-7777-666655554444"
+
+  mkdir -p "$DATA_DIR/active"
+  printf '%s\n' "$FRESH_SID" > "$DATA_DIR/active/$S4_PUUID"
+
+  # Run the wrapper in --debug. SHELL=/usr/bin/true makes the final `exec
+  # "$SHELL" -i` a no-op (zsh -i without a tty would hang). Capture the
+  # debug banner from stderr via a file. TMUX_PANE has to be set explicitly
+  # (staging.sh does `set-environment -gu TMUX_PANE` to keep claude-inside-
+  # staging from confusing it with the outer pane; run-shell -t doesn't
+  # export TMUX_PANE to the child).
+  S4_OUT="$DATA_DIR/scenario4.err"
+  : > "$S4_OUT"
+  tmux -L "$SOCK" run-shell -t "$S4_PANE" \
+    "SHELL=/usr/bin/true TMUX_PANE=$S4_PANE $REPO/bin/claude-rescue-resume --debug -r $STALE_SID 2>$S4_OUT"
+  sleep 1
+
+  S4_TARGET_LINE="$(grep 'resume target' "$S4_OUT" | head -1)"
+  S4_ACTIVE_LINE="$(grep 'active-file'   "$S4_OUT" | head -1)"
+  assert_contains "scenario 4: active-file line names FRESH_SID"   "$FRESH_SID" "$S4_ACTIVE_LINE"
+  assert_contains "scenario 4: resume target line names FRESH_SID" "$FRESH_SID" "$S4_TARGET_LINE"
+  if printf '%s' "$S4_TARGET_LINE" | grep -q "$STALE_SID"; then
+    RESULTS+=("FAIL  scenario 4: STALE_SID became the resume target (active-file ignored)")
+    FAIL=$((FAIL + 1))
+  else
+    RESULTS+=("PASS  scenario 4: STALE_SID was not used (active-file took priority)")
+    PASS=$((PASS + 1))
+  fi
+
+  rm -f "$DATA_DIR/active/$S4_PUUID"
 fi
 
 # ---------------------------------------------------------------------------
