@@ -29,6 +29,26 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$REPO/lib/common.sh"
 
+# --- Observability: per-invocation log ------------------------------------
+# Every wrapper invocation appends to wrapper.log: one "invoked" line on
+# entry with verbatim argv + pane + pids, one "resolved" line just before
+# exec with the lookup decisions. Lets us answer post-incident: did the
+# wrapper even run for pane X? With what args? What did it decide? Failure
+# to write the log is silent — we never block the wrapper on a log error.
+__rescue_log_dir="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
+mkdir -p "$__rescue_log_dir" 2>/dev/null || true
+__rescue_wrapper_log="$__rescue_log_dir/wrapper.log"
+__rescue_log() {
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >> "$__rescue_wrapper_log" 2>/dev/null || true
+}
+{
+  __ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '[%s] invoked pid=%s ppid=%s pane=%s argc=%s argv=' \
+    "$__ts" "$$" "${PPID:-?}" "${TMUX_PANE:-<unset>}" "$#"
+  if [ "$#" -gt 0 ]; then printf '%q ' "$@"; fi
+  printf '\n'
+} >> "$__rescue_wrapper_log" 2>/dev/null || true
+
 # --- Flag handling: consume --debug if first arg ---------------------------
 debug=0
 if [ "${1:-}" = "--debug" ]; then
@@ -165,4 +185,5 @@ if [ "$debug" -eq 1 ]; then
 fi
 
 # --- Live: exec claude with the resolved args ------------------------------
+__rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>}"
 exec claude "${final_args[@]}"

@@ -479,13 +479,14 @@ cmd_resurrect_save() {
 }
 
 cmd_resurrect_restore() {
-  # Hooked into tmux-resurrect via @resurrect-hook-post-restore-all.
+  # Hooked into tmux-resurrect via @resurrect-hook-pre-restore-pane-processes.
   # Re-applies @claude-window-id and @claude-pane-id from the sidecar TSV.
   # Accepts two formats:
   #   legacy (4 cols): session<TAB>window_idx<TAB>window_name<TAB>@claude-window-id
   #   current (5 cols, type-prefixed):
   #     window<TAB>session<TAB>window_idx<TAB>window_name<TAB>uuid
   #     pane<TAB>session<TAB>window_idx<TAB>pane_idx<TAB>uuid
+  log_err "resurrect-restore: hook fired (TMUX=${TMUX:-<unset>})"
   local resurrect_dir
   resurrect_dir="$(tmux show-options -gv @resurrect-dir 2>/dev/null || true)"
   if [ -z "$resurrect_dir" ]; then
@@ -493,32 +494,50 @@ cmd_resurrect_restore() {
     [ -d "$resurrect_dir" ] || resurrect_dir="$HOME/.tmux/resurrect"
   fi
   local last_link="$resurrect_dir/last"
-  [ -L "$last_link" ] || [ -f "$last_link" ] || return 0
+  if ! { [ -L "$last_link" ] || [ -f "$last_link" ]; }; then
+    log_err "resurrect-restore: no last symlink at $last_link — bailing"
+    return 0
+  fi
   local state_basename
   state_basename="$(readlink "$last_link" 2>/dev/null || cat "$last_link" 2>/dev/null)"
-  [ -n "$state_basename" ] || return 0
+  if [ -z "$state_basename" ]; then
+    log_err "resurrect-restore: last symlink resolves to empty target — bailing"
+    return 0
+  fi
   local state_file="$resurrect_dir/$state_basename"
   local sidecar="${state_file%.txt}.claude-userops.tsv"
-  [ -f "$sidecar" ] || return 0
+  if [ ! -f "$sidecar" ]; then
+    log_err "resurrect-restore: no sidecar at $sidecar — bailing (snapshot=$state_basename)"
+    return 0
+  fi
+  log_err "resurrect-restore: snapshot=$state_basename sidecar_rows=$(wc -l < "$sidecar" | tr -d ' ')"
 
+  local applied_window=0 applied_pane=0 skipped=0
   while IFS=$'\t' read -r col1 col2 col3 col4 col5; do
     if [ -z "$col5" ]; then
       # Legacy 4-col line: window only.
-      [ -n "$col4" ] || continue
-      tmux set-option -wt "$col1:$col2" @claude-window-id "$col4" 2>/dev/null || true
+      [ -n "$col4" ] || { skipped=$((skipped+1)); continue; }
+      tmux set-option -wt "$col1:$col2" @claude-window-id "$col4" 2>/dev/null \
+        && applied_window=$((applied_window+1)) \
+        || log_err "resurrect-restore: set-option -wt $col1:$col2 @claude-window-id failed"
     else
       case "$col1" in
         window)
-          [ -n "$col5" ] || continue
-          tmux set-option -wt "$col2:$col3" @claude-window-id "$col5" 2>/dev/null || true
+          [ -n "$col5" ] || { skipped=$((skipped+1)); continue; }
+          tmux set-option -wt "$col2:$col3" @claude-window-id "$col5" 2>/dev/null \
+            && applied_window=$((applied_window+1)) \
+            || log_err "resurrect-restore: set-option -wt $col2:$col3 @claude-window-id failed"
           ;;
         pane)
-          [ -n "$col5" ] || continue
-          tmux set-option -pt "$col2:$col3.$col4" @claude-pane-id "$col5" 2>/dev/null || true
+          [ -n "$col5" ] || { skipped=$((skipped+1)); continue; }
+          tmux set-option -pt "$col2:$col3.$col4" @claude-pane-id "$col5" 2>/dev/null \
+            && applied_pane=$((applied_pane+1)) \
+            || log_err "resurrect-restore: set-option -pt $col2:$col3.$col4 @claude-pane-id failed"
           ;;
       esac
     fi
   done < "$sidecar"
+  log_err "resurrect-restore: applied window=$applied_window pane=$applied_pane skipped=$skipped"
 
   # === Crash-promote: any pane that was soft-hibernated when the server died
   # is effectively hard-hibernated now (claude died with the crash). Rewrite
