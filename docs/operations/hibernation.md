@@ -84,7 +84,7 @@ runs only if `/exit` doesn't exit within ~3s.
 |---|---|---|
 | `$DATA/captures/<pane_uuid>.txt` | durable, overwritten on next hibernation | full pane scrollback at suspend time (ANSI preserved) |
 | `$DATA/captures/<pane_uuid>.json` | durable | `{pane_uuid, window_uuid, session_id, pane_id, ts, cwd, pids}` |
-| `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{mode, ts, pids, hard_ts?, hard_source?}` |
+| `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{pane_id, pane_uuid, ts, mode, pids[], hard_ts?, hard_source?}` |
 | `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running | the bash subshell pid holding the soft+hard sleeps |
 | `$CACHE/busy/<pane_uuid>` | mtime-based freshness window | `{ts, claude_pid?}` JSON — body is for troubleshooting; the `is_busy()` check reads only the file's `mtime` |
 
