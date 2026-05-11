@@ -10,6 +10,8 @@
 #   1. Soft hibernation fires on an idle claude pane (capture + Ctrl+Z + marker)
 #   2. Soft resume restores the suspended claude
 #   3. Hard escalation fires after HARD_DELAY (claude exits + clr pre-fill)
+#   3b. Hard marker survives focus-in (no-op, no spurious unhibernated event)
+#   3c. Hard marker cleaned up by session_start when claude restarts in pane
 #   4. Fast guard skips panes without @claude-pane-id (nvim)
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
@@ -192,6 +194,67 @@ assert "scenario 3: pane_current_command is zsh" "zsh" "$(fg_cmd $P0)"
 PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t $P0 | tail -5)"
 HAS_CLR="$(printf '%s' "$PANE_CONTENT" | grep -c '^.*❯ clr [0-9a-f]\{8\}-' || true)"
 assert "scenario 3: 'clr <sid>' pre-filled at shell prompt" "1" "$HAS_CLR"
+
+# ---------------------------------------------------------------------------
+echo "[3b] hard marker survives focus-in (hibernate-resume is a no-op for hard mode)"
+
+# Locate the window jsonl for this pane so we can read event history.
+P0_WIN_LOG="$(grep -l "\"pane_uuid\":\"$P0_UUID\"" "$DATA_DIR"/windows/*.jsonl 2>/dev/null | head -1)"
+[ -z "$P0_WIN_LOG" ] && { echo "FATAL: no window log for $P0_UUID" >&2; exit 1; }
+
+# Record current event tail length so we can detect events fired by focus-in.
+EVENTS_BEFORE_FOCUSIN="$(wc -l < "$P0_WIN_LOG" | tr -d ' ')"
+
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-resume #{pane_id}'
+sleep 2
+
+assert "scenario 3b: hard marker still present after focus-in" "1" \
+  "$([ -f "$MARKER" ] && echo 1 || echo 0)"
+assert "scenario 3b: marker mode still hard" "hard" \
+  "$(jq -r '.mode // empty' "$MARKER" 2>/dev/null)"
+
+UNHIB_FROM_FOCUSIN="$(tail -n +"$((EVENTS_BEFORE_FOCUSIN + 1))" "$P0_WIN_LOG" \
+  | jq -rc 'select(.kind == "unhibernated" and .pane_uuid == "'"$P0_UUID"'")' \
+  | wc -l | tr -d ' ')"
+assert "scenario 3b: no unhibernated event emitted by focus-in" "0" "$UNHIB_FROM_FOCUSIN"
+
+assert "scenario 3b: pane still at zsh prompt (claude not back)" "zsh" "$(fg_cmd $P0)"
+
+# ---------------------------------------------------------------------------
+echo "[3c] hard marker cleaned up by session_start when claude restarts in pane"
+
+# Read the session_id off the existing `clr <sid>` pre-fill (set in scenario 3).
+# Pressing Enter invokes claude-rescue-resume which starts claude --resume <sid>,
+# which fires a SessionStart hook → cmd_session_start should clean up the marker.
+EVENTS_BEFORE_RESUME="$(wc -l < "$P0_WIN_LOG" | tr -d ' ')"
+tmux -L "$SOCK" send-keys -t $P0 Enter
+
+# Wait up to 20s for claude to come back as foreground.
+RESUMED=0
+for _ in $(seq 1 20); do
+  if [ "$(fg_cmd $P0)" = "claude" ]; then RESUMED=1; break; fi
+  sleep 1
+done
+assert "scenario 3c: claude is foreground after Enter on clr pre-fill" "1" "$RESUMED"
+
+# Give the SessionStart hook a moment to run.
+sleep 2
+
+assert "scenario 3c: hibernated marker removed by session_start" "0" \
+  "$([ -f "$MARKER" ] && echo 1 || echo 0)"
+
+NEW_EVENTS="$(tail -n +"$((EVENTS_BEFORE_RESUME + 1))" "$P0_WIN_LOG")"
+SESSION_STARTS="$(printf '%s\n' "$NEW_EVENTS" \
+  | jq -rc 'select(.kind == "session_start" and .pane_uuid == "'"$P0_UUID"'")' \
+  | wc -l | tr -d ' ')"
+assert "scenario 3c: session_start event fired for the resumed claude" "1" \
+  "$([ "$SESSION_STARTS" -ge 1 ] && echo 1 || echo 0)"
+
+UNHIB_HARD="$(printf '%s\n' "$NEW_EVENTS" \
+  | jq -rc 'select(.kind == "unhibernated" and .pane_uuid == "'"$P0_UUID"'" and .mode == "hard")' \
+  | wc -l | tr -d ' ')"
+assert "scenario 3c: unhibernated(mode=hard) emitted by session_start cleanup" "1" \
+  "$([ "$UNHIB_HARD" -ge 1 ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 echo "[4] fast guard skips panes without @claude-pane-id"

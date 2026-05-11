@@ -113,6 +113,17 @@ cmd_session_start() {
       session_name:$sn, window_name:$wn} +
      (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
 
+  # claude is alive in this pane — any hibernated marker is now stale. This is
+  # the cleanup point for hard-mode markers (focus-in is intentionally a no-op
+  # so the marker survives as crash-restore insurance until claude is back).
+  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  if [ -f "$hibernated_file" ]; then
+    local stale_mode
+    stale_mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+    rm -f "$hibernated_file"
+    cmd_unhibernated "$pane_id" "${stale_mode:-hard}" 2>/dev/null || true
+  fi
+
   rebuild_meta "$window_uuid"
 }
 
@@ -221,6 +232,15 @@ cmd_pane_died() {
   append_event "$window_uuid" "$(jq -nc \
     --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
     '{ts:$ts, kind:"pane_died", pane_uuid:$puuid}')"
+
+  # Pane is gone — any hibernated marker for it is orphaned. Best-effort
+  # cleanup (only if we resolved a pane_uuid above).
+  if [ -n "$pane_uuid" ]; then
+    rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  fi
+  local san="${pane_id//[^A-Za-z0-9]/_}"
+  rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+
   rebuild_meta "$window_uuid"
 }
 
@@ -536,8 +556,8 @@ cmd_resurrect_restore() {
       # wrapper — the foreground process is racing through
       # shell → claude-rescue-resume → claude, and pane_current_command could
       # report any of those depending on timing. Sending keys into that pipeline
-      # corrupts the resume. Skip; marker will be cleaned up on the next
-      # pane-focus-in (hibernate-resume sees mode=hard, no-ops, deletes file).
+      # corrupts the resume. Skip; marker will be cleaned up by cmd_session_start
+      # when the wrapper-launched claude fires its SessionStart hook.
       hard_source="$(jq -r '.hard_source // empty' "$hib_marker" 2>/dev/null)"
       if [ "$hard_source" = "crash-promote" ]; then
         continue
@@ -555,7 +575,10 @@ cmd_resurrect_restore() {
         tmux send-keys -t "$pane_id" "clr $sid" 2>/dev/null || true
       fi
 
-      rm -f "$hib_marker"
+      # Marker NOT deleted here. The `clr <sid>` text is live readline input
+      # (not captured by tmux-resurrect), so a second crash before the user
+      # presses Enter would lose the recipe. cmd_session_start cleans it up
+      # when claude actually restarts; cmd_pane_died handles orphans.
     done < <(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}' 2>/dev/null)
   ) &
   disown 2>/dev/null || true
@@ -858,9 +881,18 @@ cmd_hibernate_arm() {
 
 cmd_hibernate_resume() {
   # Cancel any pending hibernate-arm timer and unfreeze the pane based on the
-  # mode it was hibernated as. Soft → `fg<Enter>` (shell resumes the suspended
-  # claude job, tcsetpgrp restored). Hard → no-op (claude is gone; capture
-  # remains for `claude-rescue print`).
+  # mode it was hibernated as.
+  #
+  # Soft → `fg<Enter>` (shell resumes the suspended claude job, tcsetpgrp
+  # restored). Marker + unhibernated event fire here: same claude session
+  # continues, no session_start will arrive to clean up later.
+  #
+  # Hard → true no-op. Claude is dead; the marker is the only state protecting
+  # against a crash *after* focus-in (the `clr <sid>` text on the prompt is
+  # live readline input, not captured by tmux-resurrect). Marker is cleaned
+  # up by cmd_session_start when claude actually starts again — whether via
+  # the pre-filled `clr <sid>` or a fresh `cl` for a brand-new session. If
+  # the pane dies without ever resuming, cmd_pane_died cleans it up.
   local pane_id="${1:-}"
   [ -n "$pane_id" ] || return 0
 
@@ -888,15 +920,15 @@ cmd_hibernate_resume() {
   case "$mode" in
     soft)
       tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
+      rm -f "$hibernated_file"
+      cmd_unhibernated "$pane_id" "$mode" 2>/dev/null || true
       ;;
     hard)
-      # claude is gone; pane is at shell prompt. `claude-rescue print` shows
-      # the captured snapshot; user can resume via the picker.
+      # No-op. Marker survives until session_start (real resume) or
+      # pane_died (orphan cleanup).
       :
       ;;
   esac
-  rm -f "$hibernated_file"
-  cmd_unhibernated "$pane_id" "$mode" 2>/dev/null || true
 }
 
 # --- Dispatch ---------------------------------------------------------------

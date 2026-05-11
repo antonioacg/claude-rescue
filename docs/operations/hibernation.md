@@ -31,13 +31,16 @@ focus-in              wait CLAUDE_RESCUE_HARD_DELAY total
 hibernate-resume:         send-keys "fg" Enter → "/exit" Enter
   read marker                   │
   mode=soft → fg<CR>            ▼
-  mode=hard → no-op       (fallback) SIGTERM → SIGKILL
-  delete marker                 │
-                                ▼
-                       send-keys "clr <sid>" (no Enter)
-                                │
+                delete    (fallback) SIGTERM → SIGKILL
+                marker          │
+  mode=hard → no-op             ▼
+                (marker  send-keys "clr <sid>" (no Enter)
+                survives)       │
                                 ▼
                        marker: mode=hard
+                       (cleared by session_start
+                        when claude restarts in pane,
+                        or pane_died for orphans)
 ```
 
 ### Why Ctrl+Z, not `kill -STOP`?
@@ -64,7 +67,7 @@ runs only if `/exit` doesn't exit within ~3s.
 |---|---|---|
 | `$DATA/captures/<pane_uuid>.txt` | durable, overwritten on next hibernation | full pane scrollback at suspend time (ANSI preserved) |
 | `$DATA/captures/<pane_uuid>.json` | durable | `{pane_uuid, window_uuid, session_id, pane_id, ts, cwd, pids}` |
-| `$CACHE/hibernated/<pane_uuid>.json` | until resume / promote / restore-cleanup | `{mode, ts, pids, hard_ts?, hard_source?}` |
+| `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{mode, ts, pids, hard_ts?, hard_source?}` |
 | `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running | the bash subshell pid holding the soft+hard sleeps |
 | `$CACHE/busy/<pane_uuid>` | mtime-based freshness window | `{ts, claude_pid?}` JSON — body is for troubleshooting; the `is_busy()` check reads only the file's `mtime` |
 
@@ -115,6 +118,24 @@ send any prompt so a transcript file is created.
    - Pane content shows claude's "Resume this session with: claude --resume <sid>" message.
    - Pane shell prompt is **pre-filled** with `clr <sid>` (no Enter pressed).
    - Marker has `mode: "hard"`, `hard_ts` set.
+
+### C2. Hard → focus-in (marker survives)
+
+After C: focus the hard-hibernated pane *without* pressing Enter.
+
+7'. **Verify:**
+   - Marker still present at `$CACHE/hibernated/<uuid>.json` (focus-in is a no-op for hard mode).
+   - No `unhibernated` event in the window log (claude isn't actually back yet).
+   - Pane prompt still shows `clr <sid>`.
+
+### C3. Hard → real resume cleans marker
+
+After C2: press Enter on the `clr <sid>` prompt (or type `cl` to start a fresh session). Wait for the new claude to render.
+
+8'. **Verify:**
+   - `session_start` event for this pane_uuid in window log.
+   - Marker is gone (cleaned up by `cmd_session_start`).
+   - `unhibernated` event emitted with `mode: "hard"`.
 
 ### D. Busy-aware skip
 
