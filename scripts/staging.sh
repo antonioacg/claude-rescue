@@ -165,13 +165,23 @@ set -g @continuum-save-interval '1'
 # @resurrect-processes mapping. On restore, each pane that was running
 # claude is restarted via claude-rescue-resume — which queries the pane's
 # (sidecar-restored) @claude-pane-id, looks up the latest open session via
-# find-sessions, and (when not in dry-run) execs `claude … -r <session_id>`.
+# find-sessions, and execs 'claude ... -r <session_id>'.
 # This replaces the legacy scrollback-grep claude-restore.sh path.
 #
 # In dry-run mode (current default in claude-rescue-resume) the wrapper
 # prints what it would exec and drops into a shell, so kill+restore tests
 # can validate the lookup chain without actually starting claude.
-set -g @resurrect-processes "\"~claude->claude-rescue-resume *\""
+#
+# Pattern is plain "claude" — NO tilde. The tilde prefix in tmux-resurrect
+# is a substring regex against the saved full command, which makes
+# 'nvim /tmp/file-claude.md' (any path containing the word claude) match
+# and get wrongly wrapped with claude-rescue-resume. Without the tilde the
+# match is exact-first-word only.
+#
+# IMPORTANT: do not put backticks in this heredoc — the heredoc delimiter
+# below ('TMUX' would be ideal but \$HOME is used too) is unquoted, so
+# backticks trigger command substitution at script-run time.
+set -g @resurrect-processes "\"claude->claude-rescue-resume *\""
 
 # Distinguishable status hint so you can tell staging from your main at a glance.
 set -ag status-right ' [staging]'
@@ -189,6 +199,10 @@ TMUX
   # server. The bin/claude-rescue-log subshell self-bails on identity mismatch,
   # but we kill orphans proactively here to avoid the cascade where a still-
   # alive orphan prevents new arm subshells from starting (existing-timer check).
+  #
+  # Two passes: first remove any *.arm.pid files (and kill the recorded pid if
+  # still alive), then ALSO pgrep for any orphan whose arm.pid file was already
+  # cleaned (e.g., by an earlier hibernate-resume) but whose subshell survived.
   local arm_dir="$DATA_DIR/cache/hibernated"
   if [ -d "$arm_dir" ]; then
     local f pid args
@@ -198,13 +212,19 @@ TMUX
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         args="$(ps -o args= -p "$pid" 2>/dev/null)"
         if printf '%s' "$args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
-          echo "    sweeping stale arm subshell pid=$pid"
+          echo "    sweeping stale arm subshell pid=$pid (from arm.pid file)"
           kill "$pid" 2>/dev/null || true
         fi
       fi
       rm -f "$f"
     done
   fi
+  # Pattern-pass: catch fileless orphans.
+  local orphan_pid
+  for orphan_pid in $(pgrep -f "claude-rescue-log (hibernate-arm|arm-sweep)" 2>/dev/null); do
+    echo "    sweeping fileless orphan arm subshell pid=$orphan_pid"
+    kill "$orphan_pid" 2>/dev/null || true
+  done
 
   echo "==> 3. Starting staging tmux server (socket: $SOCK)"
   if tmux -L "$SOCK" has-session 2>/dev/null; then
