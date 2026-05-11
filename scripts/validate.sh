@@ -179,6 +179,53 @@ NTBUCKETS=$(find "$HOME_DIR/no-tmux" -name "*.jsonl" 2>/dev/null | wc -l | tr -d
 assert "scenario 8: no-tmux bucket created" "1" "$NTBUCKETS"
 
 # ---------------------------------------------------------------------------
+# Regression: find-sessions must encode BOTH `/` and `.` to `-` when looking
+# up the claude projects dir. Prod rollout caught a silent filter-out of all
+# dotfile-cwd sessions (e.g. ~/.local/share/chezmoi). Build a meta.json and
+# fake transcript directly so the test exercises ONLY the encoding logic.
+echo "[scenario 9] find-sessions resolves a dotfile cwd"
+DOTCWD="/tmp/.dotfile-cwd-validate-$$"
+DOTENC="-tmp--dotfile-cwd-validate-$$"  # / and . both map to -
+PROJ_ROOT="$HOME_DIR/fake-projects"
+mkdir -p "$PROJ_ROOT/$DOTENC"
+SID9=$(uuidgen|tr A-Z a-z)
+PUUID9=$(uuidgen|tr A-Z a-z)
+WUUID9=$(uuidgen|tr A-Z a-z)
+: > "$PROJ_ROOT/$DOTENC/$SID9.jsonl"
+mkdir -p "$HOME_DIR/windows"
+jq -n --arg wu "$WUUID9" --arg sid "$SID9" --arg pu "$PUUID9" --arg cwd "$DOTCWD" '{
+  window_uuid: $wu, window_name: "validate-dotfile",
+  sessions: [{
+    session_id: $sid, pane_uuid: $pu, cwd: $cwd,
+    source: "validate", started: "2026-01-01T00:00:00Z", ended: null
+  }]
+}' > "$HOME_DIR/windows/$WUUID9.meta.json"
+RES9=$(CLAUDE_PROJECTS_DIR="$PROJ_ROOT" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+       "$REPO/bin/claude-rescue" find-sessions --pane-uuid "$PUUID9" 2>/dev/null \
+       | head -1 | awk -v FS=$'\x1f' '{print $1}')
+assert "scenario 9: dotfile cwd session resolves" "$SID9" "$RES9"
+# Also confirm a dot-free cwd still works (regression guard on the chained
+# parameter expansion: `/` mapping must survive the `.` mapping).
+PLAINCWD="/tmp/plaincwd-validate-$$"
+PLAINENC="-tmp-plaincwd-validate-$$"
+mkdir -p "$PROJ_ROOT/$PLAINENC"
+SID9B=$(uuidgen|tr A-Z a-z)
+PUUID9B=$(uuidgen|tr A-Z a-z)
+WUUID9B=$(uuidgen|tr A-Z a-z)
+: > "$PROJ_ROOT/$PLAINENC/$SID9B.jsonl"
+jq -n --arg wu "$WUUID9B" --arg sid "$SID9B" --arg pu "$PUUID9B" --arg cwd "$PLAINCWD" '{
+  window_uuid: $wu, window_name: "validate-plain",
+  sessions: [{
+    session_id: $sid, pane_uuid: $pu, cwd: $cwd,
+    source: "validate", started: "2026-01-01T00:00:00Z", ended: null
+  }]
+}' > "$HOME_DIR/windows/$WUUID9B.meta.json"
+RES9B=$(CLAUDE_PROJECTS_DIR="$PROJ_ROOT" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+        "$REPO/bin/claude-rescue" find-sessions --pane-uuid "$PUUID9B" 2>/dev/null \
+        | head -1 | awk -v FS=$'\x1f' '{print $1}')
+assert "scenario 9: plain cwd session still resolves" "$SID9B" "$RES9B"
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"
