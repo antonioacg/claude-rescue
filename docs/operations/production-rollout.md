@@ -194,6 +194,35 @@ For cwds with multiple panes, each pane gets a *distinct* session_id
 same session at restore. Panes whose cwd has fewer transcripts than
 panes are skipped — recovery for those is `clr <sid>` by hand.
 
+**Honest framing of the multi-pane mapping.** Minting a UUID is just a
+stable key. Linking that UUID to a session_id is a *claim* — we're
+asserting "this pane was running session Y" based on a heuristic
+(Nth-most-recent transcript → Nth pane in tmux order), not observation.
+For single-pane cwds the claim is reliable (one transcript, one pane).
+For multi-pane cwds the within-group mapping is essentially arbitrary:
+every pane in the group resumes *some* live conversation from that cwd,
+but which-pane-gets-which-session is not load-bearing. The dry-run output
+flags this with `(unique)` vs `(heuristic N/M)` annotations.
+
+If after restart a pane shows the "wrong" content for what you expected
+in that slot, three backing stores let you recover without losing
+anything:
+
+1. **`restore-plan.tsv`** in the step-4e dump — explicit (pane → session_id)
+   map. Find the cwd's row group and pick the session_id you actually
+   wanted, then `clr <session_id>` in that pane.
+2. **`pane_contents.tar.gz`** in the resurrect dir
+   (`~/.local/share/tmux/resurrect/default/`) — every pane's scrollback
+   at force-save time, because `@resurrect-capture-pane-contents 'on'`
+   is set. After restore the panes visually show what they had, which
+   makes content-to-session matching straightforward.
+3. **`~/.claude/projects/<encoded-cwd>/*.jsonl`** — full append-only
+   transcripts on disk. Grep them by content to find the session_id you
+   need, then resume.
+
+These three stores together mean "wrong pane got the wrong session" is
+recoverable in seconds, not lost work. See step 5's recovery recipes.
+
 ```bash
 bash ~/dev/claude-rescue/scripts/backfill-pane-uuids.sh --dry-run
 # Inspect the MINT/SKIP output. Confirm the (pane → session_id) mapping
