@@ -13,7 +13,8 @@
 #   scripts/state-dump.sh                 # default output dir
 #   scripts/state-dump.sh /path/to/dir    # explicit dir
 #
-# Defaults: $CLAUDE_RESCUE_DUMP_DIR, else ~/claude-rescue-dumps/dump-<ts>.
+# Defaults: $CLAUDE_RESCUE_DUMP_DIR, else
+# ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-<ts>.
 #
 # Target tmux server:
 #   Targets the LIVE production tmux server, assumed to be on the `default`
@@ -30,7 +31,11 @@ set -eu
 # script. State-dump is best-effort — partial data is fine, abort is not.
 
 ts="$(date +%Y%m%dT%H%M%S)"
-out="${1:-${CLAUDE_RESCUE_DUMP_DIR:-$HOME/claude-rescue-dumps/dump-$ts}}"
+# Dumps live under XDG_STATE_HOME — they're regenerable operational state, not
+# user data and not cache. CLAUDE_RESCUE_DUMP_DIR overrides the whole path
+# (use for test isolation or alternate location).
+DUMPS_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rescue/dumps"
+out="${1:-${CLAUDE_RESCUE_DUMP_DIR:-$DUMPS_ROOT/dump-$ts}}"
 mkdir -p "$out"
 
 DATA="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"

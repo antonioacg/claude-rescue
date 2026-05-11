@@ -49,9 +49,10 @@ for arg in "$@"; do
 done
 
 if [ -z "$dump" ]; then
-  dump="$(/bin/ls -td "$HOME/claude-rescue-dumps"/dump-* 2>/dev/null | head -1)"
+  DUMPS_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rescue/dumps"
+  dump="$(/bin/ls -td "$DUMPS_ROOT"/dump-* 2>/dev/null | head -1)"
 fi
-[ -d "$dump" ] || { echo "No dump dir under ~/claude-rescue-dumps/ — run state-dump.sh first" >&2; exit 1; }
+[ -d "$dump" ] || { echo "No dump dir under ${XDG_STATE_HOME:-$HOME/.local/state}/claude-rescue/dumps/ — run state-dump.sh first" >&2; exit 1; }
 plan="$dump/restore-plan.tsv"
 [ -f "$plan" ] || { echo "Missing $plan" >&2; exit 1; }
 

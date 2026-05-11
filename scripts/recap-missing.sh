@@ -39,9 +39,10 @@ for arg in "$@"; do
 done
 
 if [ -z "$dump" ]; then
-  dump="$(/bin/ls -td "$HOME/claude-rescue-dumps"/dump-* 2>/dev/null | head -1)"
+  DUMPS_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rescue/dumps"
+  dump="$(/bin/ls -td "$DUMPS_ROOT"/dump-* 2>/dev/null | head -1)"
   if [ -z "$dump" ]; then
-    echo "No dump found under ~/claude-rescue-dumps/. Run scripts/state-dump.sh first." >&2
+    echo "No dump found under $DUMPS_ROOT/. Run scripts/state-dump.sh first." >&2
     exit 1
   fi
 fi

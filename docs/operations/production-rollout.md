@@ -55,7 +55,7 @@ Set it once in the operator's shell; both `state-dump.sh` and
 bash ~/dev/claude-rescue/scripts/state-dump.sh
 ```
 
-Writes to `~/claude-rescue-dumps/dump-<ts>/`. Files you'll care about if
+Writes to `${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-<ts>/`. Files you'll care about if
 something goes wrong:
 
 | File | Purpose |
@@ -90,7 +90,7 @@ bash ~/dev/claude-rescue/scripts/recap-missing.sh             # send
 The script re-checks each target pane's `pane_current_command` at send
 time and skips anything that isn't currently `claude` — it never types
 the prompt into a shell. Default input is the latest dump under
-`~/claude-rescue-dumps/`.
+`${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/`.
 
 After it runs, give claudes ~30s to respond. The recaps land as new
 messages in their `.jsonl` files.
@@ -161,7 +161,7 @@ bash ~/dev/claude-rescue/scripts/state-dump.sh
 Verify the previously-empty `latest_session_id` rows are now populated:
 
 ```bash
-LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+LATEST="$(/bin/ls -td ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-* | head -1)"
 awk -F'\t' 'NR>1 && $7==""' "$LATEST/restore-plan.tsv"
 ```
 
@@ -293,7 +293,7 @@ reattach cycle provides naturally. See
 
 ```bash
 bash ~/dev/claude-rescue/scripts/state-dump.sh
-LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+LATEST="$(/bin/ls -td ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-* | head -1)"
 echo "Panes still missing @claude-pane-id:"
 awk -F'\t' '$7=="claude" && $9==""' "$LATEST/tmux-panes.tsv" | wc -l
 ```
@@ -383,7 +383,7 @@ tmux -L default capture-pane -t <session>:<window_idx>.<pane_idx> -p | head -40
 
 # 2. Pull the cwd's row group from the step-4e dump's restore-plan.tsv
 #    to see which session_ids exist for this cwd.
-LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+LATEST="$(/bin/ls -td ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-* | head -1)"
 awk -F'\t' -v c="<cwd>" '$6==c' "$LATEST/restore-plan.tsv"
 
 # 3. If you need to grep transcript content to identify the right
@@ -452,7 +452,7 @@ running server. Code rollback can wait.
 - Remove the legacy `~/.claude-rescue/stopped/` directory if it exists and
   is empty (pre-rename leftover): `rmdir ~/.claude-rescue/stopped`.
 - Keep the state dump from step 1 for a few days, then delete:
-  `rm -rf ~/claude-rescue-dumps/dump-<ts>`.
+  `rm -rf ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-<ts>`.
 
 ---
 
