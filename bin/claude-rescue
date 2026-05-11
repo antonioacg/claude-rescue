@@ -635,12 +635,13 @@ find_sessions() {
   shopt -u nullglob
   [ ${#metas[@]} -eq 0 ] && return 0
 
-  # Claude's transcript directory uses the cwd with `/` swapped for `-`,
-  # rooted at $CLAUDE_PROJECTS_DIR (default ~/.claude/projects). Sessions
-  # claude opened but never received a user message in have no transcript
-  # file; resuming such a session via `claude -r <sid>` silently spawns a
-  # fresh session, masking the resume. We unconditionally drop them — there's
-  # no useful behavior for an entry the user can't actually resume.
+  # Claude's transcript directory uses the cwd with BOTH `/` and `.` swapped
+  # for `-` (so `.local` and `/local` both encode as `-local`), rooted at
+  # $CLAUDE_PROJECTS_DIR (default ~/.claude/projects). Sessions claude opened
+  # but never received a user message in have no transcript file; resuming
+  # such a session via `claude -r <sid>` silently spawns a fresh session,
+  # masking the resume. We unconditionally drop them — there's no useful
+  # behavior for an entry the user can't actually resume.
   local projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 
   local US=$'\x1f'
@@ -672,6 +673,7 @@ find_sessions() {
       [ -z "$sid" ] && continue
       [ -z "$rcwd" ] && continue
       local enc="${rcwd//\//-}"
+      enc="${enc//./-}"
       [ -f "$projects_root/$enc/$sid.jsonl" ] && printf '%s\n' "$row"
     done \
   | sort -t"$US" -k4,4r

@@ -56,10 +56,12 @@ wait_for_cmd() {
 }
 
 # Wait for a transcript file to appear under ~/.claude/projects/<encoded>/.
-# Encoded cwd = $cwd with `/` → `-`.
+# Encoded cwd = $cwd with BOTH `/` and `.` mapped to `-` (so `.local` and
+# `/local` both become `-local`, hence the `--` you see on dotfile paths).
 wait_for_transcript() {
   local cwd="$1" enc proj_dir i
   enc="${cwd//\//-}"
+  enc="${enc//./-}"
   proj_dir="$HOME/.claude/projects/$enc"
   for i in $(seq 1 "$TRANSCRIPT_TIMEOUT"); do
     if [ -d "$proj_dir" ] \
