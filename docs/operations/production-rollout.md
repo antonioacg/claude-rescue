@@ -269,9 +269,16 @@ tmux -L default show-options -gv @resurrect-hook-pre-restore-pane-processes
 ```
 
 If either returns `invalid option`, the source-file didn't load
-rescue.tmux.conf. Check that `~/.tmux.conf` has the `source-file -q
-'~/dev/claude-rescue/tmux/rescue.tmux.conf'` line (it should after
-chezmoi apply).
+rescue.tmux.conf. Check that `~/.tmux.conf` has the corresponding
+`source-file -q "$HOME/dev/claude-rescue/tmux/rescue.tmux.conf"` line
+(it should after chezmoi apply).
+
+**Gotcha to check first:** `tmux source-file` does NOT expand `~`.
+A directive like `source-file -q '~/dev/.../rescue.tmux.conf'` (single
+quotes, leading tilde) silently fails — the `-q` swallows the error
+and every hook stays unset. Use `$HOME` or an absolute path. The
+`[tmux-conf]` check in `scripts/validate.sh` scans `~/.tmux.conf` for
+this exact pattern.
 
 ## 4e. Final re-dump (verify backfill landed in the sidecar)
 
