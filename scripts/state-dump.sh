@@ -14,6 +14,15 @@
 #   scripts/state-dump.sh /path/to/dir    # explicit dir
 #
 # Defaults: $CLAUDE_RESCUE_DUMP_DIR, else ~/claude-rescue-dumps/dump-<ts>.
+#
+# Target tmux server:
+#   Targets the LIVE production tmux server, assumed to be on the `default`
+#   socket. Override with CLAUDE_RESCUE_LIVE_SOCKET=<name> when the live
+#   server uses a custom socket name, OR when this script is invoked from a
+#   tmux pane that lives on a different socket (e.g. an isolated operator
+#   server during a rollout): without an explicit socket, bare `tmux`
+#   would attach to whatever $TMUX points at, not the live server we want
+#   to capture.
 
 set -eu
 # Deliberately no pipefail: many pipelines below use `cmd | head -N`, and
@@ -27,8 +36,10 @@ mkdir -p "$out"
 DATA="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
 CACHE="${CLAUDE_RESCUE_CACHE_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-rescue}"
 HOME_DIR="${CLAUDE_RESCUE_HOME:-$HOME/.claude-rescue}"
+LIVE_SOCKET="${CLAUDE_RESCUE_LIVE_SOCKET:-default}"
 
 echo "Dumping to: $out"
+echo "Targeting tmux socket: $LIVE_SOCKET (override with CLAUDE_RESCUE_LIVE_SOCKET)"
 
 # --- repo SHAs / deploy provenance ----------------------------------------
 {
@@ -55,27 +66,28 @@ echo "Dumping to: $out"
 } > "$out/repos.md"
 
 # --- tmux server overview --------------------------------------------------
-if tmux info >/dev/null 2>&1; then
+if tmux -L "$LIVE_SOCKET" info >/dev/null 2>&1; then
   tmux -V > "$out/tmux-version.txt"
-  tmux list-sessions -F \
+  echo "$LIVE_SOCKET" > "$out/tmux-socket.txt"
+  tmux -L "$LIVE_SOCKET" list-sessions -F \
     '#{session_id}|#{session_name}|#{session_created}|#{session_attached}|#{session_windows}' \
     > "$out/tmux-sessions.tsv" 2>/dev/null || true
 
   # Pane inventory — the load-bearing artifact. Columns chosen so you can
   # eyeball "where was claude session X running" from the file alone.
-  tmux list-panes -aF \
+  tmux -L "$LIVE_SOCKET" list-panes -aF \
     '#{pane_id}	#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_active}	#{pane_current_command}	#{pane_pid}	#{@claude-pane-id}	#{@claude-window-id}	#{pane_current_path}	#{pane_full_command}' \
     > "$out/tmux-panes.tsv" 2>/dev/null || true
 
   # Windows separately for @claude-window-id (window-scoped option).
-  tmux list-windows -aF \
+  tmux -L "$LIVE_SOCKET" list-windows -aF \
     '#{session_name}|#{window_index}|#{window_id}|#{window_name}|#{@claude-window-id}|#{window_panes}' \
     > "$out/tmux-windows.tsv" 2>/dev/null || true
 
-  tmux show-hooks -g > "$out/tmux-hooks-global.txt" 2>/dev/null || true
-  tmux show-options -g > "$out/tmux-options-global.txt" 2>/dev/null || true
+  tmux -L "$LIVE_SOCKET" show-hooks -g > "$out/tmux-hooks-global.txt" 2>/dev/null || true
+  tmux -L "$LIVE_SOCKET" show-options -g > "$out/tmux-options-global.txt" 2>/dev/null || true
 else
-  echo "tmux server not running" > "$out/tmux-server-missing.txt"
+  echo "tmux server on socket [$LIVE_SOCKET] is not running" > "$out/tmux-server-missing.txt"
 fi
 
 # --- claude transcripts per project ---------------------------------------

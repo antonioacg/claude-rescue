@@ -17,6 +17,38 @@ captured in step 1 is the manual fallback for that step.
 
 ---
 
+## On socket assumptions and operator isolation
+
+This runbook **assumes the live tmux server is on the `default` socket**.
+Every `tmux ...` invocation that targets the live server uses an explicit
+`-L default` to make that assumption visible at the call site (rather than
+relying on whatever `$TMUX` happens to point at when the command runs).
+
+The reason: the final step is `tmux -L default kill-server`. If you're
+following this runbook from inside an attached terminal on the live
+server, killing the server kills your terminal session — fine, you
+re-attach. But if you're following it from an **operator pane**, i.e. a
+claude or shell living inside a *separate* tmux server (which is what
+you'd do to keep your operator process alive across the cutover), bare
+`tmux` commands target the operator's own socket. `tmux kill-server`
+without `-L` would kill the wrong server. The explicit `-L default`
+prevents that confusion.
+
+**If your live server uses a different socket name**, do a find-and-replace
+across this runbook: `-L default` → `-L <your-socket-name>`. The scripts
+honor `CLAUDE_RESCUE_LIVE_SOCKET`:
+
+```bash
+export CLAUDE_RESCUE_LIVE_SOCKET=<your-socket-name>
+```
+
+Set it once in the operator's shell; both `state-dump.sh` and
+`recap-missing.sh` will pick it up, and the dump's
+`tmux-socket.txt` records which socket the dump was taken against (so
+`recap-missing.sh` refuses to send to a different one).
+
+---
+
 ## 1. Capture a state dump (don't skip)
 
 ```bash
@@ -146,43 +178,46 @@ step 4b is your manual-restore fallback.
 
 ```bash
 # 5a. Force a fresh resurrect snapshot so we restore from current state.
-tmux run-shell '~/.config/tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
+tmux -L default run-shell '~/.config/tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
 
 # Sanity: the snapshot should be seconds old.
 ls -lt ~/.local/share/tmux/resurrect/default/ | head -3
 
 # 5b. Detach all attached clients cleanly. (Optional but tidier than
 # letting them get evicted by the server kill.)
-tmux detach-client -a 2>/dev/null || true
+tmux -L default detach-client -a 2>/dev/null || true
 
 # 5c. Kill the server. The boot wrapper + @continuum-restore in
 # ~/.tmux.conf spawn a new server and replay the snapshot.
-tmux kill-server
+tmux -L default kill-server
 
-# 5d. Wait a couple seconds, then attach.
-tmux attach
+# 5d. Wait a couple seconds. Operator: do NOT attach from inside your
+# operator tmux — that nests sockets in confusing ways. Open a new
+# terminal on the host (Terminal.app / Ghostty / iTerm) and run:
+tmux -L default attach
 ```
 
-Inside the restored server, verify:
+Verify (run from the operator pane against `-L default`, or from the
+fresh attached terminal — same result):
 
-- **Pane count matches the dump.** `tmux list-panes -a | wc -l` should
-  equal the `tmux-panes.tsv` line count from the step 4b dump.
+- **Pane count matches the dump.** `tmux -L default list-panes -a | wc -l`
+  should equal the `tmux-panes.tsv` line count from the step 4b dump.
 - **Each pane is in the right cwd.** Cross-check a few rows against
   `restore-plan.tsv`.
 - **claude panes restored as `claude-rescue-resume` then handed off to
-  claude.** `tmux list-panes -aF '#{pane_current_command}'` should show
-  `claude` for the panes that were claude pre-rollout. (A transient
-  `claude-rescue-r` or `bash` is normal during the wrapper handoff —
-  re-check after ~10s.)
+  claude.** `tmux -L default list-panes -aF '#{pane_current_command}'`
+  should show `claude` for the panes that were claude pre-rollout. (A
+  transient `claude-rescue-r` or `bash` is normal during the wrapper
+  handoff — re-check after ~10s.)
 - **`@claude-pane-id` is being minted on new activity.** Type a prompt
-  in any claude pane. Then:
+  in any claude pane (from the attached terminal). Then:
   ```bash
   ls ~/.cache/claude-rescue/busy/        # should see a fresh marker
-  tmux list-panes -aF '#{@claude-pane-id}' | sort -u | head
+  tmux -L default list-panes -aF '#{@claude-pane-id}' | sort -u | head
   ```
 - **Hibernation hooks are installed.**
   ```bash
-  tmux show-hooks -g | grep -E 'pane-focus-|client-attached|client-session-changed'
+  tmux -L default show-hooks -g | grep -E 'pane-focus-|client-attached|client-session-changed'
   ```
   Should list all four.
 - **No errors in the rescue logs.**
@@ -197,9 +232,10 @@ If restore is incomplete (some panes missing, some in `bash` instead of
 
 ```bash
 # Per missing pane:
-tmux new-session -d -s <session>  # if session is missing
-tmux new-window -t <session>:<window_idx>
-tmux send-keys -t <session>:<window_idx>.<pane_idx> "cd <cwd> && clr <latest_session_id>" Enter
+tmux -L default new-session -d -s <session>  # if session is missing
+tmux -L default new-window   -t <session>:<window_idx>
+tmux -L default send-keys    -t <session>:<window_idx>.<pane_idx> \
+  "cd <cwd> && clr <latest_session_id>" Enter
 ```
 
 ## 6. Watch the system for ~10 minutes
@@ -233,17 +269,17 @@ Config rollback:
 cd ~/.local/share/chezmoi
 git revert <merge-or-feat-commit>      # or git checkout HEAD~ for working copy
 chezmoi apply
-tmux source-file ~/.tmux.conf          # re-load tmux without restart
+tmux -L default source-file ~/.tmux.conf   # re-load live tmux without restart
 ```
 
 If hibernation is firing destructively in production and you need an
 immediate kill switch without a config revert:
 
 ```bash
-tmux set-hook -gu pane-focus-out
-tmux set-hook -gu pane-focus-in
-tmux set-hook -gu client-attached
-tmux set-hook -gu client-session-changed
+tmux -L default set-hook -gu pane-focus-out
+tmux -L default set-hook -gu pane-focus-in
+tmux -L default set-hook -gu client-attached
+tmux -L default set-hook -gu client-session-changed
 ```
 
 These four `set-hook -gu` calls remove the hibernation wiring from the
