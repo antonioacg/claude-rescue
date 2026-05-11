@@ -680,9 +680,14 @@ cmd_stop()               { __busy_hook clear ; }
 #
 # Stage 2 (HARD): if the pane stays defocused and soft-hibernated for
 #   CLAUDE_RESCUE_HARD_DELAY (default 24h), wake claude with `fg<Enter>` then
-#   send `C-c` twice for a clean exit. Frees all resources. The capture file
-#   stays on disk for `claude-rescue print` so the user can recall context and
-#   resume the session from the picker.
+#   send `/exit<Enter>` for a clean shutdown (fires claude's SessionEnd, flushes
+#   the transcript). Falls back to SIGTERM → SIGKILL on the recorded claude pids
+#   if `/exit` doesn't terminate within ~3s. Frees all resources. The capture
+#   file stays on disk for `claude-rescue print` so the user can recall context
+#   and resume the session from the picker. The shell prompt is then pre-filled
+#   with `clr <session_id>` (no Enter) so resume is one keystroke away.
+#   (Task #48 tracks moving away from `/exit` to Ctrl+C × 2 to avoid polluting
+#   claude's command history.)
 #
 # Resume (focus-in): hibernate-resume is called by the pane-focus-in tmux
 #   hook. Soft → `fg<Enter>`. Hard → no-op (claude is gone; capture remains).
@@ -840,7 +845,7 @@ cmd_hibernate_arm() {
 
     cmd_hibernated "$pane_id" "$pids" "soft" 2>/dev/null || true
 
-    # ===== STAGE 2: HARD (fg + Ctrl+C × 2) =====
+    # ===== STAGE 2: HARD (fg + /exit, with SIGTERM/SIGKILL fallback) =====
     local hard_remaining=$((HARD_DELAY - SOFT_DELAY))
     if [ "$hard_remaining" -le 0 ]; then
       rm -f "$arm_pid_file"
