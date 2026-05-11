@@ -400,6 +400,64 @@ No conversations are lost in this scenario — `clr` switches the pane to
 the session you actually wanted; the session it was running is still
 resumable elsewhere if you need it.
 
+### 5b. If panes restored but came back as `zsh` instead of `claude`
+
+This is the failure mode observed during the 2026-05-11 rollout: `tmux
+list-panes` shows panes back in their right cwds, but most are running
+`zsh` instead of `claude`. `wrapper.log` shows few or zero "invoked"
+lines — the wrapper send-keys phase didn't reach those panes.
+
+The conversations are still resumable: `@claude-pane-id` is preserved
+on each pane (the sidecar reapply hook landed at restore time, even if
+send-keys later didn't), and `find-sessions` returns the right session
+for each. Use the recovery script:
+
+```bash
+# Dry-run first to see what it would do.
+bash ~/dev/claude-rescue/scripts/restore-zsh-to-claude.sh --dry-run
+
+# Sanity-check the (pane → sid) mapping. Critically: if any sid in
+# the SEND list collides with a sid CURRENTLY ACTIVE in another claude
+# (e.g., the rollout operator-claude's own session), do NOT recover
+# that pane — two claude processes writing the same on-disk transcript
+# corrupts both. Identify in-use sids:
+ps -A -o command 2>/dev/null | grep -oE '\-r [0-9a-f-]{36}' | sort -u
+
+# If the dry-run output is sane, run for real. The script enforces a
+# 250ms inter-pane delay (CLAUDE_RESCUE_RESTORE_DELAY) so subsequent
+# `clr` invocations don't suffer the same race that broke the original
+# restore.
+bash ~/dev/claude-rescue/scripts/restore-zsh-to-claude.sh
+```
+
+After running, each recovered pane lands on claude's "Resume from
+summary?" dialog (claude detects the resumed transcript is old/large
+and prompts before continuing). You'll need to press `1` or `2` per
+pane to actually use them — or leave them dormant, your call.
+
+**Important caveats**:
+
+- **Recovery is a manual emergency tool, NOT a retry hook**. The
+  script isn't wired into any tmux hook. If you find yourself reaching
+  for it, the underlying failure deserves investigation (check
+  `wrapper.log` for invocation count first — if it's 0 or very low,
+  something in the restore path is dropping send-keys; if it matches
+  pane count, the wrappers ran but exited fast, look at their
+  resolution decisions).
+- **Continuum keeps saving the broken state** at its
+  `@continuum-save-interval` (default 1 minute). Every minute that
+  passes after a failed restore narrows the recovery window:
+  subsequent saves capture `pane_full_command=":"` for the zsh panes,
+  and the `last` snapshot rotates forward. **Recover fast** or risk
+  losing the saved-as-claude commands from the restore-input snapshot.
+  Don't wait around debugging while continuum eats your safety net.
+- **Backfill collision check** — if `restore-plan.tsv` assigned the
+  same sid to multiple panes (thin transcript pool in a cwd, or the
+  operator's own session is the latest), the script will SEND `clr
+  <sid>` to all of them. Pick one to inherit; kill the rest with
+  `tmux -L default kill-pane -t <pane_id>`. Backfilling distinct sids
+  doesn't help if there aren't enough transcripts available.
+
 ## 6. Watch the system for ~10 minutes
 
 The first soft hibernation can't fire for an hour (default 3600s), but
