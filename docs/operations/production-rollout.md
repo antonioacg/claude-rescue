@@ -234,6 +234,18 @@ The script's tail emits a per-pane round-trip check
 (`find-sessions --pane-uuid <minted>` should return the session_id we
 wrote). It exits non-zero if any pane fails.
 
+**If the smoke test FAILs on a subset of panes**, the first thing to
+check is the `find-sessions` cwd encoding (`bin/claude-rescue`). Claude
+encodes cwd → `~/.claude/projects/<dir>` by mapping **both** `/` and
+`.` to `-`, so paths containing dotfile segments (e.g.
+`~/.local/share/chezmoi` → `-Users-…--local-share-chezmoi` with a
+double-dash) require both substitutions. A previous version of
+`find-sessions` only mapped `/`, which silently filtered out every
+dotfile-cwd session. Symptom: panes whose cwd contains `.` all FAIL
+the smoke test, panes whose cwd is dot-free all OK. Scenario 9 in
+`scripts/validate.sh` is the regression test; run `bash
+scripts/validate.sh` and verify scenarios 9a/9b PASS.
+
 ## 4d. Load the new tmux hooks into the live server
 
 `chezmoi apply` updated `~/.tmux.conf` and `~/dev/claude-rescue/tmux/rescue.tmux.conf`,
