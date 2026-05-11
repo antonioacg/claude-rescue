@@ -226,6 +226,55 @@ RES9B=$(CLAUDE_PROJECTS_DIR="$PROJ_ROOT" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLA
 assert "scenario 9: plain cwd session still resolves" "$SID9B" "$RES9B"
 
 # ---------------------------------------------------------------------------
+# Regression: bash's `IFS=$'\t' read` collapses consecutive tabs, so an
+# empty `window_name` in the sidecar row would silently shift the uuid
+# into col4 and leave col5 empty — restore then dispatches to the legacy
+# 4-col branch and calls `set-option -wt window:<session>` (literal
+# "window" as session name, since col1 was "window" and got treated as
+# the session marker). Caught in prod rollout on bufferbloat-wr741 w3.
+# Fix: sentinel-encode internal empties in cmd_resurrect_save's awk.
+echo "[scenario 10] resurrect-save sentinel-encodes empty window_name"
+# Create a new window with empty name. Disable automatic-rename so tmux
+# doesn't immediately overwrite our empty name with the command name.
+tmux -L "$SOCK" set-window-option -g automatic-rename off
+tmux -L "$SOCK" new-window -t t1 -n "scenario10-placeholder"
+S10_WIN_ID="$(tmux -L "$SOCK" display-message -p -t t1 -F '#{window_id}')"
+tmux -L "$SOCK" rename-window -t "$S10_WIN_ID" ""
+S10_TEST_UUID="$(uuidgen|tr A-Z a-z)"
+tmux -L "$SOCK" set-option -wt "$S10_WIN_ID" @claude-window-id "$S10_TEST_UUID"
+# Trigger cmd_resurrect_save via run-shell so its tmux calls hit $SOCK.
+S10_FAKE_STATE="$HOME_DIR/scenario10.txt"
+echo "fake-tmux-resurrect-state" > "$S10_FAKE_STATE"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S10_FAKE_STATE"
+sleep 1
+S10_SIDECAR="${S10_FAKE_STATE%.txt}.claude-userops.tsv"
+# Find the sidecar row for our test UUID. Sentinel-encoded col4 should be "-".
+S10_COL4=$(awk -F'\t' -v u="$S10_TEST_UUID" '$5==u {print $4; exit}' "$S10_SIDECAR" 2>/dev/null)
+assert "scenario 10: empty window_name encoded as sentinel" "-" "$S10_COL4"
+# Also exercise the reader: set up a `last` symlink and call resurrect-restore.
+# Stderr from the hook lands in rescue-log.err — assert no set-option failures
+# for our test window. Use a dedicated resurrect-dir under HOME_DIR so we
+# don't touch the user's real one.
+S10_RDIR="$HOME_DIR/resurrect-scenario10"
+mkdir -p "$S10_RDIR"
+cp "$S10_FAKE_STATE" "$S10_RDIR/scenario10.txt"
+cp "$S10_SIDECAR"    "$S10_RDIR/scenario10.claude-userops.tsv"
+ln -sf scenario10.txt "$S10_RDIR/last"
+tmux -L "$SOCK" set-option -g @resurrect-dir "$S10_RDIR"
+S10_RESCUE_ERR="$HOME_DIR/scenario10-restore.err"
+: > "$S10_RESCUE_ERR"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-restore 2>>$S10_RESCUE_ERR"
+sleep 1
+# The hook logs to $CLAUDE_RESCUE_CACHE_HOME/rescue-log.err. Grep for the
+# specific failure mode (set-option ... failed) on a line from this scenario's
+# restore call. Pre-existing entries from earlier scenarios should be empty.
+S10_FAIL=$(grep -c "set-option .* failed" "$HOME_DIR/cache/rescue-log.err" 2>/dev/null)
+[ -z "$S10_FAIL" ] && S10_FAIL=0
+assert "scenario 10: restore reads sentinel'd sidecar without set-option failures" "0" "$S10_FAIL"
+# Restore automatic-rename for any later scenarios (none in this file but defensive).
+tmux -L "$SOCK" set-window-option -g automatic-rename on
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"

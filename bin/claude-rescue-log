@@ -377,12 +377,29 @@ cmd_resurrect_save() {
   # the restore handler for backwards compat.
   #   window<TAB>session<TAB>window_idx<TAB>window_name<TAB>uuid
   #   pane<TAB>session<TAB>window_idx<TAB>pane_idx<TAB>pane_uuid
+  #
+  # Sentinel-encode internal empties (`-` for any empty field) so bash's
+  # `IFS=$'\t' read` at restore time doesn't collapse them. Tab is whitespace
+  # in IFS, and consecutive whitespace IFS chars get coalesced — without this,
+  # an empty window_name silently shifts subsequent fields, making the uuid
+  # read as col4 and col5 empty. Same trick as state-dump.sh's restore-plan
+  # synth.
   local sidecar="${state_file%.txt}.claude-userops.tsv"
+  # OFS="\t" is required: modifying $i triggers awk to reconstruct $0 using
+  # OFS, which defaults to space. Without it, the sentinel'd row would have
+  # space-separated fields and the restore-side `IFS=$'\t' read` would treat
+  # the whole line as col1.
   {
     tmux list-windows -aF $'window\t#{session_name}\t#{window_index}\t#{window_name}\t#{@claude-window-id}' \
-      | awk -F'\t' 'NF==5 && $5 != "" { print }'
+      | awk -F'\t' 'BEGIN{OFS="\t"} NF==5 && $5 != "" {
+          for (i=1;i<=NF;i++) if ($i=="") $i="-"
+          print
+        }'
     tmux list-panes -aF $'pane\t#{session_name}\t#{window_index}\t#{pane_index}\t#{@claude-pane-id}' \
-      | awk -F'\t' 'NF==5 && $5 != "" { print }'
+      | awk -F'\t' 'BEGIN{OFS="\t"} NF==5 && $5 != "" {
+          for (i=1;i<=NF;i++) if ($i=="") $i="-"
+          print
+        }'
   } > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
 
@@ -514,6 +531,12 @@ cmd_resurrect_restore() {
 
   local applied_window=0 applied_pane=0 skipped=0
   while IFS=$'\t' read -r col1 col2 col3 col4 col5; do
+    # Decode sentinel-encoded empties (`-` → empty). Matches the encoding in
+    # cmd_resurrect_save. Only col4 (window_name / pane_idx) and col5 (uuid)
+    # are realistically subject to encoding; col1-col3 are never empty for
+    # well-formed rows.
+    [ "$col4" = "-" ] && col4=""
+    [ "$col5" = "-" ] && col5=""
     if [ -z "$col5" ]; then
       # Legacy 4-col line: window only.
       [ -n "$col4" ] || { skipped=$((skipped+1)); continue; }
