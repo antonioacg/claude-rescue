@@ -3,6 +3,23 @@
 Two-stage focus-driven pane suspension. Capture is the universal first step;
 suspension method depends on how long the pane has been defocused.
 
+## What starts the countdown
+
+Two paths arm the per-pane hibernation timer:
+
+1. **`pane-focus-out`** — fires when the currently-focused pane in some client
+   loses focus (e.g., you switch windows or press into a different pane).
+   Arms only the pane that just lost focus.
+2. **`client-attached` / `client-session-changed`** — runs `arm-sweep`, which
+   walks every pane and arms each claude pane that isn't currently focused.
+   Without this, panes that are inactive-in-window — or that you never
+   physically visited since attach — would sit forever without a countdown,
+   because `pane-focus-out` only fires on transitions of the *active* pane.
+
+Both paths invoke `cmd_hibernate_arm` with the same idempotent existing-timer
+check, so a sweep that runs after a focus-out won't reset an already-running
+timer.
+
 ## Model
 
 ```
@@ -148,6 +165,18 @@ After C2: press Enter on the `clr <sid>` prompt (or type `cl` to start a fresh s
 8. Focus a pane that has never run claude (e.g., the nvim window pane).
 9. Wait `SOFT_DELAY + 5s`.
 10. **Verify:** no arm pid file, no hibernated marker, no capture file for that pane. Fast guard checks `@claude-pane-id` and returns early.
+
+### F. arm-sweep fires on attach (covers backgrounded panes)
+
+The fixture has 3 claude panes plus an nvim pane. After fixture exit the
+active pane is the nvim one; none of the claude panes are focused.
+
+11. From outside the staging socket, drive the sweep that `client-attached` would invoke:
+    `tmux -L claude-rescue-staging run-shell -b 'claude-rescue-log arm-sweep'`
+12. **Verify:** within 1s, three arm pid files appear in `$CACHE/hibernated/`
+    (one per backgrounded claude pane). nvim's pane has none (fast guard).
+13. Repeat the same command — **verify** the arm pids in the files are
+    unchanged (idempotent; the second sweep does not reset live timers).
 
 ## Claude hook wiring
 

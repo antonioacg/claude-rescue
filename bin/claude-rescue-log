@@ -715,7 +715,7 @@ cmd_hibernate_arm() {
     prev_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
     if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
       prev_args="$(ps -o args= -p "$prev_pid" 2>/dev/null)"
-      if printf '%s' "$prev_args" | grep -q "claude-rescue-log hibernate-arm"; then
+      if printf '%s' "$prev_args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
         return 0
       fi
     fi
@@ -948,7 +948,7 @@ cmd_hibernate_resume() {
       # reassigned to an unrelated process could cause us to kill it.
       local arm_args
       arm_args="$(ps -o args= -p "$arm_pid" 2>/dev/null)"
-      if printf '%s' "$arm_args" | grep -q "claude-rescue-log hibernate-arm"; then
+      if printf '%s' "$arm_args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
         kill "$arm_pid" 2>/dev/null || true
       fi
     fi
@@ -975,6 +975,44 @@ cmd_hibernate_resume() {
   esac
 }
 
+# Arm every backgrounded claude pane that isn't already armed. Triggered on
+# client-attached (and session/window changes if wired) so users don't have
+# to physically visit each pane to start its hibernation countdown.
+#
+# pane-focus-out only fires for *the currently-focused* pane transitioning
+# away — it never fires for panes that are inactive-in-window or for panes
+# the user simply never visited. This sweep fills that gap: at the moments
+# we know the client is engaging with the server, we arm all eligible
+# backgrounded panes idempotently (per-pane arm.pid check skips already-armed).
+cmd_arm_sweep() {
+  local pane_id win_act pane_act puuid pane_pid san arm_pid_file
+  while IFS=$'\t' read -r pane_id win_act pane_act puuid pane_pid; do
+    [ -n "$pane_id" ] || continue
+    # Fast guard: pane never ran claude → no work.
+    [ -n "$puuid" ] || continue
+    # Currently focused (active pane in an active window): leave it alone.
+    [ "$win_act$pane_act" = "11" ] && continue
+    san="${pane_id//[^A-Za-z0-9]/_}"
+    arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+    # Already armed (file present AND the recorded pid is alive AND is a real
+    # hibernate-arm subshell): don't reset the timer.
+    if [ -f "$arm_pid_file" ]; then
+      local existing_pid existing_args
+      existing_pid="$(cat "$arm_pid_file" 2>/dev/null)"
+      if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        existing_args="$(ps -o args= -p "$existing_pid" 2>/dev/null)"
+        if printf '%s' "$existing_args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
+          continue
+        fi
+      fi
+      # Stale file (dead pid or pid recycled to unrelated process). Remove
+      # and re-arm fresh.
+      rm -f "$arm_pid_file"
+    fi
+    cmd_hibernate_arm "$pane_id" "$pane_pid" 2>/dev/null || true
+  done < <(tmux list-panes -aF $'#{pane_id}\t#{window_active}\t#{pane_active}\t#{@claude-pane-id}\t#{pane_pid}' 2>/dev/null)
+}
+
 # --- Dispatch ---------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
@@ -995,6 +1033,7 @@ case "$cmd" in
   resurrect-restore)  cmd_resurrect_restore "$@" ;;
   hibernate-arm)      cmd_hibernate_arm "$@" ;;
   hibernate-resume)   cmd_hibernate_resume "$@" ;;
+  arm-sweep)          cmd_arm_sweep "$@" ;;
   '')                 log_err "no subcommand"; exit 2 ;;
   *)                  log_err "unknown subcommand: $cmd"; exit 2 ;;
 esac

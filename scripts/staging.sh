@@ -197,7 +197,7 @@ TMUX
       pid="$(cat "$f" 2>/dev/null)"
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
         args="$(ps -o args= -p "$pid" 2>/dev/null)"
-        if printf '%s' "$args" | grep -q "claude-rescue-log hibernate-arm"; then
+        if printf '%s' "$args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
           echo "    sweeping stale arm subshell pid=$pid"
           kill "$pid" 2>/dev/null || true
         fi

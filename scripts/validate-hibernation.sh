@@ -15,6 +15,8 @@
 #   4. Fast guard skips panes without @claude-pane-id (nvim)
 #   5. Orphan arm subshell self-bails on @claude-pane-id mismatch — no action
 #      taken against a pane whose identity has changed since the timer armed.
+#   6. arm-sweep arms every backgrounded claude pane in one shot (so the user
+#      doesn't have to physically visit each pane to start its countdown).
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -337,6 +339,76 @@ assert "scenario 5: P2's claude process still alive (no spurious kill)" "1" \
 # clean state. Also clean up arm.pid file in case it lingers.
 tmux -L "$SOCK" set-option -pt $P2 @claude-pane-id "$P2_UUID"
 rm -f "$P2_ARM_FILE"
+
+# ---------------------------------------------------------------------------
+echo "[6] arm-sweep arms all backgrounded claude panes in one shot"
+
+# Start from a clean slate: kill any subshells the previous scenarios left
+# behind and wipe arm.pid files so we measure exactly what the sweep adds.
+for f in "$CACHE_DIR"/hibernated/*.arm.pid; do
+  [ -f "$f" ] || continue
+  pid="$(cat "$f" 2>/dev/null)"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$f"
+done
+
+# Snapshot all claude panes into a "pane_id|focused" line list (bash 3.2 has
+# no associative arrays). focused="1" iff window_active==1 && pane_active==1.
+CLAUDE_PANE_LINES="$(tmux -L "$SOCK" list-panes -aF $'#{pane_id}\t#{window_active}\t#{pane_active}\t#{@claude-pane-id}' 2>/dev/null \
+  | awk -F'\t' '$4 != "" { focused = ($2 "" $3 == "11") ? 1 : 0; print $1 "|" focused }')"
+NUM_CLAUDE_PANES="$(printf '%s\n' "$CLAUDE_PANE_LINES" | wc -l | tr -d ' ')"
+assert "scenario 6: fixture has 3 claude panes" "3" "$NUM_CLAUDE_PANES"
+
+# Run the sweep (the same code path client-attached / client-session-changed
+# fires in production). Invoking directly avoids needing a real attached client.
+tmux -L "$SOCK" run-shell -b 'claude-rescue-log arm-sweep'
+sleep 1
+
+# Verify each claude pane: focused → no arm.pid; backgrounded → arm.pid with
+# a live hibernate-arm subshell.
+SWEEP_ARMED=0
+while IFS='|' read -r pid_p is_focused; do
+  [ -n "$pid_p" ] || continue
+  san="${pid_p//[^A-Za-z0-9]/_}"
+  af="$CACHE_DIR/hibernated/$san.arm.pid"
+  if [ "$is_focused" = "1" ]; then
+    continue   # focused panes should NOT be armed; not counted
+  fi
+  [ -f "$af" ] || continue
+  apid="$(cat "$af" 2>/dev/null)"
+  [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null || continue
+  args="$(ps -o args= -p "$apid" 2>/dev/null)"
+  if printf '%s' "$args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
+    SWEEP_ARMED=$((SWEEP_ARMED + 1))
+  fi
+done <<< "$CLAUDE_PANE_LINES"
+
+# At fixture exit time the active window is window 3 (nvim), so all 3 claude
+# panes are backgrounded — all three should be armed after the sweep.
+assert "scenario 6: 3 backgrounded claude panes armed by sweep" "3" "$SWEEP_ARMED"
+
+# Idempotency: a second sweep must NOT replace existing live timers. Snapshot
+# the current arm pids, sweep again, verify they're unchanged.
+PRE_RESWEEP="$(while IFS='|' read -r pid_p is_focused; do
+  [ -n "$pid_p" ] || continue
+  [ "$is_focused" = "1" ] && continue
+  san="${pid_p//[^A-Za-z0-9]/_}"
+  printf '%s=%s\n' "$pid_p" "$(cat "$CACHE_DIR/hibernated/$san.arm.pid" 2>/dev/null)"
+done <<< "$CLAUDE_PANE_LINES")"
+tmux -L "$SOCK" run-shell -b 'claude-rescue-log arm-sweep'
+sleep 1
+POST_RESWEEP="$(while IFS='|' read -r pid_p is_focused; do
+  [ -n "$pid_p" ] || continue
+  [ "$is_focused" = "1" ] && continue
+  san="${pid_p//[^A-Za-z0-9]/_}"
+  printf '%s=%s\n' "$pid_p" "$(cat "$CACHE_DIR/hibernated/$san.arm.pid" 2>/dev/null)"
+done <<< "$CLAUDE_PANE_LINES")"
+assert "scenario 6: second sweep is idempotent (existing timers untouched)" "$PRE_RESWEEP" "$POST_RESWEEP"
+
+# Fast guard: nvim pane (no @claude-pane-id) must NOT be armed.
+P3_SAN_S6="${P3//[^A-Za-z0-9]/_}"
+assert "scenario 6: nvim pane not armed by sweep (fast guard)" "0" \
+  "$([ -f "$CACHE_DIR/hibernated/$P3_SAN_S6.arm.pid" ] && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 # Summary
