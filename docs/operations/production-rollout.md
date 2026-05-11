@@ -589,6 +589,22 @@ running server. Code rollback can wait.
   is empty (pre-rename leftover): `rmdir ~/.claude-rescue/stopped`.
 - Keep the state dump from step 1 for a few days, then delete:
   `rm -rf ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-<ts>`.
+- **Resurrect snapshot dir**: tmux-resurrect's built-in rotation
+  (`@resurrect-delete-backup-after`) breaks once the dir exceeds ~6000
+  `.txt` files — the upstream cleanup uses a shell glob that hits
+  "argument list too long". Symptom: rotation silently stops, the dir
+  grows unboundedly. With `@continuum-save-interval=1` the dir hits
+  this scale in under a week. Run periodically (e.g. weekly):
+
+  ```bash
+  bash ~/dev/claude-rescue/scripts/cleanup-resurrect-snapshots.sh --dry-run   # preview
+  bash ~/dev/claude-rescue/scripts/cleanup-resurrect-snapshots.sh             # keep newest 200
+  ```
+
+  The script uses `find` (no glob), keeps the newest N (default 200,
+  ~3h worth at 1-min interval), preserves the `last` symlink target
+  unconditionally, and removes paired `.claude-userops.tsv` sidecars
+  alongside their `.txt` snapshots. Tune `--keep` to taste.
 
 ---
 
