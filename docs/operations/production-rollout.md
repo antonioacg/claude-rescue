@@ -343,6 +343,35 @@ tmux -L default send-keys    -t <session>:<window_idx>.<pane_idx> \
   "cd <cwd> && clr <latest_session_id>" Enter
 ```
 
+If a pane restored as `claude` but is showing the **wrong session**
+(possible for multi-pane cwds where backfill mapped arbitrarily — see
+4c), swap it in place. The three backing stores from 4c are your inputs:
+
+```bash
+# 1. Confirm what's currently on screen (matches one of the cwd group's
+#    transcripts — the resurrect pane_contents.tar.gz preserved the
+#    scrollback so visual matching is easy).
+tmux -L default capture-pane -t <session>:<window_idx>.<pane_idx> -p | head -40
+
+# 2. Pull the cwd's row group from the step-4e dump's restore-plan.tsv
+#    to see which session_ids exist for this cwd.
+LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+awk -F'\t' -v c="<cwd>" '$6==c' "$LATEST/restore-plan.tsv"
+
+# 3. If you need to grep transcript content to identify the right
+#    session_id, transcripts are at:
+#    ~/.claude/projects/<encoded-cwd>/<session_id>.jsonl
+#    (cwd encoding: replace '/' and '.' with '-')
+
+# 4. Resume the correct session in the pane.
+tmux -L default send-keys -t <session>:<window_idx>.<pane_idx> \
+  "clr <correct_session_id>" Enter
+```
+
+No conversations are lost in this scenario — `clr` switches the pane to
+the session you actually wanted; the session it was running is still
+resumable elsewhere if you need it.
+
 ## 6. Watch the system for ~10 minutes
 
 The first soft hibernation can't fire for an hour (default 3600s), but
