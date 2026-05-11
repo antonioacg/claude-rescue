@@ -71,6 +71,50 @@ log_err() {
   printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >> "$err_file"
 }
 
+# Authority check for an in-flight hibernate-arm subshell.
+#
+# An arm subshell is detached from its tmux server (run-shell -b → PPID becomes
+# 1 the moment tmux exits). It can outlive a kill -9'd server, a teardown, or
+# a validator's cleanup. When it wakes from sleep it MUST NOT act on whatever
+# pane currently bears the numeric pane_id it captured — that pane might be a
+# brand-new unrelated session on a fresh server, or a different claude entirely.
+#
+# Returns 0 if BOTH:
+#   1. The arm pid file still contains our subshell's pid (no setup sweep,
+#      no resurrect-restore cleanup, no concurrent arm has rewritten it).
+#      The caller passes its own subshell pid in $2 — on bash 4+ this is
+#      $BASHPID; on bash 3.2 (macOS default) discover it via
+#      $(exec sh -c 'echo $PPID') since $BASHPID is unset.
+#   2. The pane's current @claude-pane-id still matches the puuid we armed
+#      against (the pane hasn't been recreated; we are still acting on the
+#      same logical claude pane).
+#
+# Args: $1=arm_pid_file, $2=expected_subshell_pid, $3=pane_id, $4=expected_puuid
+arm_still_authoritative() {
+  local arm_pid_file="$1" expected_bashpid="$2" pane_id="$3" expected_puuid="$4"
+  local file_pid current_puuid
+  file_pid="$(cat "$arm_pid_file" 2>/dev/null)"
+  [ "$file_pid" = "$expected_bashpid" ] || return 1
+  current_puuid="$(tmux show-options -pv -t "$pane_id" @claude-pane-id 2>/dev/null)"
+  [ "$current_puuid" = "$expected_puuid" ] || return 1
+  return 0
+}
+
+# Send a signal to a pid only if its current comm matches the expected target
+# (default: claude). Defends against pid recycling: if the OS handed our
+# recorded pid to an unrelated process between arm and fire, we MUST NOT kill it.
+#
+# Args: $1=signal (TERM|KILL|0|…), $2=pid, $3=optional target comm (default claude)
+kill_only_if_comm() {
+  local sig="$1" pid="$2" target="${3:-claude}"
+  [ -n "$pid" ] || return 0
+  local comm
+  comm="$(ps -o comm= -p "$pid" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+  [ "$comm" = "$target" ] || return 1
+  kill -"$sig" "$pid" 2>/dev/null || true
+  return 0
+}
+
 # Atomic JSONL append. Lines under PIPE_BUF (typically 512+ bytes) are atomic.
 append_event() {
   local window_uuid="$1" json="$2"

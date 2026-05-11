@@ -13,6 +13,8 @@
 #   3b. Hard marker survives focus-in (no-op, no spurious unhibernated event)
 #   3c. Hard marker cleaned up by session_start when claude restarts in pane
 #   4. Fast guard skips panes without @claude-pane-id (nvim)
+#   5. Orphan arm subshell self-bails on @claude-pane-id mismatch — no action
+#      taken against a pane whose identity has changed since the timer armed.
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -273,6 +275,68 @@ assert "scenario 4: no arm pid file for nvim pane" "0" \
 # Marker keyed by pane_uuid — empty for nvim, so the file path would be /captures/.json (malformed). Just check no file was added.
 NVIM_MARKERS="$(find "$CACHE_DIR/hibernated" -type f -newer "$MARKER" 2>/dev/null | wc -l | tr -d ' ')"
 assert "scenario 4: no new marker after fast-guard reject" "0" "$NVIM_MARKERS"
+
+# ---------------------------------------------------------------------------
+echo "[5] orphan arm subshell self-bails on identity mismatch"
+
+# Use %2 (claude in projectB, window 2). %2 is currently focused in its window,
+# so to arm we just run hibernate-arm directly via tmux run-shell (same code
+# path as the focus-out hook would invoke).
+P2=%2
+P2_UUID="$(pane_uuid_of $P2)"
+[ -z "$P2_UUID" ] && { echo "FATAL: $P2 has no @claude-pane-id" >&2; exit 1; }
+P2_SAN="${P2//[^A-Za-z0-9]/_}"
+P2_ARM_FILE="$CACHE_DIR/hibernated/$P2_SAN.arm.pid"
+P2_MARKER="$CACHE_DIR/hibernated/$P2_UUID.json"
+
+# Capture P2's claude pid up front — we'll verify it's still alive after the
+# orphan should have fired (the kill_only_if_comm guard must not let an
+# identity-mismatched subshell signal it).
+P2_PANE_PID="$(tmux -L "$SOCK" display-message -p -t $P2 '#{pane_pid}' 2>/dev/null)"
+P2_CLAUDE_PID="$(pgrep -P "$P2_PANE_PID" claude 2>/dev/null | head -1)"
+assert_nonempty "scenario 5: P2's claude pid resolvable before arm" "$P2_CLAUDE_PID"
+
+# Locate P2's window log for event-tail comparison.
+P2_WIN_LOG="$(grep -l "\"pane_uuid\":\"$P2_UUID\"" "$DATA_DIR"/windows/*.jsonl 2>/dev/null | head -1)"
+[ -z "$P2_WIN_LOG" ] && { echo "FATAL: no window log for $P2_UUID" >&2; exit 1; }
+P2_EVENTS_BEFORE="$(wc -l < "$P2_WIN_LOG" | tr -d ' ')"
+
+# Arm the timer.
+tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep 1
+assert "scenario 5: arm.pid file created" "1" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+P2_ARM_BASHPID="$(cat "$P2_ARM_FILE" 2>/dev/null)"
+assert_nonempty "scenario 5: arm subshell pid recorded" "$P2_ARM_BASHPID"
+
+# Invalidate authority: rewrite @claude-pane-id on the pane to a fake uuid.
+# This simulates the post-crash-restore / fresh-server case where the pane's
+# identity differs from what the orphan recorded at arm time.
+tmux -L "$SOCK" set-option -pt $P2 @claude-pane-id "00000000-orphan-test-0000-000000000000"
+
+# Wait past SOFT_DELAY for the subshell to wake and run arm_check.
+sleep $((SOFT_DELAY + 3))
+
+assert "scenario 5: arm subshell exited (self-bail)" "0" \
+  "$(kill -0 "$P2_ARM_BASHPID" 2>/dev/null && echo 1 || echo 0)"
+# No hibernation marker should have been created for either uuid.
+assert "scenario 5: no marker for original P2 uuid" "0" \
+  "$([ -f "$P2_MARKER" ] && echo 1 || echo 0)"
+assert "scenario 5: no marker for the fake uuid" "0" \
+  "$([ -f "$CACHE_DIR/hibernated/00000000-orphan-test-0000-000000000000.json" ] && echo 1 || echo 0)"
+# No hibernated event in the window log for this pane.
+HIB_EVENTS="$(tail -n +"$((P2_EVENTS_BEFORE + 1))" "$P2_WIN_LOG" \
+  | jq -rc 'select(.kind == "hibernated" and .pane_uuid == "'"$P2_UUID"'")' \
+  | wc -l | tr -d ' ')"
+assert "scenario 5: no hibernated event emitted by orphan" "0" "$HIB_EVENTS"
+# Claude pid must still be alive — the orphan must NOT have killed it.
+assert "scenario 5: P2's claude process still alive (no spurious kill)" "1" \
+  "$(kill -0 "$P2_CLAUDE_PID" 2>/dev/null && echo 1 || echo 0)"
+
+# Restore the original uuid so the rest of the validator (if extended) sees a
+# clean state. Also clean up arm.pid file in case it lingers.
+tmux -L "$SOCK" set-option -pt $P2 @claude-pane-id "$P2_UUID"
+rm -f "$P2_ARM_FILE"
 
 # ---------------------------------------------------------------------------
 # Summary

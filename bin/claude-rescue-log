@@ -705,12 +705,19 @@ cmd_hibernate_arm() {
   local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
   local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$_puuid.json"
 
-  # If a timer is already running for this pane, leave it.
+  # If a timer is already running for this pane, leave it. "Running" means:
+  # pid alive AND its argv shows it's actually an arm subshell — defends
+  # against pid recycling (a stale arm.pid pointing at an unrelated process
+  # would otherwise block us from arming for the rest of the kernel pid
+  # rollover window).
   if [ -f "$arm_pid_file" ]; then
-    local prev_pid
+    local prev_pid prev_args
     prev_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
     if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
-      return 0
+      prev_args="$(ps -o args= -p "$prev_pid" 2>/dev/null)"
+      if printf '%s' "$prev_args" | grep -q "claude-rescue-log hibernate-arm"; then
+        return 0
+      fi
     fi
     rm -f "$arm_pid_file"
   fi
@@ -718,15 +725,36 @@ cmd_hibernate_arm() {
   (
     exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/hibernate.err"
 
+    # Discover our own pid in a way that works on bash 3.2 (no $BASHPID).
+    # `exec sh -c 'echo $PPID'` makes sh REPLACE the command-substitution
+    # subshell at the same pid, then echo its parent's pid — which is *this*
+    # outer subshell.
+    local MY_PID
+    MY_PID="$(exec sh -c 'echo $PPID')"
+
+    # Orphan-safety: this subshell is detached from its tmux server (run-shell
+    # -b). On kill -9 / teardown the server dies but we keep sleeping; when we
+    # wake, the pane_id we captured might belong to a brand-new unrelated pane
+    # on a fresh server (or no server at all). Before every side effect we
+    # verify (a) the arm pid file still names *this* subshell and (b) the
+    # pane's @claude-pane-id still matches the one we armed against. Either
+    # mismatch → exit silently without touching tmux or any pid.
+    arm_check() {
+      if ! arm_still_authoritative "$arm_pid_file" "$MY_PID" "$pane_id" "$_puuid"; then
+        exit 0
+      fi
+    }
+
     # ===== STAGE 1: SOFT (capture + Ctrl+Z) =====
     sleep "$SOFT_DELAY"
+    arm_check
 
     # Busy-aware defer (UserPromptSubmit/Pre|PostToolUse touch the busy file;
     # Stop clears it). Skips title-spinner regex which depended on the
     # configured theme's streaming glyph.
     local active pids cur child cmd queue
     for _ in $(seq 1 "$DEFER_TIMES"); do
-      if is_busy "$_puuid"; then sleep "$DEFER_SECONDS"; else break; fi
+      if is_busy "$_puuid"; then sleep "$DEFER_SECONDS"; arm_check; else break; fi
     done
 
     if is_busy "$_puuid"; then
@@ -809,6 +837,7 @@ cmd_hibernate_arm() {
       exit 0
     fi
     sleep "$hard_remaining"
+    arm_check
 
     # Bail out if the hibernated marker is gone (resume already happened) or
     # already hard, or pane is currently focused.
@@ -832,7 +861,9 @@ cmd_hibernate_arm() {
     tmux send-keys -t "$pane_id" "/exit" Enter 2>/dev/null || true
     sleep 3
 
-    # Check claude is gone; if not, escalate.
+    # Check claude is gone; if not, escalate. Each kill is guarded by
+    # kill_only_if_comm — recorded pids might have been recycled to unrelated
+    # processes after a long defocus + claude crash + new program reusing pid.
     local pid still_alive=""
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
@@ -840,16 +871,22 @@ cmd_hibernate_arm() {
       fi
     done
     if [ -n "${still_alive// /}" ]; then
-      for pid in $still_alive; do kill -TERM "$pid" 2>/dev/null || true; done
+      for pid in $still_alive; do
+        kill_only_if_comm TERM "$pid" "$TARGET_COMM" || true
+      done
       sleep 2
       still_alive=""
       for pid in $pids; do
         if kill -0 "$pid" 2>/dev/null; then
+          # Re-confirm comm — between TERM and now the pid could have died
+          # and been recycled; we already filtered, just re-list survivors.
           still_alive="$still_alive $pid"
         fi
       done
       if [ -n "${still_alive// /}" ]; then
-        for pid in $still_alive; do kill -KILL "$pid" 2>/dev/null || true; done
+        for pid in $still_alive; do
+          kill_only_if_comm KILL "$pid" "$TARGET_COMM" || true
+        done
       fi
     fi
 
@@ -906,7 +943,14 @@ cmd_hibernate_resume() {
     local arm_pid
     arm_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
     if [ -n "$arm_pid" ] && kill -0 "$arm_pid" 2>/dev/null; then
-      kill "$arm_pid" 2>/dev/null || true
+      # Only kill if the pid is plausibly an arm subshell. Defends against
+      # pid recycling — without this, a stale arm.pid file whose pid was
+      # reassigned to an unrelated process could cause us to kill it.
+      local arm_args
+      arm_args="$(ps -o args= -p "$arm_pid" 2>/dev/null)"
+      if printf '%s' "$arm_args" | grep -q "claude-rescue-log hibernate-arm"; then
+        kill "$arm_pid" 2>/dev/null || true
+      fi
     fi
     rm -f "$arm_pid_file"
   fi

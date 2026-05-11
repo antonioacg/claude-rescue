@@ -183,6 +183,29 @@ TMUX
   echo "    staging dir ready"
   echo ""
 
+  # Sweep any stale arm subshells from a previous staging server. tmux
+  # run-shell -b detaches the subshell — it survives kill -9 / teardown and
+  # would wake later expecting to act on pane ids that now belong to a fresh
+  # server. The bin/claude-rescue-log subshell self-bails on identity mismatch,
+  # but we kill orphans proactively here to avoid the cascade where a still-
+  # alive orphan prevents new arm subshells from starting (existing-timer check).
+  local arm_dir="$DATA_DIR/cache/hibernated"
+  if [ -d "$arm_dir" ]; then
+    local f pid args
+    for f in "$arm_dir"/*.arm.pid; do
+      [ -f "$f" ] || continue
+      pid="$(cat "$f" 2>/dev/null)"
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        args="$(ps -o args= -p "$pid" 2>/dev/null)"
+        if printf '%s' "$args" | grep -q "claude-rescue-log hibernate-arm"; then
+          echo "    sweeping stale arm subshell pid=$pid"
+          kill "$pid" 2>/dev/null || true
+        fi
+      fi
+      rm -f "$f"
+    done
+  fi
+
   echo "==> 3. Starting staging tmux server (socket: $SOCK)"
   if tmux -L "$SOCK" has-session 2>/dev/null; then
     echo "    server already running"
