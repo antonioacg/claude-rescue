@@ -11,9 +11,22 @@ captured in step 1 is the manual fallback for that step.
 
 > Assumes the machine starts in the same shape as the first Mac at rollout
 > time: chezmoi `feat/claude-rescue-prod-deploy` checked out (or merged to
-> main), claude-rescue `feat/hibernation-capture-and-tooling` checked out
-> (or merged to main), live tmux server has the *pre-rollout* config
-> loaded, symlinks in `~/.local/bin/` already point at the repo.
+> main), claude-rescue `feat/hook-driven-identity` checked out (or merged
+> to main), live tmux server has the *pre-rollout* config loaded, symlinks
+> in `~/.local/bin/` already point at the repo.
+>
+> **What `feat/hook-driven-identity` adds on top of the original
+> `feat/hibernation-capture-and-tooling` rollout** (relevant for any second
+> Mac that hasn't done the earlier rollout — both branches' work ships
+> together):
+> - `$DATA/active/<pane_uuid>` — durable per-pane current `session_id`,
+>   written by every SessionStart, removed by SessionEnd / pane_died /
+>   arm-sweep voluntary-exit. Wrapper's priority-1 resume target.
+> - `cmd_session_end` reaps `arm.pid` + active file up front (fixes the
+>   "27 orphan arm.pids after dialog-dismiss" bug).
+> - `cmd_arm_sweep` extended with voluntary-exit detection: panes with
+>   `@claude-pane-id` but no claude (and no busy/hibernation marker) get
+>   their state cleaned automatically on next attach.
 
 ---
 
@@ -101,14 +114,14 @@ Quick gate (~30s, isolated, safe anytime):
 
 ```bash
 cd ~/dev/claude-rescue
-bash scripts/validate.sh
+bash scripts/validate.sh                 # 26 assertions / 11 scenarios
 ```
 
 If that passes and you want belt-and-suspenders:
 
 ```bash
-bash scripts/validate-hibernation.sh     # ~3 min, rebuilds staging
-bash scripts/validate-crash-restore.sh   # ~4 min, rebuilds staging
+bash scripts/validate-hibernation.sh     # ~3 min, rebuilds staging, 57 assertions / 9 scenarios
+bash scripts/validate-crash-restore.sh   # ~4 min, rebuilds staging, 31 assertions / 4 scenarios
 ```
 
 These destroy the staging server on exit. Don't run during a busy day.
@@ -175,14 +188,25 @@ before continuing.
 in each restored pane after kill-server, resolves the resume target via
 this priority:
 
-1. `@claude-pane-id` on the pane → `find-sessions` lookup → `-r <session_id>`
-2. Else: existing `-r <UUID>` parsed from the saved command line
-3. Else: no `-r` → claude starts a fresh session
+1. `$DATA/active/<pane_uuid>` — written by every SessionStart, holds the
+   current `session_id`. Cleared at `cmd_resurrect_restore` time so
+   freshly-restored panes don't carry stale entries — repopulated as
+   each restored claude fires its first SessionStart.
+2. `@claude-pane-id` on the pane → `find-sessions` lookup over the event
+   log → `-r <session_id>` (the durable fallback when active was cleared
+   by SessionEnd / restore / never written).
+3. Else: existing `-r <UUID>` parsed from the saved command line.
+4. Else: no `-r` → claude starts a fresh session.
+
+Right after kill-server, priority (1) is empty by design (the dir was
+bulk-cleared at restore). Resolution flows through (2), which is exactly
+what the backfill below sets up: a `@claude-pane-id` that `find-sessions`
+can match against an event-log entry that maps to a transcript on disk.
 
 If your live server has a mix of older claude panes that never had
 `@claude-pane-id` minted (pre-rollout SessionStart events didn't write
 one), AND those panes were originally launched fresh (no `-r` in their
-saved tmux-resurrect command), they fall through to (3) and lose
+saved tmux-resurrect command), they fall through to (4) and lose
 in-memory context on restore.
 
 The backfill script walks current claude panes from step 4b's dump,
@@ -553,7 +577,16 @@ several other code paths run in the first minutes:
 
 - `arm-sweep` fires on `client-attached` — every claude pane should get an
   arm.pid file: `ls ~/.cache/claude-rescue/hibernated/_*.arm.pid`. Expect
-  one per claude pane.
+  one per backgrounded claude pane. The same sweep also exercises the
+  voluntary-exit branch: any pane that has `@claude-pane-id` but isn't
+  running claude (no busy / no hibernation marker) gets its arm.pid +
+  active file + `@claude-pane-id` cleared. Pre-rollout orphan arm.pids
+  (from claudes that exited via "Resume from summary?" dialog dismiss)
+  drain here.
+- `SessionStart` fires on the next claude prompt — `$DATA/active/<pane_uuid>`
+  populates with the current session_id. After ~5 minutes of normal use,
+  `find ~/.local/share/claude-rescue/active -type f | wc -l` should
+  approach the count of currently-running claude panes.
 - Claude hooks fire on the next prompt — busy markers appear under
   `~/.cache/claude-rescue/busy/` and refresh on each tool call.
 - `client-session-changed` fires when you switch sessions — should be a
