@@ -60,6 +60,23 @@ hibernate-resume:         send-keys "fg" Enter → "/exit" Enter
                         or pane_died for orphans)
 ```
 
+### arm-sweep firing model
+
+`arm-sweep` is bound to `client-attached` and `client-session-changed`.
+`set-hook -g` doesn't fire retroactively, so reloading
+`rescue.tmux.conf` with `source-file` doesn't arm existing panes — only
+the next real attach (or session switch) does. Individual
+`pane-focus-out` events still fire normally for the currently-focused
+pane, so a freshly-reloaded server will accumulate at most one arm.pid
+per real focus-out until a client attaches or switches sessions and
+arm-sweep blankets the rest.
+
+Operational consequence: a state dump taken immediately after
+`source-file ~/.tmux.conf` on a running server will typically show
+`hibernated/_*.arm.pid` count of 1 (or 0), not N. This is not a bug.
+The next attach (e.g. the operator reattaching after `kill-server`)
+covers all currently-running claude panes in one sweep.
+
 ### Why Ctrl+Z, not `kill -STOP`?
 
 Raw `kill -STOP` followed by `kill -CONT` does NOT restore the tty foreground

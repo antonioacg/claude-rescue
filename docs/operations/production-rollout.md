@@ -280,6 +280,15 @@ and every hook stays unset. Use `$HOME` or an absolute path. The
 `[tmux-conf]` check in `scripts/validate.sh` scans `~/.tmux.conf` for
 this exact pattern.
 
+**Don't expect `arm.pid` files to appear immediately after source-file.**
+`arm-sweep` is bound to `client-attached` and `client-session-changed`,
+neither of which fires on `source-file` alone. A dump taken right after
+the source-file will typically show `_*.arm.pid` count of 1 (the
+currently-focused-out pane), not N. Coverage of all running claude
+panes kicks in on the next attach — which the step-5 kill-server +
+reattach cycle provides naturally. See
+[hibernation.md → arm-sweep firing model](./hibernation.md) for the model.
+
 ## 4e. Final re-dump (verify backfill landed in the sidecar)
 
 ```bash
