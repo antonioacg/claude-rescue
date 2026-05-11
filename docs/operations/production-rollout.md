@@ -39,6 +39,36 @@ something goes wrong:
 If automation fails in step 5, re-create panes by hand, `cd` to the cwd
 column, and run `clr <latest_session_id>` to resume each claude.
 
+## 1b. (Optional) Backfill recaps for panes with no on-disk transcript
+
+The dump's `restore-plan.tsv` may have rows with an empty
+`latest_session_id` — claude panes whose `.jsonl` transcript was pruned
+(or never written, for sessions that haven't been prompted yet). For
+those panes, the in-memory claude has context but nothing on disk to
+resume from.
+
+To make them recoverable across the server restart, send each one a
+recap prompt; claude's response writes a fresh `.jsonl` we can resume
+from later:
+
+```bash
+bash ~/dev/claude-rescue/scripts/recap-missing.sh --dry-run   # preview
+bash ~/dev/claude-rescue/scripts/recap-missing.sh             # send
+```
+
+The script re-checks each target pane's `pane_current_command` at send
+time and skips anything that isn't currently `claude` — it never types
+the prompt into a shell. Default input is the latest dump under
+`~/claude-rescue-dumps/`.
+
+If the targets include panes you don't actually care about preserving,
+skip this step or edit the `restore-plan.tsv` to remove those rows
+before running.
+
+After it runs, give claudes a moment to respond, then re-run the state
+dump to refresh `restore-plan.tsv` — the previously-empty rows should
+now have session_ids.
+
 ## 2. Validate the code on this machine
 
 Quick gate (~30s, isolated, safe anytime):

@@ -147,12 +147,20 @@ fi
 if [ -f "$out/tmux-panes.tsv" ] && [ -d "$HOME/.claude/projects" ]; then
   {
     printf 'session\twindow_idx\twindow_name\tpane_idx\tpane_id\tcwd\tlatest_session_id\tlatest_transcript_mtime\tclaude_pane_uuid\n'
-    # Reorder fields so the only possibly-empty one (claude_pane_uuid) is
-    # last. `read` with IFS=$'\t' still treats tab as whitespace and collapses
-    # consecutive tabs into one, so an internal empty would shift later
-    # fields left. Putting `cpid` last sidesteps it.
-    awk -F'\t' '$7=="claude" {print $2"\t"$3"\t"$4"\t"$5"\t"$1"\t"$11"\t"$9}' "$out/tmux-panes.tsv" \
+    # `read` with IFS=$'\t' still treats tab as whitespace and collapses
+    # consecutive tabs — an empty internal field (e.g. an unnamed window)
+    # would shift later fields left. Sentinel-encode empties as `-` in
+    # awk, decode after read. Real `-` values in these fields are
+    # essentially impossible (session/window names tmux generates, pane
+    # ids, cwds), so the round-trip is safe.
+    awk -F'\t' '$7=="claude" {
+      for (i=1;i<=NF;i++) if ($i=="") $i="-"
+      print $2"\t"$3"\t"$4"\t"$5"\t"$1"\t"$11"\t"$9
+    }' "$out/tmux-panes.tsv" \
       | while IFS=$'\t' read -r sess win_idx win_name pane_idx pane_id cwd cpid; do
+          [ "$win_name" = "-" ] && win_name=""
+          [ "$cwd" = "-" ] && cwd=""
+          [ "$cpid" = "-" ] && cpid=""
           # Claude encodes cwd by replacing both `/` and `.` with `-` (so
           # `.local` and `/local` both become `-local`, hence the `--` you
           # see on dotfile paths).
