@@ -68,11 +68,26 @@ emit_session_start() {
     Enter
 }
 
+# send-keys silently no-ops if the shell hasn't drawn its first prompt yet,
+# which causes flaky scenario 1 on busy machines. Block until a sentinel
+# command actually executes.
+wait_for_shell() {
+  local pane="$1" marker="$HOME_DIR/.ready.${pane//[^a-zA-Z0-9]/_}"
+  rm -f "$marker"
+  tmux -L "$SOCK" send-keys -t "$pane" "touch '$marker'" Enter
+  local i
+  for i in $(seq 1 50); do
+    [ -f "$marker" ] && { rm -f "$marker"; return 0; }
+    sleep 0.2
+  done
+  echo "wait_for_shell: pane $pane never became interactive" >&2
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 echo "[scenario 1] first session in new window mints @claude-window-id"
 SID1=$(uuidgen|tr A-Z a-z)
-# Wait for the test pane's shell to be interactive before sending keys.
-sleep 2
+wait_for_shell "$P0"
 emit_session_start "$P0" "$SID1" "/tmp/s1" startup
 sleep 3
 U1=$(tmux -L "$SOCK" show-options -wv -t "$P0" @claude-window-id)
