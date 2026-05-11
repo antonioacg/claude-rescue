@@ -241,6 +241,27 @@ DR=$(bash "$REPO/scripts/install.sh" --dry-run 2>&1 | grep -cE "ln -s|already li
 assert "install.sh dry-run accounts for all binaries" "$EXPECTED_BINS" "$DR"
 
 # ---------------------------------------------------------------------------
+# Regression: tmux's `source-file` does NOT expand `~`. A directive like
+# `source-file -q '~/dev/.../rescue.tmux.conf'` silently fails (the `-q`
+# eats the error), leaving all hooks unset. Prod rollout hit this and
+# burned a diagnostic loop. If the user's rendered ~/.tmux.conf exists,
+# scan it for the bad pattern.
+echo "[tmux-conf] source-file directives don't rely on tilde expansion"
+if [ -f "$HOME/.tmux.conf" ]; then
+  BAD_TILDE=$(grep -nE "^[[:space:]]*source-file[[:space:]]+(-q[[:space:]]+)?['\"]~" "$HOME/.tmux.conf" || true)
+  if [ -n "$BAD_TILDE" ]; then
+    RESULTS+=("FAIL  ~/.tmux.conf has source-file with tilde path: $BAD_TILDE  (use \$HOME or absolute)")
+    FAIL=$((FAIL + 1))
+  else
+    RESULTS+=("PASS  ~/.tmux.conf source-file directives use \$HOME or absolute paths")
+    PASS=$((PASS + 1))
+  fi
+else
+  RESULTS+=("PASS  ~/.tmux.conf not present — skipped tilde scan")
+  PASS=$((PASS + 1))
+fi
+
+# ---------------------------------------------------------------------------
 echo "[json] all window logs are valid JSONL"
 INVALID=0
 for f in "$HOME_DIR/windows/"*.jsonl; do
