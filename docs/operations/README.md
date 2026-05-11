@@ -8,7 +8,8 @@ environment without touching the live tmux server.
 | [staging.md](./staging.md) | Spin up an isolated tmux server wired exactly like production. The harness for everything below. |
 | [hibernation.md](./hibernation.md) | Soft (Ctrl+Z) and hard (Ctrl+C → exit) suspension. Env vars, expected behaviors, manual test recipes. |
 | [crash-recovery.md](./crash-recovery.md) | What survives a tmux crash, what's reborn, and how the resurrect/continuum pipeline interacts with claude-rescue. |
-| [deploying.md](./deploying.md) | chezmoi flow + cutover procedure for the live server. |
+| [deploying.md](./deploying.md) | chezmoi flow + cutover procedure for the live server (concepts). |
+| [production-rollout.md](./production-rollout.md) | Step-by-step runbook for cutting a live machine over to a new release — state dump, apply, server restart, verify, rollback. |
 
 ## Where things live
 
