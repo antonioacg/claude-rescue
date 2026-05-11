@@ -939,7 +939,25 @@ cmd_hibernate_resume() {
   local san="${pane_id//[^A-Za-z0-9]/_}"
   local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
 
-  if [ -f "$arm_pid_file" ]; then
+  # Read the hibernation mode (if any) BEFORE deciding whether to kill the arm
+  # subshell. The arm subshell's role changes by phase:
+  #
+  #   - pre-soft (no marker yet): the timer is just sleeping; we want to cancel
+  #     it so the focused pane doesn't get hibernated.
+  #   - soft (marker mode=soft): claude is suspended, the subshell is sleeping
+  #     toward hard escalation. Cancel it; we're about to fg<Enter> the job.
+  #   - hard (marker mode=hard): claude is already gone. The subshell is in its
+  #     short post-/exit cleanup window — sending `clr <sid>` to the prompt,
+  #     emitting the hibernated event, removing its own arm.pid. Killing it now
+  #     drops the `clr <sid>` pre-fill (the user sees a bare prompt). Leave it.
+  local hibernated_file=""
+  local mode=""
+  if [ -n "$pane_uuid" ]; then
+    hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+    [ -f "$hibernated_file" ] && mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+  fi
+
+  if [ "$mode" != "hard" ] && [ -f "$arm_pid_file" ]; then
     local arm_pid
     arm_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
     if [ -n "$arm_pid" ] && kill -0 "$arm_pid" 2>/dev/null; then
@@ -955,12 +973,9 @@ cmd_hibernate_resume() {
     rm -f "$arm_pid_file"
   fi
 
-  [ -z "$pane_uuid" ] && return 0
-  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  [ -z "$hibernated_file" ] && return 0
   [ -f "$hibernated_file" ] || return 0
 
-  local mode
-  mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
   case "$mode" in
     soft)
       tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
@@ -969,7 +984,8 @@ cmd_hibernate_resume() {
       ;;
     hard)
       # No-op. Marker survives until session_start (real resume) or
-      # pane_died (orphan cleanup).
+      # pane_died (orphan cleanup). The in-flight arm subshell (if any)
+      # finishes its `clr <sid>` send-keys and removes its own arm.pid.
       :
       ;;
   esac

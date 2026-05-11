@@ -17,6 +17,11 @@
 #      taken against a pane whose identity has changed since the timer armed.
 #   6. arm-sweep arms every backgrounded claude pane in one shot (so the user
 #      doesn't have to physically visit each pane to start its countdown).
+#   7. hibernate-resume preserves the in-flight arm subshell when the marker
+#      is mode=hard (post-/exit cleanup is sending `clr <sid>` to the prompt
+#      — killing the subshell mid-flight would drop the pre-fill). For
+#      mode=soft (or no marker), the kill still happens — that's how
+#      focus-in cancels a pending hibernation.
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -409,6 +414,71 @@ assert "scenario 6: second sweep is idempotent (existing timers untouched)" "$PR
 P3_SAN_S6="${P3//[^A-Za-z0-9]/_}"
 assert "scenario 6: nvim pane not armed by sweep (fast guard)" "0" \
   "$([ -f "$CACHE_DIR/hibernated/$P3_SAN_S6.arm.pid" ] && echo 1 || echo 0)"
+
+# ---------------------------------------------------------------------------
+echo "[7] hibernate-resume preserves arm subshell when mode=hard"
+
+# Re-use %2. Clear residual state from scenario 5 / 6.
+P2=%2
+P2_UUID="$(pane_uuid_of $P2)"
+P2_SAN="${P2//[^A-Za-z0-9]/_}"
+P2_ARM_FILE="$CACHE_DIR/hibernated/$P2_SAN.arm.pid"
+P2_MARKER="$CACHE_DIR/hibernated/$P2_UUID.json"
+
+# Clean slate.
+for f in "$CACHE_DIR"/hibernated/*.arm.pid; do
+  [ -f "$f" ] || continue
+  pid="$(cat "$f" 2>/dev/null)"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$f"
+done
+rm -f "$P2_MARKER"
+sleep 1
+
+# Arm %2 — this spawns an arm subshell sleeping toward soft.
+tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep 1
+assert "scenario 7: arm.pid file created" "1" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+S7_ARM_PID="$(cat "$P2_ARM_FILE" 2>/dev/null)"
+assert "scenario 7: arm subshell is alive pre-resume" "1" \
+  "$([ -n "$S7_ARM_PID" ] && kill -0 "$S7_ARM_PID" 2>/dev/null && echo 1 || echo 0)"
+
+# Inject a hard-mode marker by hand — this simulates the in-flight state
+# right after cmd_hibernate_arm has written mode=hard but before it has
+# sent `clr <sid>`. cmd_hibernate_resume should treat this state as
+# "subshell is finishing critical cleanup — leave it alone".
+jq -nc --arg ts "$(now_iso)" --arg pid_p "$P2" --arg puuid "$P2_UUID" \
+  '{pane_id:$pid_p, pane_uuid:$puuid, ts:$ts, mode:"hard", hard_ts:$ts, pids:[]}' \
+  > "$P2_MARKER"
+
+# Fire hibernate-resume. Under the bug, this would kill the arm subshell
+# because its argv matches the orphan-safety pattern.
+tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-resume #{pane_id}'
+sleep 1
+
+assert "scenario 7: hard marker survives hibernate-resume (mode=hard no-op)" "1" \
+  "$([ -f "$P2_MARKER" ] && echo 1 || echo 0)"
+assert "scenario 7: arm subshell NOT killed (hard cleanup must finish)" "1" \
+  "$(kill -0 "$S7_ARM_PID" 2>/dev/null && echo 1 || echo 0)"
+assert "scenario 7: arm.pid file still present" "1" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+
+# Negative control: rewrite marker to mode=soft and re-fire hibernate-resume.
+# Now the arm subshell SHOULD be killed (this is how a focused soft-hibernated
+# pane gets resumed: fg<Enter> + cancel the pending hard escalation).
+jq --arg mode "soft" '. + {mode:$mode} | del(.hard_ts)' \
+  "$P2_MARKER" > "$P2_MARKER.tmp" && mv "$P2_MARKER.tmp" "$P2_MARKER"
+tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-resume #{pane_id}'
+sleep 1
+
+assert "scenario 7: arm subshell IS killed when mode=soft (negative control)" "0" \
+  "$(kill -0 "$S7_ARM_PID" 2>/dev/null && echo 1 || echo 0)"
+assert "scenario 7: arm.pid file removed after soft-mode resume" "0" \
+  "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+
+# Cleanup so a re-run starts fresh.
+rm -f "$P2_MARKER"
 
 # ---------------------------------------------------------------------------
 # Summary
