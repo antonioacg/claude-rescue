@@ -10,6 +10,7 @@ environment without touching the live tmux server.
 | [crash-recovery.md](./crash-recovery.md) | What survives a tmux crash, what's reborn, and how the resurrect/continuum pipeline interacts with claude-rescue. |
 | [deploying.md](./deploying.md) | chezmoi flow + cutover procedure for the live server (concepts). |
 | [production-rollout.md](./production-rollout.md) | Step-by-step runbook for cutting a live machine over to a new release — state dump, apply, server restart, verify, rollback. |
+| [rollout-2026-05-11-postmortem.md](./rollout-2026-05-11-postmortem.md) | Postmortem of the first production rollout. Bugs caught, root causes unresolved, recovery paths validated. Worth reading before doing the same rollout on another machine. |
 
 ## Where things live
 

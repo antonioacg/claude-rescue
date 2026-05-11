@@ -234,6 +234,33 @@ The script's tail emits a per-pane round-trip check
 (`find-sessions --pane-uuid <minted>` should return the session_id we
 wrote). It exits non-zero if any pane fails.
 
+**Pre-run sanity check — backfill collision with active claudes.**
+Inspect the dry-run MINT output for any sid that's currently in use by
+another running claude process (e.g., the operator-claude itself, or a
+claude running outside the live tmux server):
+
+```bash
+# List sids of currently-running claude processes (from launch argv):
+ps -A -o command 2>/dev/null | grep -oE '\-r [0-9a-f-]{36}' \
+  | sort -u | awk '{print $2}'
+```
+
+If any of those sids appear in MINT lines, the affected panes would
+end up trying to resume a session that's actively running in another
+process. Two claude processes writing the same on-disk transcript
+corrupts both. Either:
+
+- Skip those panes (kill them post-restart with `tmux kill-pane`), or
+- Edit the dump's `restore-plan.tsv` to remove those rows before
+  running the real backfill.
+
+This is most likely to bite when (a) the rollout operator-claude lives
+in the same cwd as a backfill target, AND (b) the cwd has a thin
+transcript pool — the Nth-most-recent heuristic falls back to the
+operator's own most-recent jsonl as the "best available" for
+neighboring panes. Caught on the 2026-05-11 rollout (2 panes mapped to
+the rollout operator's own session).
+
 **If the smoke test FAILs on a subset of panes**, the first thing to
 check is the `find-sessions` cwd encoding (`bin/claude-rescue`). Claude
 encodes cwd → `~/.claude/projects/<dir>` by mapping **both** `/` and
@@ -316,6 +343,12 @@ tmux -L default run-shell '~/.config/tmux/plugins/tmux-continuum/scripts/continu
 # Sanity: the snapshot should be seconds old.
 ls -lt ~/.local/share/tmux/resurrect/default/ | head -3
 
+# 5a'. Clear the observability logs so the redo's traces are
+# isolated from any pre-rollout content. NOT optional — if you skip
+# this and need to diagnose a failure, you'll be reading mixed history.
+: > ~/.local/share/claude-rescue/wrapper.log
+: > ~/.cache/claude-rescue/rescue-log.err
+
 # 5b. Detach all attached clients cleanly. (Optional but tidier than
 # letting them get evicted by the server kill.)
 tmux -L default detach-client -a 2>/dev/null || true
@@ -330,8 +363,53 @@ tmux -L default kill-server
 tmux -L default attach
 ```
 
-Verify (run from the operator pane against `-L default`, or from the
-fresh attached terminal — same result):
+### Observability surfaces (read these post-restore)
+
+Two log files capture what actually happened during the restore. Both
+are critical for diagnosing failures and should be read together:
+
+- **`~/.local/share/claude-rescue/wrapper.log`** — every
+  `claude-rescue-resume` invocation appends 2 lines: one "invoked" on
+  entry (pid, ppid, pane, argc, full argv), one "resolved" before exec
+  (pane_uuid, find_sessions_sid, saved_uuid, target). For a healthy
+  restore of N claude panes, expect N "invoked" + N "resolved" lines.
+
+  ```bash
+  echo "invoked: $(grep -c 'invoked pid=' ~/.local/share/claude-rescue/wrapper.log)"
+  echo "resolved: $(grep -c 'resolved pid=' ~/.local/share/claude-rescue/wrapper.log)"
+  ```
+
+  If invoked < N: tmux-resurrect's send-keys didn't reach every saved
+  claude pane. **Go to section 5b for the recovery procedure.**
+  If invoked == N but resolved < N: some wrappers crashed before
+  exec. Inspect the trailing lines of each "invoked" without a
+  matching "resolved" — likely a wrapper bug.
+
+- **`~/.cache/claude-rescue/rescue-log.err`** — `claude-rescue-log`'s
+  `cmd_resurrect_restore` logs hook fire, snapshot name, sidecar row
+  count, per-set-option outcome, and final tallies (applied/skipped
+  per window+pane). Expect one block per restore.
+
+  ```bash
+  cat ~/.cache/claude-rescue/rescue-log.err
+  ```
+
+  Expected pattern:
+  ```
+  resurrect-restore: hook fired (TMUX=...)
+  resurrect-restore: snapshot=tmux_resurrect_<ts>.txt sidecar_rows=<2N-1>
+  resurrect-restore: applied window=<N> pane=<N> skipped=0
+  ```
+
+  If the hook didn't fire at all, the pre-restore-pane-processes
+  setup is broken. Check `tmux -L default show-options -gv
+  @resurrect-hook-pre-restore-pane-processes` returns the handler
+  name (back to step 4d if `invalid option`).
+
+### Verify (run from any attached terminal)
+
+Run from the operator pane against `-L default`, or from the fresh
+attached terminal — same result:
 
 - **Pane count matches the dump.** `tmux -L default list-panes -a | wc -l`
   should equal the `tmux-panes.tsv` line count from the step 4e dump.
@@ -513,6 +591,16 @@ running server. Code rollback can wait.
   `rm -rf ${XDG_STATE_HOME:-~/.local/state}/claude-rescue/dumps/dump-<ts>`.
 
 ---
+
+## Related reading
+
+- [`rollout-2026-05-11-postmortem.md`](./rollout-2026-05-11-postmortem.md)
+  — the first machine's rollout. Captures what actually went wrong, what
+  was unproven, and which bugs got caught during the rollout itself
+  (find-sessions encoding, source-file tilde expansion, wrapper empty
+  `rebuilt[@]` array). Recommended reading before doing the rollout on
+  any subsequent machine: the failure modes are real, the recovery
+  paths in this runbook were forged through them.
 
 ## What this runbook does *not* cover
 
