@@ -147,11 +147,12 @@ repo. To force the installer to re-run:
 bash ~/dev/claude-rescue/scripts/install.sh --apply
 ```
 
-## 4b. Re-dump (mandatory before kill-server)
+## 4b. Re-dump (mandatory before backfill / kill-server)
 
 The dump from step 1 is now stale: recap-missing wrote new transcripts,
 and chezmoi apply may have rewritten config. Re-run the dump so the
-manual-restore fallback for the next step reflects the *current* state:
+backfill and manual-restore fallback for later steps reflect the
+*current* state:
 
 ```bash
 bash ~/dev/claude-rescue/scripts/state-dump.sh
@@ -168,13 +169,88 @@ Output should be empty (or only show panes you knowingly chose not to
 recap). If anything you care about is still empty, return to step 1b
 before continuing.
 
+## 4c. Backfill @claude-pane-id for panes lacking one
+
+**Why this step exists.** `claude-rescue-resume`, the wrapper that runs
+in each restored pane after kill-server, resolves the resume target via
+this priority:
+
+1. `@claude-pane-id` on the pane → `find-sessions` lookup → `-r <session_id>`
+2. Else: existing `-r <UUID>` parsed from the saved command line
+3. Else: no `-r` → claude starts a fresh session
+
+If your live server has a mix of older claude panes that never had
+`@claude-pane-id` minted (pre-rollout SessionStart events didn't write
+one), AND those panes were originally launched fresh (no `-r` in their
+saved tmux-resurrect command), they fall through to (3) and lose
+in-memory context on restore.
+
+The backfill script walks current claude panes from step 4b's dump,
+mints pane + window UUIDs for those lacking them, writes a
+`session_start_backfill` event tying each new pane UUID to one of the
+cwd's claude transcripts, and rebuilds the affected windows' meta files.
+For cwds with multiple panes, each pane gets a *distinct* session_id
+(Nth-most-recent transcript to Nth pane) so they don't race for the
+same session at restore. Panes whose cwd has fewer transcripts than
+panes are skipped — recovery for those is `clr <sid>` by hand.
+
+```bash
+bash ~/dev/claude-rescue/scripts/backfill-pane-uuids.sh --dry-run
+# Inspect the MINT/SKIP output. Confirm the (pane → session_id) mapping
+# looks sane. Then:
+bash ~/dev/claude-rescue/scripts/backfill-pane-uuids.sh
+```
+
+The script's tail emits a per-pane round-trip check
+(`find-sessions --pane-uuid <minted>` should return the session_id we
+wrote). It exits non-zero if any pane fails.
+
+## 4d. Load the new tmux hooks into the live server
+
+`chezmoi apply` updated `~/.tmux.conf` and `~/dev/claude-rescue/tmux/rescue.tmux.conf`,
+but the running tmux server has the previous in-memory copy. The new
+`@resurrect-hook-post-save-layout` hook needs to be loaded *before*
+step 5a's force save, otherwise the sidecar isn't written and the
+backfilled `@claude-pane-id`s don't survive kill-server.
+
+```bash
+tmux -L default source-file ~/.tmux.conf
+```
+
+Verify the hook is now set:
+
+```bash
+tmux -L default show-options -gv @resurrect-hook-post-save-layout
+# expect: claude-rescue-log resurrect-save "$1"
+
+tmux -L default show-options -gv @resurrect-hook-pre-restore-pane-processes
+# expect: claude-rescue-log resurrect-restore
+```
+
+If either returns `invalid option`, the source-file didn't load
+rescue.tmux.conf. Check that `~/.tmux.conf` has the `source-file -q
+'~/dev/claude-rescue/tmux/rescue.tmux.conf'` line (it should after
+chezmoi apply).
+
+## 4e. Final re-dump (verify backfill landed in the sidecar)
+
+```bash
+bash ~/dev/claude-rescue/scripts/state-dump.sh
+LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+echo "Panes still missing @claude-pane-id:"
+awk -F'\t' '$7=="claude" && $9==""' "$LATEST/tmux-panes.tsv" | wc -l
+```
+
+Expect `0` (or whatever count of skipped panes you accepted in 4c).
+This dump is the manual-restore fallback for step 5.
+
 ## 5. Final validation — restart the tmux server
 
 This is the load-bearing step. We deliberately kill the live server so
 continuum's auto-restore brings everything back with the new wiring. If
 anything is broken (resurrect snapshot stale, wrapper path wrong, hook
 ordering off), it surfaces here, not silently later. The dump from
-step 4b is your manual-restore fallback.
+step 4e is your manual-restore fallback.
 
 ```bash
 # 5a. Force a fresh resurrect snapshot so we restore from current state.
@@ -201,7 +277,7 @@ Verify (run from the operator pane against `-L default`, or from the
 fresh attached terminal — same result):
 
 - **Pane count matches the dump.** `tmux -L default list-panes -a | wc -l`
-  should equal the `tmux-panes.tsv` line count from the step 4b dump.
+  should equal the `tmux-panes.tsv` line count from the step 4e dump.
 - **Each pane is in the right cwd.** Cross-check a few rows against
   `restore-plan.tsv`.
 - **claude panes restored as `claude-rescue-resume` then handed off to
