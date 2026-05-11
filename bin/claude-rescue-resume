@@ -117,7 +117,14 @@ while [ $i -le $# ]; do
   fi
   i=$((i + 1))
 done
-set -- "${rebuilt[@]}"
+# bash 3.2 + set -u treats an empty array's ${arr[@]} as unbound. When the
+# saved cmd is just `claude -r <UUID>` (no other args), the rebuild loop
+# strips both args and `rebuilt` stays empty. Guard the expansion.
+if [ "${#rebuilt[@]}" -gt 0 ]; then
+  set -- "${rebuilt[@]}"
+else
+  set --
+fi
 
 # --- Query pane uuid + look up the resume target via find-sessions --------
 pane_uuid=""
