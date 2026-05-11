@@ -60,10 +60,8 @@ time and skips anything that isn't currently `claude` — it never types
 the prompt into a shell. Default input is the latest dump under
 `~/claude-rescue-dumps/`.
 
-After it runs, give claudes a moment to respond, then re-run the state
-dump to refresh `restore-plan.tsv` — the previously-empty rows should
-now have session_ids. **Don't proceed to the kill-server step until
-this is true.**
+After it runs, give claudes ~30s to respond. The recaps land as new
+messages in their `.jsonl` files.
 
 ## 2. Validate the code on this machine
 
@@ -117,12 +115,34 @@ repo. To force the installer to re-run:
 bash ~/dev/claude-rescue/scripts/install.sh --apply
 ```
 
+## 4b. Re-dump (mandatory before kill-server)
+
+The dump from step 1 is now stale: recap-missing wrote new transcripts,
+and chezmoi apply may have rewritten config. Re-run the dump so the
+manual-restore fallback for the next step reflects the *current* state:
+
+```bash
+bash ~/dev/claude-rescue/scripts/state-dump.sh
+```
+
+Verify the previously-empty `latest_session_id` rows are now populated:
+
+```bash
+LATEST="$(/bin/ls -td ~/claude-rescue-dumps/dump-* | head -1)"
+awk -F'\t' 'NR>1 && $7==""' "$LATEST/restore-plan.tsv"
+```
+
+Output should be empty (or only show panes you knowingly chose not to
+recap). If anything you care about is still empty, return to step 1b
+before continuing.
+
 ## 5. Final validation — restart the tmux server
 
 This is the load-bearing step. We deliberately kill the live server so
 continuum's auto-restore brings everything back with the new wiring. If
 anything is broken (resurrect snapshot stale, wrapper path wrong, hook
-ordering off), it surfaces here, not silently later.
+ordering off), it surfaces here, not silently later. The dump from
+step 4b is your manual-restore fallback.
 
 ```bash
 # 5a. Force a fresh resurrect snapshot so we restore from current state.
@@ -146,7 +166,7 @@ tmux attach
 Inside the restored server, verify:
 
 - **Pane count matches the dump.** `tmux list-panes -a | wc -l` should
-  equal the `tmux-panes.tsv` line count from step 1.
+  equal the `tmux-panes.tsv` line count from the step 4b dump.
 - **Each pane is in the right cwd.** Cross-check a few rows against
   `restore-plan.tsv`.
 - **claude panes restored as `claude-rescue-resume` then handed off to
