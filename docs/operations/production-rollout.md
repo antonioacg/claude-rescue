@@ -153,12 +153,19 @@ Expected changes:
   should be in the diff scoped to this rollout.
 
 > **If the second Mac's chezmoi is currently on `main`** (it was at the
-> time of the 2026-05-11 rollout on the first Mac), all five claude-rescue
-> chezmoi commits — `d82388b` (swap claude-restore → claude-rescue-resume
-> + hook order), `b12e2e2` (busy hooks wiring), `0493fc5` (drop tilde from
-> @resurrect-processes), `28911fd` (source-file path: `$HOME` not `~`),
-> `5918531` (picker keybind) — all ship together when this Mac merges
-> `feat/claude-rescue-prod-deploy`. Don't cherry-pick subsets.
+> time of the 2026-05-11 rollout on the first Mac), merge the entire
+> `feat/claude-rescue-prod-deploy` branch — don't cherry-pick subsets.
+> The five commits on that branch all ship together:
+>
+> 1. `feat(tmux): swap claude-restore.sh → claude-rescue-resume, fix hook order`
+> 2. `feat(claude-rescue): wire busy hooks; install.sh moved to scripts/`
+> 3. `fix(tmux): @resurrect-processes — drop tilde from claude pattern`
+> 4. `fix(tmux): rescue.tmux.conf source-file path — use $HOME, not ~`
+> 5. `feat(tmux): wire prefix+R picker keybind for claude-rescue`
+>
+> (Subjects are listed instead of SHAs because rebasing onto main
+> rewrites SHAs; subjects don't change. Find them in your local clone
+> with `git log --oneline origin/main..feat/claude-rescue-prod-deploy`.)
 
 If you see anything surprising, stop and investigate.
 
