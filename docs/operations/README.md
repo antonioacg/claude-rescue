@@ -23,7 +23,7 @@ environment without touching the live tmux server.
 ## Standard dev loop
 
 1. **Make the change** in `bin/` / `lib/` / `tmux/` (live system picks it up via symlinks — no install step).
-2. **Validate scripted basics** — `bash scripts/validate.sh` (isolated server, ~30s, 26 assertions across 11 unit-level scenarios — adds active-session-file lifecycle).
+2. **Validate scripted basics** — `bash scripts/validate.sh` (isolated server, ~30s, 31 assertions across 12 unit-level scenarios — adds active-session-file lifecycle + snapshot-diff per-server isolation).
 3. **Validate hibernation + crash-restore** — `scripts/validate-hibernation.sh` (~3 min, 57 assertions across 9 scenarios — adds SessionEnd arm.pid reap + arm-sweep voluntary-exit detection) and `scripts/validate-crash-restore.sh` (~4 min, 31 assertions across 4 crash-recovery paths — adds wrapper-prefers-active-file). Both destroy current staging on entry/exit; both build the fixture from scratch via `staging-fixture.sh`.
 4. **Validate interactively** in staging if needed — `scripts/staging.sh setup` + `scripts/staging-fixture.sh`. See [staging.md](./staging.md).
 5. **Update or add docs** in this directory as the operational surface changes.

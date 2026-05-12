@@ -7,7 +7,9 @@ agent) on a second machine can replay what was done on the first machine.
 **Final validation step is `tmux kill-server`** — we deliberately exercise
 the resurrect+continuum auto-restore path while the new wiring is live, so
 any regression in restore behavior shows up immediately. The state-dump
-captured in step 1 is the manual fallback for that step.
+captured in step 1 is the manual fallback for that step. Step 4f
+(rebuild event log from snapshots) runs immediately before, giving the
+post-restore observability check a clean baseline to read against.
 
 > Assumes the machine starts in the same shape as the first Mac at rollout
 > time: chezmoi `feat/claude-rescue-prod-deploy` checked out (or merged to
@@ -15,18 +17,22 @@ captured in step 1 is the manual fallback for that step.
 > to main), live tmux server has the *pre-rollout* config loaded, symlinks
 > in `~/.local/bin/` already point at the repo.
 >
-> **What `feat/hook-driven-identity` adds on top of the original
-> `feat/hibernation-capture-and-tooling` rollout** (relevant for any second
-> Mac that hasn't done the earlier rollout — both branches' work ships
-> together):
-> - `$DATA/active/<pane_uuid>` — durable per-pane current `session_id`,
->   written by every SessionStart, removed by SessionEnd / pane_died /
->   arm-sweep voluntary-exit. Wrapper's priority-1 resume target.
-> - `cmd_session_end` reaps `arm.pid` + active file up front (fixes the
->   "27 orphan arm.pids after dialog-dismiss" bug).
-> - `cmd_arm_sweep` extended with voluntary-exit detection: panes with
->   `@claude-pane-id` but no claude (and no busy/hibernation marker) get
->   their state cleaned automatically on next attach.
+> **What `feat/hook-driven-identity` ships** (for a second Mac that's still
+> on `main`, all of this lands together when the branch merges):
+> - **Hibernation + capture/print** — soft (Ctrl+Z) and hard (`/exit`) pane
+>   suspension, focus-driven arm-sweep, scrollback capture at hibernate time.
+> - **Hook-driven identity** — `$DATA/active/<pane_uuid>` holds the current
+>   `session_id`, written by every SessionStart, removed by SessionEnd /
+>   pane_died / arm-sweep voluntary-exit. Wrapper's priority-1 resume target.
+> - **arm.pid lifecycle reaper** — `cmd_session_end` reaps `arm.pid` + active
+>   file up front; `cmd_arm_sweep` detects voluntary-exit (pane with
+>   `@claude-pane-id` but no claude / no busy / no hibernation marker) and
+>   cleans the state automatically on next attach. Fixes the "27 orphan
+>   arm.pids after dialog-dismiss" failure mode.
+> - **Snapshot-diff unification** — live title sampling and the backfill now
+>   share one code path (snapshot-diff over `tmux_resurrect_*.txt`). No more
+>   per-pane filesystem dedupe state, no cross-server cache collision. Step
+>   4f rebuilds the event log from scratch off this single source of truth.
 
 ---
 
@@ -114,7 +120,7 @@ Quick gate (~30s, isolated, safe anytime):
 
 ```bash
 cd ~/dev/claude-rescue
-bash scripts/validate.sh                 # 26 assertions / 11 scenarios
+bash scripts/validate.sh                 # 31 assertions / 12 scenarios
 ```
 
 If that passes and you want belt-and-suspenders:
@@ -147,13 +153,12 @@ Expected changes:
   should be in the diff scoped to this rollout.
 
 > **If the second Mac's chezmoi is currently on `main`** (it was at the
-> time of the 2026-05-11 rollout on the first Mac), all four of the
-> previous claude-rescue chezmoi commits — `51486e9` (swap claude-restore
-> → claude-rescue-resume + hook order), `9248c7c` (busy hooks wiring),
-> `c93b68a` (drop tilde from @resurrect-processes), `7137b48` (source-file
-> path: `$HOME` not `~`) — plus the new `a978ced` (picker keybind) all
-> ship together when this Mac merges `feat/claude-rescue-prod-deploy`.
-> Don't cherry-pick subsets.
+> time of the 2026-05-11 rollout on the first Mac), all five claude-rescue
+> chezmoi commits — `d82388b` (swap claude-restore → claude-rescue-resume
+> + hook order), `b12e2e2` (busy hooks wiring), `0493fc5` (drop tilde from
+> @resurrect-processes), `28911fd` (source-file path: `$HOME` not `~`),
+> `5918531` (picker keybind) — all ship together when this Mac merges
+> `feat/claude-rescue-prod-deploy`. Don't cherry-pick subsets.
 
 If you see anything surprising, stop and investigate.
 
