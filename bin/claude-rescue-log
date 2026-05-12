@@ -392,11 +392,17 @@ log_no_tmux() {
 cmd_resurrect_save() {
   # Hooked into tmux-resurrect via @resurrect-hook-post-save-layout.
   # Two jobs:
-  #   1. Write the @claude-window-id sidecar (so UUIDs survive a kill-server cycle).
-  #   2. Sample per-pane state and emit title transitions / pane-died events.
-  #      This replaces the pane-title-changed and pane-died tmux hooks, which
-  #      don't register at server-global scope on tmux 3.x. Granularity matches
-  #      the continuum save interval (typically 1 minute).
+  #   1. Write the @claude-window-id / @claude-pane-id sidecar so UUIDs survive
+  #      a kill-server cycle (replayed by cmd_resurrect_restore).
+  #   2. Diff this snapshot against the previous one and emit title transitions
+  #      + pane_died events. This is the same logic as bin/claude-rescue-backfill;
+  #      backfill runs it over a chain of historical snapshots, live runs it
+  #      incrementally over one new (prev → current) pair.
+  #
+  # The resurrect snapshot files are the single source of truth — they're
+  # exactly what would be replayed on restore, so what we log matches what
+  # the user actually has in saved state. No filesystem dedupe state (no
+  # `*.last` files), no race-prone read-then-write across hook firings.
   local state_file="${1:-}"
   [ -n "$state_file" ] || return 0
   [ -f "$state_file" ] || return 0
@@ -433,107 +439,106 @@ cmd_resurrect_save() {
   } > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
 
-  # 2. Per-pane sample — emit title transitions and detect pane death.
-  #
-  # Snapshot dir is per-server. Without this, two tmux servers (e.g. main +
-  # staging, or main + a per-task operator server) share `_<N>.last` files
-  # keyed only by sanitized pane_id `%N`. Both servers' pane %0 race to write
-  # the same file: server A reads B's title, sees "different", emits an event,
-  # writes its own; server B does the reverse next tick. Net result: every
-  # tick on every server emits an event regardless of whether the title
-  # actually changed, even on long-stable panes. Mirrors @resurrect-dir's
-  # per-server scheme (state_file lives in $resurrect_dir/.../tmux_resurrect_*.txt,
-  # so its dirname IS the per-server resurrect dir).
-  local server_name="$(basename "$(dirname "$state_file")")"
-  local snapshot_dir="$CLAUDE_RESCUE_CACHE_HOME/tmp/last-pane-state/$server_name"
-  mkdir -p "$snapshot_dir"
-  local current_panes_file="$snapshot_dir/.current-panes"
-  : > "$current_panes_file"
-
-  # Use ASCII unit separator (\x1f) instead of tab. Bash's `read` collapses
-  # consecutive whitespace IFS chars (including tabs), which silently drops
-  # empty fields like an unset pane_title — shifting subsequent fields and
-  # making @claude-window-id read empty. Non-whitespace IFS preserves them.
-  local US=$'\x1f'
-  while IFS="$US" read -r pane_id session_name window_index window_name pane_title pane_cwd window_uuid pane_uuid; do
-    [ -z "$pane_id" ] && continue
-    [ -z "$window_uuid" ] && continue
-    printf '%s\n' "$pane_id" >> "$current_panes_file"
-
-    local san="${pane_id//[^A-Za-z0-9]/_}"
-    local last_file="$snapshot_dir/$san.last"
-    local prev_title=""
-    [ -f "$last_file" ] && prev_title="$(cat "$last_file" 2>/dev/null)"
-
-    if [ -n "$pane_title" ] && [ "$pane_title" != "$prev_title" ]; then
-      local session_id
-      session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
-      append_event "$window_uuid" "$(jq -nc \
-        --arg ts "$(now_iso)" --arg t "$pane_title" \
-        --arg puuid "$pane_uuid" --arg sid "${session_id:-}" \
-        '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
-         (if $sid == "" then {} else {session_id:$sid} end)')"
-      printf '%s' "$pane_title" > "$last_file"
-    fi
-  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}${US}#{@claude-pane-id}")
-
-  # 2b. Detect panes that disappeared since last sample (deferred pane-died).
-  # Defensive guard: if this sample saw ZERO live panes with @claude-window-id,
-  # tmux's option lookup likely returned a transient empty (observed when a
-  # pane's command transitions, e.g. claude → zsh on Ctrl+C+Ctrl+C — the
-  # save fires in the middle of automatic-rename and the option query
-  # briefly returns nothing). Skip the gone-pane detection and wait for the
-  # next sample rather than firing false positive pane_died events.
-  if [ ! -s "$current_panes_file" ]; then
-    log_err "resurrect-save: list-panes returned no live windows with @claude-window-id; skipping gone-pane detection"
-    rm -f "$current_panes_file"
+  # 2. Snapshot diff. Find the snapshot immediately before $state_file in this
+  # server's resurrect-dir and compare pane_title per (session_name,
+  # window_index, pane_index). Sort by filename (NOT mtime) — tmux-resurrect
+  # names files `tmux_resurrect_<YYYYMMDDTHHMMSS>.txt`, so lexical order is
+  # chronological order. mtime sort would be wrong under concurrent saves
+  # (two hooks firing within the same second can write files in mtime order
+  # different from filename order, which would point our diff at the wrong
+  # base).
+  # First save on a fresh server has no prev; nothing to diff against.
+  local resurrect_dir; resurrect_dir="$(dirname "$state_file")"
+  local prev_state
+  prev_state="$(find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f 2>/dev/null \
+                 | awk -v cur="$state_file" '$0 < cur' \
+                 | sort | tail -1)"
+  if [ -z "$prev_state" ] || [ ! -f "$prev_state" ]; then
     return 0
   fi
 
-  local stale_pane
-  for stale_file in "$snapshot_dir"/*.last; do
-    [ -f "$stale_file" ] || continue
-    stale_pane="$(basename "$stale_file" .last)"
-    # Walk back to find the original pane_id by inverting the sanitization.
-    # Sanitization is one-way (multiple chars → underscore), so we record the
-    # full pane_id in a sidecar.
-    local owner_file="$snapshot_dir/$stale_pane.owner"
-    [ -f "$owner_file" ] || { rm -f "$stale_file"; continue; }
-    local original_pane_id
-    original_pane_id="$(cat "$owner_file")"
-    if ! grep -qxF "$original_pane_id" "$current_panes_file" 2>/dev/null; then
-      # Pane no longer exists; emit pane_died if we have a window UUID for it.
-      local last_window_uuid_file="$snapshot_dir/$stale_pane.window_uuid"
-      local last_pane_uuid_file="$snapshot_dir/$stale_pane.pane_uuid"
-      [ -f "$last_window_uuid_file" ] || { rm -f "$stale_file" "$owner_file" "$last_pane_uuid_file"; continue; }
-      local last_window_uuid last_pane_uuid
-      last_window_uuid="$(cat "$last_window_uuid_file")"
-      last_pane_uuid="$(cat "$last_pane_uuid_file" 2>/dev/null || true)"
-      append_event "$last_window_uuid" "$(jq -nc \
-        --arg ts "$(now_iso)" --arg puuid "$last_pane_uuid" \
-        '{ts:$ts, kind:"pane_died", pane_uuid:$puuid, source:"resurrect_sample"}')"
-      rm -f "$stale_file" "$owner_file" "$last_window_uuid_file" "$last_pane_uuid_file"
-    fi
+  local prev_sidecar="${prev_state%.txt}.claude-userops.tsv"
+
+  # awk diff: emit one record per (sn, wi, pi) whose title changed, plus one
+  # per pane present in prev but absent in current (pane_died).
+  # Output columns (TAB-separated):
+  #   TITLE \t session_name \t window_index \t pane_index \t pane_title \t pane_command
+  #   DIED  \t session_name \t window_index \t pane_index
+  # Resurrect pane line layout — same as bin/claude-rescue-backfill:
+  #   $1=pane $2=sn $3=wi $4=window_active $5=:flags
+  #   $6=pi   $7=pane_title $8=:dir $9=pane_active $10=pane_command
+  local diff_out
+  diff_out="$(awk -F'\t' '
+    FILENAME == prev_file {
+      if ($1 == "pane") {
+        key = $2 "\t" $3 "\t" $6
+        prev_title[key] = $7
+      }
+      next
+    }
+    $1 == "pane" {
+      key = $2 "\t" $3 "\t" $6
+      curr_seen[key] = 1
+      if ($7 != "" && $7 != prev_title[key]) {
+        printf("TITLE\t%s\t%s\t%s\t%s\t%s\n", $2, $3, $6, $7, $10)
+      }
+    }
+    END {
+      for (k in prev_title) {
+        if (!(k in curr_seen)) {
+          split(k, parts, "\t")
+          printf("DIED\t%s\t%s\t%s\n", parts[1], parts[2], parts[3])
+        }
+      }
+    }
+  ' prev_file="$prev_state" "$prev_state" "$state_file")"
+
+  [ -z "$diff_out" ] && return 0
+
+  # Resolve uuids and emit events. Sidecar lookups use the CURRENT sidecar for
+  # TITLE (the pane is alive now), the PREVIOUS sidecar for DIED (the pane is
+  # gone; its uuids were captured in prev_state's sidecar).
+  local touched_windows; touched_windows="$(mktemp)"
+  while IFS=$'\t' read -r kind sn wi pi title pane_cmd; do
+    local kind_window_uuid="" kind_pane_uuid=""
+    case "$kind" in
+      TITLE)
+        kind_window_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" \
+          '$1=="window" && $2==sn && $3==wi {print $5; exit}' "$sidecar")"
+        kind_pane_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" -v pi="$pi" \
+          '$1=="pane" && $2==sn && $3==wi && $4==pi {print $5; exit}' "$sidecar")"
+        [ -z "$kind_window_uuid" ] && continue
+        local session_id
+        session_id="$(latest_open_session_in_pane "$kind_window_uuid" "$kind_pane_uuid")"
+        append_event "$kind_window_uuid" "$(jq -nc \
+          --arg ts "$(now_iso)" --arg t "$title" \
+          --arg puuid "${kind_pane_uuid:-}" --arg sid "${session_id:-}" \
+          '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
+           (if $sid == "" then {} else {session_id:$sid} end)')"
+        echo "$kind_window_uuid" >> "$touched_windows"
+        ;;
+      DIED)
+        if [ -f "$prev_sidecar" ]; then
+          kind_window_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" \
+            '$1=="window" && $2==sn && $3==wi {print $5; exit}' "$prev_sidecar")"
+          kind_pane_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" -v pi="$pi" \
+            '$1=="pane" && $2==sn && $3==wi && $4==pi {print $5; exit}' "$prev_sidecar")"
+        fi
+        [ -z "$kind_window_uuid" ] && continue
+        append_event "$kind_window_uuid" "$(jq -nc \
+          --arg ts "$(now_iso)" --arg puuid "${kind_pane_uuid:-}" \
+          '{ts:$ts, kind:"pane_died", pane_uuid:$puuid, source:"snapshot_diff"}')"
+        echo "$kind_window_uuid" >> "$touched_windows"
+        ;;
+    esac
+  done <<< "$diff_out"
+
+  # Rebuild meta only for windows that received events here. Other code paths
+  # (cmd_session_start, cmd_session_end, etc.) call rebuild_meta themselves.
+  sort -u "$touched_windows" 2>/dev/null | while IFS= read -r wuuid; do
+    [ -n "$wuuid" ] && rebuild_meta "$wuuid"
   done
-
-  # 2c. Update owner + window_uuid + pane_uuid sidecars for currently-live panes.
-  # Same US separator as above to handle empty pane_title correctly.
-  while IFS="$US" read -r pane_id _ _ _ _ _ window_uuid pane_uuid; do
-    [ -z "$pane_id" ] && continue
-    [ -z "$window_uuid" ] && continue
-    local san="${pane_id//[^A-Za-z0-9]/_}"
-    printf '%s' "$pane_id" > "$snapshot_dir/$san.owner"
-    printf '%s' "$window_uuid" > "$snapshot_dir/$san.window_uuid"
-    printf '%s' "$pane_uuid" > "$snapshot_dir/$san.pane_uuid"
-  done < <(tmux list-panes -aF "#{pane_id}${US}#{session_name}${US}#{window_index}${US}#{window_name}${US}#{pane_title}${US}#{pane_current_path}${US}#{@claude-window-id}${US}#{@claude-pane-id}")
-
-  rm -f "$current_panes_file"
-
-  # 2d. Rebuild metas for any windows we touched.
-  for log in "$CLAUDE_RESCUE_DATA_HOME/windows/"*.jsonl; do
-    [ -f "$log" ] || continue
-    rebuild_meta "$(basename "$log" .jsonl)"
-  done
+  rm -f "$touched_windows"
 }
 
 cmd_resurrect_restore() {

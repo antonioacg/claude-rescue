@@ -322,32 +322,91 @@ sleep 1
 assert "scenario 11d: resurrect-restore bulk-clears active dir" "absent" "$S11_ORPHAN_STATE"
 
 # ---------------------------------------------------------------------------
-# Regression: the title-sample dedupe state under
-# $CACHE/tmp/last-pane-state/<pane_id_sanitized>.last must be per-server.
-# Without that, two tmux servers (e.g. main + staging, or main + a per-task
-# operator server) share `_N.last` keyed only by sanitized `%N`: server A
-# writes its title, server B reads it, sees "different", emits an event,
-# writes its own. Every tick on every server emits an event, regardless of
-# whether the title changed. Caught in prod after spotting 100s of identical
-# title events in a 1-pane window's log.
-echo "[scenario 12] resurrect-save snapshot dir is per-server"
-S12_SRVA="$HOME_DIR/resurrect-scenario12-A"
-S12_SRVB="$HOME_DIR/resurrect-scenario12-B"
-mkdir -p "$S12_SRVA" "$S12_SRVB"
-echo "fake" > "$S12_SRVA/tmux_resurrect_test.txt"
-echo "fake" > "$S12_SRVB/tmux_resurrect_test.txt"
-tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_SRVA/tmux_resurrect_test.txt"
-tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_SRVB/tmux_resurrect_test.txt"
+# resurrect-save now diffs the new snapshot against the previous one (same
+# source-of-truth and dedupe key as bin/claude-rescue-backfill). Cross-server
+# isolation is structural — each server's resurrect-dir holds its own
+# snapshots, so the prev-lookup never crosses servers.
+#
+# Test that:
+#  (a) first save in a fresh resurrect-dir emits no title event (no prev)
+#  (b) second save with a changed title emits exactly one title event
+#  (c) third save with an unchanged title emits zero new title events
+#  (d) a snapshot in a sibling resurrect-dir does NOT influence the diff
+echo "[scenario 12] resurrect-save snapshot-diff"
+
+# Set up a fresh pane with @claude-* options; previous scenarios may have
+# killed off $PA's window. The diff resolves uuids via the sidecar, which
+# cmd_resurrect_save writes from live tmux state — so the test pane must
+# exist with both @claude-window-id and @claude-pane-id set.
+tmux -L "$SOCK" new-window -t t1
+S12_P=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S12_P"
+emit_session_start "$S12_P" "$(uuidgen|tr A-Z a-z)" "/tmp/s12" startup
+sleep 2
+S12_SN=$(tmux -L "$SOCK" display-message -p -t "$S12_P" '#{session_name}')
+S12_WI=$(tmux -L "$SOCK" display-message -p -t "$S12_P" '#{window_index}')
+S12_PI=$(tmux -L "$SOCK" display-message -p -t "$S12_P" '#{pane_index}')
+S12_WU=$(tmux -L "$SOCK" show-options -wv -t "$S12_P" @claude-window-id)
+
+# Helper: write a fake resurrect snapshot containing one pane line. Other
+# fields are placeholders; resurrect-save only reads cols 1, 2, 3, 6, 7, 10.
+write_fake_snap() {
+  local path="$1" title="$2"
+  printf 'pane\t%s\t%s\t1\t:flags\t%s\t%s\t:dir\t1\tclaude\t:cmd\n' \
+    "$S12_SN" "$S12_WI" "$S12_PI" "$title" > "$path"
+}
+
+S12_DIR="$HOME_DIR/resurrect-scenario12"
+mkdir -p "$S12_DIR"
+S12_LOG="$HOME_DIR/windows/$S12_WU.jsonl"
+S12_BASE=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
+
+# (a) First save — no prev snapshot in this dir → no diff → no event.
+S12_T1="$S12_DIR/tmux_resurrect_20260101T000001.txt"
+write_fake_snap "$S12_T1" "alpha"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_T1"
 sleep 1
-S12_A_NAME="$(basename "$S12_SRVA")"
-S12_B_NAME="$(basename "$S12_SRVB")"
-[ -d "$HOME_DIR/cache/tmp/last-pane-state/$S12_A_NAME" ] && S12_A=present || S12_A=absent
-[ -d "$HOME_DIR/cache/tmp/last-pane-state/$S12_B_NAME" ] && S12_B=present || S12_B=absent
-assert "scenario 12a: snapshot dir for server A is created under its server name" "present" "$S12_A"
-assert "scenario 12b: snapshot dir for server B is created under its server name" "present" "$S12_B"
-# Top-level state files should NOT be created — that's the pre-fix layout.
-S12_TOP_LEAK=$(find "$HOME_DIR/cache/tmp/last-pane-state" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
-assert "scenario 12c: no top-level dedupe files (per-server isolation holds)" "0" "$S12_TOP_LEAK"
+S12_AFTER1=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
+assert "scenario 12a: first save (no prev) emits no title event" "$S12_BASE" "$S12_AFTER1"
+
+# (b) Second save with changed title — exactly one new title event.
+sleep 1  # ensure mtime ordering for the prev-lookup
+S12_T2="$S12_DIR/tmux_resurrect_20260101T000002.txt"
+write_fake_snap "$S12_T2" "beta"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_T2"
+sleep 1
+S12_AFTER2=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
+S12_DELTA2=$((S12_AFTER2 - S12_AFTER1))
+assert "scenario 12b: changed title emits exactly one event" "1" "$S12_DELTA2"
+# Verify the emitted title is the new one.
+S12_LAST_TITLE=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | tail -1 | jq -r '.title')
+assert "scenario 12b: emitted title is the new value" "beta" "$S12_LAST_TITLE"
+
+# (c) Third save with unchanged title — no new event.
+sleep 1
+S12_T3="$S12_DIR/tmux_resurrect_20260101T000003.txt"
+write_fake_snap "$S12_T3" "beta"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_T3"
+sleep 1
+S12_AFTER3=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
+S12_DELTA3=$((S12_AFTER3 - S12_AFTER2))
+assert "scenario 12c: unchanged title emits no new event" "0" "$S12_DELTA3"
+
+# (d) A sibling resurrect-dir's snapshot does not become the prev for this dir.
+S12_OTHER="$HOME_DIR/resurrect-scenario12-other"
+mkdir -p "$S12_OTHER"
+S12_OT1="$S12_OTHER/tmux_resurrect_20260101T000010.txt"
+write_fake_snap "$S12_OT1" "from-other-server"
+# Touch the other dir's snapshot to a NEWER mtime than this dir's latest.
+touch "$S12_OT1"
+sleep 1
+S12_T4="$S12_DIR/tmux_resurrect_20260101T000004.txt"
+write_fake_snap "$S12_T4" "beta"   # still "beta"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_T4"
+sleep 1
+S12_AFTER4=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
+S12_DELTA4=$((S12_AFTER4 - S12_AFTER3))
+assert "scenario 12d: sibling resurrect-dir snapshots don't pollute prev-lookup" "0" "$S12_DELTA4"
 
 # ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
