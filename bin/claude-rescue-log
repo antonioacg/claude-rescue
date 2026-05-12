@@ -434,7 +434,18 @@ cmd_resurrect_save() {
   mv "$sidecar.tmp" "$sidecar"
 
   # 2. Per-pane sample — emit title transitions and detect pane death.
-  local snapshot_dir="$CLAUDE_RESCUE_CACHE_HOME/tmp/last-pane-state"
+  #
+  # Snapshot dir is per-server. Without this, two tmux servers (e.g. main +
+  # staging, or main + a per-task operator server) share `_<N>.last` files
+  # keyed only by sanitized pane_id `%N`. Both servers' pane %0 race to write
+  # the same file: server A reads B's title, sees "different", emits an event,
+  # writes its own; server B does the reverse next tick. Net result: every
+  # tick on every server emits an event regardless of whether the title
+  # actually changed, even on long-stable panes. Mirrors @resurrect-dir's
+  # per-server scheme (state_file lives in $resurrect_dir/.../tmux_resurrect_*.txt,
+  # so its dirname IS the per-server resurrect dir).
+  local server_name="$(basename "$(dirname "$state_file")")"
+  local snapshot_dir="$CLAUDE_RESCUE_CACHE_HOME/tmp/last-pane-state/$server_name"
   mkdir -p "$snapshot_dir"
   local current_panes_file="$snapshot_dir/.current-panes"
   : > "$current_panes_file"

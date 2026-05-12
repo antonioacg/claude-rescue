@@ -322,6 +322,34 @@ sleep 1
 assert "scenario 11d: resurrect-restore bulk-clears active dir" "absent" "$S11_ORPHAN_STATE"
 
 # ---------------------------------------------------------------------------
+# Regression: the title-sample dedupe state under
+# $CACHE/tmp/last-pane-state/<pane_id_sanitized>.last must be per-server.
+# Without that, two tmux servers (e.g. main + staging, or main + a per-task
+# operator server) share `_N.last` keyed only by sanitized `%N`: server A
+# writes its title, server B reads it, sees "different", emits an event,
+# writes its own. Every tick on every server emits an event, regardless of
+# whether the title changed. Caught in prod after spotting 100s of identical
+# title events in a 1-pane window's log.
+echo "[scenario 12] resurrect-save snapshot dir is per-server"
+S12_SRVA="$HOME_DIR/resurrect-scenario12-A"
+S12_SRVB="$HOME_DIR/resurrect-scenario12-B"
+mkdir -p "$S12_SRVA" "$S12_SRVB"
+echo "fake" > "$S12_SRVA/tmux_resurrect_test.txt"
+echo "fake" > "$S12_SRVB/tmux_resurrect_test.txt"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_SRVA/tmux_resurrect_test.txt"
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-save $S12_SRVB/tmux_resurrect_test.txt"
+sleep 1
+S12_A_NAME="$(basename "$S12_SRVA")"
+S12_B_NAME="$(basename "$S12_SRVB")"
+[ -d "$HOME_DIR/cache/tmp/last-pane-state/$S12_A_NAME" ] && S12_A=present || S12_A=absent
+[ -d "$HOME_DIR/cache/tmp/last-pane-state/$S12_B_NAME" ] && S12_B=present || S12_B=absent
+assert "scenario 12a: snapshot dir for server A is created under its server name" "present" "$S12_A"
+assert "scenario 12b: snapshot dir for server B is created under its server name" "present" "$S12_B"
+# Top-level state files should NOT be created — that's the pre-fix layout.
+S12_TOP_LEAK=$(find "$HOME_DIR/cache/tmp/last-pane-state" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+assert "scenario 12c: no top-level dedupe files (per-server isolation holds)" "0" "$S12_TOP_LEAK"
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"
