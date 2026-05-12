@@ -414,16 +414,20 @@ cat ~/.local/share/claude-rescue/.backfill-done
 
 Expect: window count in the dozens (one window per `(session_name, cwd)`
 that ever appeared in a saved snapshot), total size in the low hundreds
-of KB, marker at "now-ish". Each row from `list-windows` should have a
-plausible `cwd` and a `last_title` that reads like a real claude task.
+of KB, marker set to the timestamp of the newest snapshot processed (so
+"now-ish" only if the live server has saved a snapshot recently). Each
+row from `list-windows` should have a plausible `cwd` and a `last_title`
+that reads like a real claude task.
 
 **If you also want history from non-`default` resurrect dirs** (e.g. a
-long-running staging server with meaningful sessions), re-run pointing at
-each one. The marker is shared across runs, so it gets bumped each time
-— that's fine because the snapshots in different resurrect-dirs don't
-share timestamps anyway. Example:
+long-running staging server with meaningful sessions), re-run pointing
+at each one. **Reset the marker before each subsequent run** —
+snapshot timestamps are absolute wall-clock, so after the first run's
+marker is set to `default`'s newest, all of `staging`'s older snapshots
+would be silently filtered out:
 
 ```bash
+rm -f ~/.local/share/claude-rescue/.backfill-done
 CLAUDE_RESCUE_RESURRECT_DIR=~/.local/share/tmux/resurrect/staging \
   ~/.local/bin/claude-rescue-backfill
 ```
@@ -687,21 +691,25 @@ several other code paths run in the first minutes:
   wc -l ~/.local/share/claude-rescue/windows/*.jsonl | tail -1
   ```
 
-  Expected delta over 10 min of normal use: low single-digits to low
-  dozens of new lines per active window — a `session_start` per fresh
-  prompt, a handful of `title` events for real spinner-glyph-stripped
-  title changes, no per-minute heartbeat noise. **If you see ~10
-  events/minute/pane**, the snapshot-diff path isn't deduping correctly
-  — most likely cause is another tmux server on this machine sharing the
-  `$CACHE` dir (the pre-fix bug). Verify with:
+  Expected pattern: a `session_start` per fresh claude session (every
+  `startup` / `resume` / `clear` / `compact`), one `title` event whenever
+  a pane's saved `pane_title` byte-differs from the previous snapshot's
+  (claude's status glyph plus task description). Idle panes whose
+  scrollback is unchanged produce zero events — tmux-resurrect's
+  `cmp -s` against `last` deletes the byte-identical new snapshot, so
+  the next snapshot diffs against an older surviving one with the same
+  title and emits nothing. Actively-spinning panes whose status glyph
+  cycles (`✳ → ⠐ → ⠂`) will emit one title event per save tick they're
+  spinning; this is correct, not noise.
 
-  ```bash
-  ls /private/tmp/tmux-$(id -u)/   # one socket per active server
-  ```
-
-  Also confirm `~/.cache/claude-rescue/tmp/last-pane-state/` does **not**
-  exist or is empty — that directory was the pre-fix dedupe layout and
-  the new code doesn't create it. Re-appearance is a regression signal.
+  **The regression signal is**: many *byte-identical* events emitted for
+  the same `(pane_uuid, title)` pair within a short window (look for
+  consecutive same-content rows in any one `windows/*.jsonl`). That's
+  the pre-fix shape — snapshot-diff doesn't produce duplicates when
+  working correctly. Also confirm
+  `~/.cache/claude-rescue/tmp/last-pane-state/` does **not** exist —
+  that directory was the pre-fix dedupe layout and the new code doesn't
+  create it. Re-appearance is a regression signal.
 
 ## 7. Rollback (only if step 5 or 6 reveals a real problem)
 
