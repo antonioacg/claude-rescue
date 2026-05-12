@@ -551,7 +551,7 @@ attached terminal — same result:
   Should list all four.
 - **No errors in the rescue logs.**
   ```bash
-  tail -n 50 ~/.claude-rescue/rescue-log.err 2>/dev/null
+  tail -n 50 ~/.cache/claude-rescue/rescue-log.err 2>/dev/null
   tail -n 50 ~/.cache/claude-rescue/hibernate.err 2>/dev/null
   ```
   Both empty or only old timestamps.
@@ -675,9 +675,28 @@ several other code paths run in the first minutes:
   `~/.cache/claude-rescue/busy/` and refresh on each tool call.
 - `client-session-changed` fires when you switch sessions — should be a
   no-op for already-armed panes.
+- **Event log grows sanely**, not explosively. Right after step 4f the log
+  is a clean baseline (counts captured then). Snapshot 10 min later:
 
-If any of these misbehave: see [hibernation.md](./hibernation.md) for the
-model and [staging.md](./staging.md) for reproduction recipes.
+  ```bash
+  wc -l ~/.local/share/claude-rescue/windows/*.jsonl | tail -1
+  ```
+
+  Expected delta over 10 min of normal use: low single-digits to low
+  dozens of new lines per active window — a `session_start` per fresh
+  prompt, a handful of `title` events for real spinner-glyph-stripped
+  title changes, no per-minute heartbeat noise. **If you see ~10
+  events/minute/pane**, the snapshot-diff path isn't deduping correctly
+  — most likely cause is another tmux server on this machine sharing the
+  `$CACHE` dir (the pre-fix bug). Verify with:
+
+  ```bash
+  ls /private/tmp/tmux-$(id -u)/   # one socket per active server
+  ```
+
+  Also confirm `~/.cache/claude-rescue/tmp/last-pane-state/` does **not**
+  exist or is empty — that directory was the pre-fix dedupe layout and
+  the new code doesn't create it. Re-appearance is a regression signal.
 
 ## 7. Rollback (only if step 5 or 6 reveals a real problem)
 
