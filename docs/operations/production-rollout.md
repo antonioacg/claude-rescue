@@ -12,13 +12,13 @@ captured in step 1 is the manual fallback for that step. Step 4f
 post-restore observability check a clean baseline to read against.
 
 > Assumes the machine starts in the same shape as the first Mac at rollout
-> time: chezmoi `feat/claude-rescue-prod-deploy` checked out (or merged to
-> main), claude-rescue `feat/hook-driven-identity` checked out (or merged
-> to main), live tmux server has the *pre-rollout* config loaded, symlinks
-> in `~/.local/bin/` already point at the repo.
+> time: both repos pulled to the latest `main`, live tmux server still
+> running the *pre-rollout* config (chezmoi apply hasn't been run for the
+> new commits yet), symlinks in `~/.local/bin/` already point at the
+> claude-rescue repo.
 >
-> **What `feat/hook-driven-identity` ships** (for a second Mac that's still
-> on `main`, all of this lands together when the branch merges):
+> **What this rollout brings** (for a second Mac whose live tmux still
+> reflects pre-rollout state, all of this lands together on `chezmoi apply`):
 > - **Hibernation + capture/print** — soft (Ctrl+Z) and hard (`/exit`) pane
 >   suspension, focus-driven arm-sweep, scrollback capture at hibernate time.
 > - **Hook-driven identity** — `$DATA/active/<pane_uuid>` holds the current
@@ -33,6 +33,31 @@ post-restore observability check a clean baseline to read against.
 >   share one code path (snapshot-diff over `tmux_resurrect_*.txt`). No more
 >   per-pane filesystem dedupe state, no cross-server cache collision. Step
 >   4f rebuilds the event log from scratch off this single source of truth.
+> - **XDG-compliant hook stderr + dir pre-create** (chezmoi side) — Claude
+>   Code hooks now write stderr to `${XDG_CACHE_HOME:-$HOME/.cache}/claude-rescue/`,
+>   and a chezmoiscript ensures the dir exists before apply. Fixes the
+>   first-run "SessionStart hook error: No such file" the second Mac saw.
+
+## 0. Pre-flight: pull both repos, confirm tips
+
+Before any other step. Verifies you have what this runbook expects.
+
+```bash
+cd ~/.local/share/chezmoi
+git pull --ff-only origin main
+
+cd ~/dev/claude-rescue
+git pull --ff-only origin main
+
+# Sanity: both tips should match what's on origin/main.
+echo "chezmoi:       $(cd ~/.local/share/chezmoi && git rev-parse --short HEAD) == $(cd ~/.local/share/chezmoi && git rev-parse --short origin/main)"
+echo "claude-rescue: $(cd ~/dev/claude-rescue && git rev-parse --short HEAD)    == $(cd ~/dev/claude-rescue && git rev-parse --short origin/main)"
+```
+
+If `git pull --ff-only` refuses on either repo (non-fast-forward), STOP
+and investigate — local main has diverged from origin, which means
+either a stale local commit needs rebasing or someone force-pushed.
+This runbook assumes a clean fast-forward state.
 
 ---
 
@@ -151,21 +176,6 @@ Expected changes:
   staging server).
 - Other deltas your dotfiles happen to have. Inspect; nothing unexpected
   should be in the diff scoped to this rollout.
-
-> **If the second Mac's chezmoi is currently on `main`** (it was at the
-> time of the 2026-05-11 rollout on the first Mac), merge the entire
-> `feat/claude-rescue-prod-deploy` branch — don't cherry-pick subsets.
-> The five commits on that branch all ship together:
->
-> 1. `feat(tmux): swap claude-restore.sh → claude-rescue-resume, fix hook order`
-> 2. `feat(claude-rescue): wire busy hooks; install.sh moved to scripts/`
-> 3. `fix(tmux): @resurrect-processes — drop tilde from claude pattern`
-> 4. `fix(tmux): rescue.tmux.conf source-file path — use $HOME, not ~`
-> 5. `feat(tmux): wire prefix+R picker keybind for claude-rescue`
->
-> (Subjects are listed instead of SHAs because rebasing onto main
-> rewrites SHAs; subjects don't change. Find them in your local clone
-> with `git log --oneline origin/main..feat/claude-rescue-prod-deploy`.)
 
 If you see anything surprising, stop and investigate.
 

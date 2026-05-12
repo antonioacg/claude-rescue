@@ -429,15 +429,17 @@ assert "install.sh dry-run accounts for all binaries" "$EXPECTED_BINS" "$DR"
 # eats the error), leaving all hooks unset. Prod rollout hit this and
 # burned a diagnostic loop.
 #
-# Scan both the applied configs AND the chezmoi source (if present), so
-# the bug is caught BEFORE chezmoi apply renders it onto disk. Either
-# location existing without the other is fine (fresh-checkout machines
-# have no chezmoi; non-managed machines have no chezmoi source).
+# When chezmoi source is present, scan ONLY that — it's the source of
+# truth that the next `chezmoi apply` will deploy. Scanning the live
+# ~/.tmux.conf in addition produced a false positive on pre-rollout
+# machines: the chezmoi source is fixed but the live config is still
+# the older buggy version because the operator hasn't run apply yet.
+# That tripped this check at runbook step 2 (before step 4's apply),
+# making the runbook's own validate gate unreachable. Falling back to
+# live configs when there's no chezmoi (unmanaged machines).
 echo "[tmux-conf] source-file directives don't rely on tilde expansion"
 shopt -s globstar nullglob
 TMUX_SCAN_PATHS=()
-[ -f "$HOME/.tmux.conf" ] && TMUX_SCAN_PATHS+=("$HOME/.tmux.conf")
-[ -d "$HOME/.config/tmux" ] && TMUX_SCAN_PATHS+=( "$HOME"/.config/tmux/**/*.conf "$HOME"/.config/tmux/**/*.tmux )
 CHEZMOI_SRC="$HOME/.local/share/chezmoi"
 if [ -d "$CHEZMOI_SRC" ]; then
   [ -f "$CHEZMOI_SRC/dot_tmux.conf" ]      && TMUX_SCAN_PATHS+=("$CHEZMOI_SRC/dot_tmux.conf")
@@ -450,6 +452,10 @@ if [ -d "$CHEZMOI_SRC" ]; then
       "$CHEZMOI_SRC"/dot_config/tmux/**/*.tmux.tmpl
     )
   fi
+else
+  # Unmanaged machine — scan whatever's live.
+  [ -f "$HOME/.tmux.conf" ] && TMUX_SCAN_PATHS+=("$HOME/.tmux.conf")
+  [ -d "$HOME/.config/tmux" ] && TMUX_SCAN_PATHS+=( "$HOME"/.config/tmux/**/*.conf "$HOME"/.config/tmux/**/*.tmux )
 fi
 shopt -u globstar nullglob
 
