@@ -364,6 +364,78 @@ awk -F'\t' '$7=="claude" && $9==""' "$LATEST/tmux-panes.tsv" | wc -l
 Expect `0` (or whatever count of skipped panes you accepted in 4c).
 This dump is the manual-restore fallback for step 5.
 
+## 4f. Rebuild the event log from resurrect snapshots
+
+Why this step exists: as of the snapshot-diff unification, live title
+sampling and `claude-rescue-backfill` share the same code path
+(snapshot-diff over `tmux_resurrect_*.txt`). The prior implementation
+kept a `.last` dedupe file per pane under
+`$CACHE/tmp/last-pane-state/_<N>.last`, keyed only by sanitized `%N`. Any
+second tmux server on the same machine (staging, a per-task operator
+server, an old detached `tmux -L something-else`) raced with the main
+server for the same file, and both emitted title events every save tick
+even on completely stable panes. The polluted event log can be 50–200×
+the volume it should be, with multi-event-per-minute spam in long-lived
+windows. Operator on the first rollout observed it as ~480 identical-title
+events per session in the picker preview.
+
+Rebuilding from snapshots gives a clean baseline. The snapshot files are
+the source of truth (they're what would be replayed on restore), and
+`claude-rescue-backfill` walks them with the same dedupe algorithm the
+live code uses going forward. Doing this before kill-server means
+step 5's verify pass reads a clean event log.
+
+```bash
+# 1. Wipe the polluted event logs.
+rm -rf ~/.local/share/claude-rescue/windows/
+
+# 2. Reset the backfill marker so it processes every snapshot.
+rm -f ~/.local/share/claude-rescue/.backfill-done
+
+# 3. Drop the now-unused last-pane-state cache (the pre-fix dedupe layout).
+rm -rf ~/.cache/claude-rescue/tmp/last-pane-state/
+
+# 4. Rebuild from the default server's snapshot history.
+~/.local/bin/claude-rescue-backfill
+
+# 5. Sanity: window count + total size are both modest, marker is fresh.
+find ~/.local/share/claude-rescue/windows -name '*.jsonl' | wc -l
+du -sh ~/.local/share/claude-rescue/windows
+cat ~/.local/share/claude-rescue/.backfill-done
+
+# 6. Picker spot-check (no popup needed):
+~/.local/bin/claude-rescue list-windows | head -5
+```
+
+Expect: window count in the dozens (one window per `(session_name, cwd)`
+that ever appeared in a saved snapshot), total size in the low hundreds
+of KB, marker at "now-ish". Each row from `list-windows` should have a
+plausible `cwd` and a `last_title` that reads like a real claude task.
+
+**If you also want history from non-`default` resurrect dirs** (e.g. a
+long-running staging server with meaningful sessions), re-run pointing at
+each one. The marker is shared across runs, so it gets bumped each time
+— that's fine because the snapshots in different resurrect-dirs don't
+share timestamps anyway. Example:
+
+```bash
+CLAUDE_RESCUE_RESURRECT_DIR=~/.local/share/tmux/resurrect/staging \
+  ~/.local/bin/claude-rescue-backfill
+```
+
+What this step doesn't do: nothing here touches live tmux state. The
+@claude-pane-id options from step 4c stay put, and any active claude
+session that emits a `session_start` event after this point gets a
+fresh real-uuid window log alongside the `bf-<hash>` ones from backfill.
+
+What you lose vs. the old log: discrete `session_start` / `session_end`
+events from Claude Code hooks (replaced by `session_start_backfill`
+events derived from `-r <sid>` flags in saved cmdlines), and exact
+source attribution (`startup` / `resume` / `clear` / `compact`). The
+picker treats both kinds equivalently, so this is invisible in normal
+use. The wins are 50–200× fewer events to scroll, a single dedupe
+algorithm to reason about, and correct counts in window previews.
+
 ## 5. Final validation — restart the tmux server
 
 This is the load-bearing step. We deliberately kill the live server so
