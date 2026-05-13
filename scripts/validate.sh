@@ -312,14 +312,18 @@ assert "scenario 11c: SessionEnd clears active file" "absent" "$S11_AFTER"
 S11_PUUID_AFTER=$(tmux -L "$SOCK" show-options -pv -t "$S11_P" @claude-pane-id 2>/dev/null)
 assert "scenario 11c: SessionEnd preserves @claude-pane-id" "$S11_PUUID" "$S11_PUUID_AFTER"
 
-# (d) resurrect-restore bulk-clears the active dir.
+# (d) resurrect-restore PRESERVES active files. The truthful "which session
+# is loaded" set by SessionStart hooks (keyed by durable pane_uuid) is the
+# only signal that survives stale saved -r (set at launch, never updated on
+# in-process /resume) and stale event-log meta. Orphans for vanished
+# pane_uuids are harmless because the wrapper only queries by live pane_uuid.
 mkdir -p "$HOME_DIR/active"
 S11_ORPHAN="orphan-puuid-$$-$(date +%s)"
 touch "$HOME_DIR/active/$S11_ORPHAN"
 tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-restore"
 sleep 1
 [ -f "$HOME_DIR/active/$S11_ORPHAN" ] && S11_ORPHAN_STATE=present || S11_ORPHAN_STATE=absent
-assert "scenario 11d: resurrect-restore bulk-clears active dir" "absent" "$S11_ORPHAN_STATE"
+assert "scenario 11d: resurrect-restore preserves active dir" "present" "$S11_ORPHAN_STATE"
 
 # ---------------------------------------------------------------------------
 # resurrect-save now diffs the new snapshot against the previous one (same
@@ -407,6 +411,116 @@ sleep 1
 S12_AFTER4=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 S12_DELTA4=$((S12_AFTER4 - S12_AFTER3))
 assert "scenario 12d: sibling resurrect-dir snapshots don't pollute prev-lookup" "0" "$S12_DELTA4"
+
+# ---------------------------------------------------------------------------
+# Snapshot-race lock: continuum's status-bar-interval save can fire DURING
+# tmux-resurrect's restore window, capturing partial state and rotating
+# `last` to point at it. The next `cmd_resurrect_restore` reads the new
+# `last`, finds either no sidecar or one written before @claude-pane-id was
+# set, and bails — @claude-pane-id never re-applies. We close that window
+# with a `.restoring` lock file:
+#   pre-restore-all hook creates it
+#   save-guarded.sh bails if it exists
+#   post-restore-all hook removes it
+echo "[scenario 13] snapshot-race lock prevents save during restore"
+
+S13_DIR="$HOME_DIR/resurrect-scenario13"
+mkdir -p "$S13_DIR"
+
+# Point @resurrect-dir at the fake dir so our hooks find the right lock path.
+tmux -L "$SOCK" set-option -g @resurrect-dir "$S13_DIR"
+
+# (a) pre-restore-all creates the lock.
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-pre-restore-all"
+sleep 1
+[ -f "$S13_DIR/.restoring" ] && S13_LOCK_A=present || S13_LOCK_A=absent
+assert "scenario 13a: pre-restore-all creates .restoring lock" "present" "$S13_LOCK_A"
+
+# (b) save-guarded.sh bails when the lock exists. We mock the inner save
+# script with a sentinel that writes a marker file; if save-guarded calls
+# through, the marker appears. With the lock present, it must NOT appear.
+# Propagate the override via `tmux set-environment` — env vars set in the
+# calling shell do NOT cross tmux's run-shell boundary.
+S13_MARKER="$S13_DIR/save-was-called"
+S13_MOCK="$HOME_DIR/mock-save.sh"
+cat > "$S13_MOCK" <<EOF
+#!/bin/sh
+touch "$S13_MARKER"
+EOF
+chmod +x "$S13_MOCK"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_RESURRECT_SAVE "$S13_MOCK"
+
+rm -f "$S13_MARKER"
+tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
+sleep 1
+[ -f "$S13_MARKER" ] && S13_RAN_LOCKED=ran || S13_RAN_LOCKED=bailed
+assert "scenario 13b: save-guarded.sh bails when lock present" "bailed" "$S13_RAN_LOCKED"
+
+# (c) post-restore-all removes the lock.
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log resurrect-post-restore-all"
+sleep 1
+[ -f "$S13_DIR/.restoring" ] && S13_LOCK_C=present || S13_LOCK_C=absent
+assert "scenario 13c: post-restore-all removes .restoring lock" "absent" "$S13_LOCK_C"
+
+# (d) save-guarded.sh runs through when the lock is gone.
+rm -f "$S13_MARKER"
+tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
+sleep 1
+[ -f "$S13_MARKER" ] && S13_RAN_UNLOCKED=ran || S13_RAN_UNLOCKED=bailed
+assert "scenario 13d: save-guarded.sh runs when lock absent" "ran" "$S13_RAN_UNLOCKED"
+tmux -L "$SOCK" set-environment -gu CLAUDE_RESCUE_RESURRECT_SAVE
+
+# Reset @resurrect-dir to the test fixture's default for downstream scenarios.
+tmux -L "$SOCK" set-option -g @resurrect-dir "$HOME_DIR/resurrect-default"
+
+# ---------------------------------------------------------------------------
+# Wrapper resolution: find-sessions must run even when the saved tmux-resurrect
+# cmdline still has `-r <stale_sid>` in argv. Pre-fix the wrapper gated the
+# find-sessions block behind "no existing -r", so any /resume'd pane silently
+# resumed the original pre-/resume session (P3 won over P2). We removed both
+# the gate AND the P3 fallback — the wrapper now goes active → find-sessions
+# → fresh, and the saved -r is stripped from final_args but never used as a
+# resume target.
+echo "[scenario 14] wrapper resolves via find-sessions with stale -r in argv"
+
+# Set up a pane with @claude-pane-id pointing at a window whose meta has a
+# known session_id. Clear the active file so P1 misses; the only path left
+# that can produce a target_uuid is P2 (find-sessions).
+tmux -L "$SOCK" new-window -t t1
+S14_P=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S14_P"
+SID14=$(uuidgen|tr A-Z a-z)
+STALE14=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S14_P" "$SID14" "/tmp/s14" startup
+sleep 2
+S14_PUUID=$(tmux -L "$SOCK" show-options -pv -t "$S14_P" @claude-pane-id)
+# Drop the active file written by SessionStart so P1 can't satisfy the lookup.
+rm -f "$HOME_DIR/active/$S14_PUUID"
+
+# Create a transcript on disk for find-sessions's existence filter to pass.
+S14_PROJECTS="$HOME_DIR/projects"
+S14_ENC="$(printf '%s' /tmp/s14 | tr '/.' '--')"
+mkdir -p "$S14_PROJECTS/$S14_ENC"
+touch "$S14_PROJECTS/$S14_ENC/$SID14.jsonl"
+
+# Run the wrapper in debug mode with a STALE -r argv. The output's "resume
+# target" line tells us which sid won. Pre-fix: target = STALE14. Post-fix:
+# target = SID14 (from find-sessions, ignoring argv).
+#
+# The wrapper uses bare `tmux` to read @claude-pane-id, which defaults to
+# the system socket. Point it at the test server by setting $TMUX explicitly
+# (the format tmux's clients use internally: socket_path,server_pid,-1).
+S14_TMUX="$(tmux -L "$SOCK" display-message -p '#{socket_path},#{pid},-1')"
+S14_OUTPUT=$(
+  TMUX="$S14_TMUX" \
+  TMUX_PANE="$S14_P" \
+  CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" \
+  CLAUDE_PROJECTS_DIR="$S14_PROJECTS" \
+  bash "$REPO/bin/claude-rescue-resume" --debug \
+    --add-dir /tmp -r "$STALE14" 2>&1 < /dev/null
+)
+S14_TARGET=$(printf '%s\n' "$S14_OUTPUT" | awk -F': ' '/resume target/{gsub(/ .*$/,"",$2); print $2}')
+assert "scenario 14: wrapper uses find-sessions sid, not stale -r" "$SID14" "$S14_TARGET"
 
 # ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
