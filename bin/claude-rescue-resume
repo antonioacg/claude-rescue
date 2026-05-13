@@ -146,7 +146,7 @@ fi
 # session for this pane_uuid that has a transcript on disk.
 found_sid=""
 found_cwd=""
-if [ -z "$active_sid" ] && [ -z "$existing_uuid" ] && [ -n "$pane_uuid" ]; then
+if [ -z "$active_sid" ] && [ -n "$pane_uuid" ]; then
   # `--open-only` is intentionally NOT used: it filters by absence of a
   # session_end event, but a SIGKILL'd claude leaves the session "open" in
   # our log without a transcript. find-sessions already filters to sessions
@@ -168,17 +168,20 @@ fi
 #   2. find-sessions lookup result — derived from the append-only event log,
 #      keyed by the durable pane_uuid (fallback when the active file was
 #      cleared by SessionEnd or never written)
-#   3. UUID stripped from the saved -r/--resume args (fallback for legacy
-#      data that pre-dates pane_uuid attribution)
-#   4. None — exec claude without -r, starting a fresh session
+#   3. None — exec claude without -r, starting a fresh session
+#
+# Saved -r in the tmux-resurrect cmdline is intentionally NOT a fallback.
+# It's set at claude launch and never updated when the user does an in-claude
+# /resume — so trusting it silently resumes the wrong (pre-/resume) session,
+# corrupting on-disk transcripts if both sessions are still live elsewhere.
+# We parse existing_uuid above only to (a) strip it from final_args so it
+# can't be passed through, and (b) surface it in debug output for diagnosis.
 final_args=("$@")
 target_uuid=""
 if [ -n "$active_sid" ]; then
   target_uuid="$active_sid"
 elif [ -n "$found_sid" ]; then
   target_uuid="$found_sid"
-elif [ -n "$existing_uuid" ]; then
-  target_uuid="$existing_uuid"
 fi
 if [ -n "$target_uuid" ]; then
   final_args+=(-r "$target_uuid")

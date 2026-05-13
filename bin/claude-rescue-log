@@ -541,6 +541,41 @@ cmd_resurrect_save() {
   rm -f "$touched_windows"
 }
 
+cmd_resurrect_pre_restore_all() {
+  # Hooked into tmux-resurrect via @resurrect-hook-pre-restore-all — the
+  # earliest restore hook tmux-resurrect fires. Creates a `.restoring`
+  # lock file in the resurrect dir so save-guarded.sh (wired via
+  # @resurrect-save-script-path) bails on any save attempt during restore.
+  # Without this lock, tmux-continuum's status-bar-interval save can fire
+  # mid-restore, capture partial state (panes still in send-keys handoff,
+  # claude argv empty), rotate `last` to point at it, and break the
+  # @claude-pane-id reapply path in cmd_resurrect_restore — every pane
+  # then falls back to saved -r without the sidecar.
+  local resurrect_dir
+  resurrect_dir="$(tmux show-options -gv @resurrect-dir 2>/dev/null || true)"
+  if [ -z "$resurrect_dir" ]; then
+    resurrect_dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+    [ -d "$resurrect_dir" ] || resurrect_dir="$HOME/.tmux/resurrect"
+  fi
+  mkdir -p "$resurrect_dir" 2>/dev/null || true
+  : > "$resurrect_dir/.restoring"
+  log_err "resurrect-pre-restore-all: created lock at $resurrect_dir/.restoring"
+}
+
+cmd_resurrect_post_restore_all() {
+  # Hooked into tmux-resurrect via @resurrect-hook-post-restore-all — fires
+  # AFTER all panes have been restored and their send-keys phase is done.
+  # Removes the `.restoring` lock so subsequent saves proceed normally.
+  local resurrect_dir
+  resurrect_dir="$(tmux show-options -gv @resurrect-dir 2>/dev/null || true)"
+  if [ -z "$resurrect_dir" ]; then
+    resurrect_dir="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
+    [ -d "$resurrect_dir" ] || resurrect_dir="$HOME/.tmux/resurrect"
+  fi
+  rm -f "$resurrect_dir/.restoring"
+  log_err "resurrect-post-restore-all: removed lock at $resurrect_dir/.restoring"
+}
+
 cmd_resurrect_restore() {
   # Hooked into tmux-resurrect via @resurrect-hook-pre-restore-pane-processes.
   # Re-applies @claude-window-id and @claude-pane-id from the sidecar TSV.
@@ -625,11 +660,15 @@ cmd_resurrect_restore() {
   # Stale arm pid files refer to processes from the dead server.
   rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid
 
-  # Stale active-session files refer to claude processes that died with the
-  # server. Restored panes are about to run claude-rescue-resume → SessionStart,
-  # which writes a fresh active file. Clear the directory rather than leave
-  # entries pointing at sessions whose pane_uuid mapping may have shifted.
-  rm -f "$CLAUDE_RESCUE_DATA_HOME"/active/*
+  # Preserve active/<pane_uuid> files across kill-server: they carry the
+  # truthful "which session is loaded" set by SessionStart hooks (including
+  # in-claude /resume), keyed by the durable pane_uuid that the sidecar
+  # reapplies. The wrapper resolves priority-1 from these files, which is
+  # the only signal that survives both stale saved -r (set at launch, never
+  # updated on in-process /resume) and stale event-log meta (started field
+  # frozen at first session_start). On the next SessionStart post-restore,
+  # each file is overwritten in place; orphaned entries for vanished
+  # pane_uuids are harmless (the wrapper only queries by live pane_uuid).
 
   # === Post-restore UX: for each pane with a hard-hibernation marker AND no
   # live claude process, run `claude-rescue print` (shows the captured
@@ -1179,8 +1218,10 @@ case "$cmd" in
   client-detached)    cmd_client_detached "$@" ;;
   hibernated)         cmd_hibernated "$@" ;;
   unhibernated)       cmd_unhibernated "$@" ;;
-  resurrect-save)     cmd_resurrect_save "$@" ;;
-  resurrect-restore)  cmd_resurrect_restore "$@" ;;
+  resurrect-save)             cmd_resurrect_save "$@" ;;
+  resurrect-restore)          cmd_resurrect_restore "$@" ;;
+  resurrect-pre-restore-all)  cmd_resurrect_pre_restore_all "$@" ;;
+  resurrect-post-restore-all) cmd_resurrect_post_restore_all "$@" ;;
   hibernate-arm)      cmd_hibernate_arm "$@" ;;
   hibernate-resume)   cmd_hibernate_resume "$@" ;;
   arm-sweep)          cmd_arm_sweep "$@" ;;
