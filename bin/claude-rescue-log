@@ -1161,15 +1161,31 @@ cmd_arm_sweep() {
     # drop active-session file, unset @claude-pane-id.
     #
     # Guards (any one → skip cleanup):
-    #   - busy marker present: claude is transiently invisible from
-    #     pane_current_command (e.g. spawned a tool subprocess like a wrapper).
+    #   - claude process alive as a direct child of pane_pid: claude is
+    #     still running but transiently delegating pane_current_command to
+    #     a tool subprocess (Bash, etc.). pgrep -x ensures comm=="claude"
+    #     exactly, so something incidentally containing "claude" in argv
+    #     doesn't false-positive. This guard fires on the race we observed
+    #     on the 2026-05-12 rollout follow-up: %10 (merge-http-client) had
+    #     its @claude-pane-id wiped by arm-sweep mid-tool-exec, with no
+    #     hibernation marker and no busy marker, despite claude being very
+    #     much alive a few PIDs deeper than pane_current_command revealed.
+    #   - busy marker present: claude itself signaled it's about to exec a
+    #     subprocess. Independent of the pgrep check — the marker is set
+    #     by Claude Code hooks before pane_current_command flips.
     #   - hibernation marker present: soft means claude is Ctrl+Z'd (T state,
     #     pane_current_command reports the shell, but the arm subshell is
     #     load-bearing for the hard escalation). Hard means claude really
     #     exited, but the marker is the crash-restore insurance that survives
     #     until cmd_session_start cleans it — don't unset puuid out from under
     #     it (the marker is keyed by puuid).
+    # Note on the pgrep arg order: BSD pgrep (macOS) stops parsing options
+    # at the first non-option arg (the pattern). `pgrep -x claude -P PID`
+    # treats `-P PID` as an additional pattern, NOT as the -P selector —
+    # effectively returning every claude process system-wide. Always put
+    # selectors BEFORE the pattern. See `man pgrep` synopsis.
     if [ "$cur_cmd" != "claude" ] \
+       && ! pgrep -P "$pane_pid" -x claude >/dev/null 2>&1 \
        && ! is_busy "$puuid" \
        && [ ! -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json" ]; then
       san="${pane_id//[^A-Za-z0-9]/_}"

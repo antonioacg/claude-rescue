@@ -523,6 +523,67 @@ S14_TARGET=$(printf '%s\n' "$S14_OUTPUT" | awk -F': ' '/resume target/{gsub(/ .*
 assert "scenario 14: wrapper uses find-sessions sid, not stale -r" "$SID14" "$S14_TARGET"
 
 # ---------------------------------------------------------------------------
+# arm-sweep voluntary-exit detection has a guard against the case where
+# claude is alive in the pane's process tree but pane_current_command is
+# momentarily a tool subprocess (Bash, etc.). Without the guard, arm-sweep
+# clears @claude-pane-id + active-session + arm.pid out from under a
+# perfectly healthy claude. Observed on the 2026-05-12 rollout follow-up:
+# pane %10's @claude-pane-id was wiped despite claude (-r ff9f468c) being
+# the running process — pane_current_command had transiently flipped while
+# claude exec'd a tool.
+echo "[scenario 15] arm-sweep guards a live claude in the pane subtree"
+
+# Build a pane whose pane_current_command is the shell (NOT claude), but
+# which has a process named `claude` alive as a direct child of pane_pid.
+# `pgrep -x claude` matches against the argv[0] basename — so we need a
+# process invoked as `.../claude`. A shell script with shebang gets the
+# interpreter's comm (`sh`/`bash`); `cp /bin/sleep $TMP/claude` works on
+# Linux but on macOS the copy fails code-signing and is SIGKILL'd. A
+# symlink to /bin/sleep keeps the original binary's signature AND makes
+# argv[0]'s basename "claude" — best of both.
+S15_DIR="$HOME_DIR/scenario15"
+mkdir -p "$S15_DIR"
+ln -sf /bin/sleep "$S15_DIR/claude"
+
+tmux -L "$SOCK" new-window -t t1
+S15_P=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S15_P"
+# Stamp @claude-pane-id + write active file so arm-sweep sees a "claude
+# pane" candidate. Without these the pane fails the puuid gate and
+# arm-sweep skips it before reaching voluntary-exit.
+S15_PUUID=$(uuidgen|tr A-Z a-z)
+S15_SID=$(uuidgen|tr A-Z a-z)
+tmux -L "$SOCK" set-option -pt "$S15_P" @claude-pane-id "$S15_PUUID"
+mkdir -p "$HOME_DIR/active"
+printf '%s' "$S15_SID" > "$HOME_DIR/active/$S15_PUUID"
+
+# Spawn the sentinel `claude` (= /bin/sleep) as a direct child of the
+# pane shell. 9999s is well past the test's lifetime; the cleanup kill
+# below removes it.
+tmux -L "$SOCK" send-keys -t "$S15_P" "$S15_DIR/claude 9999 &" Enter
+sleep 1
+S15_PANE_PID=$(tmux -L "$SOCK" display-message -p -t "$S15_P" '#{pane_pid}')
+S15_SENTINEL_PID=$(pgrep -P "$S15_PANE_PID" -x claude 2>/dev/null | head -1)
+assert_nonempty "scenario 15 setup: sentinel claude alive under pane shell" "$S15_SENTINEL_PID"
+# pane_current_command should be the shell, not claude — confirms the
+# transient-tool-exec setup we want to test against.
+S15_CUR_CMD=$(tmux -L "$SOCK" display-message -p -t "$S15_P" '#{pane_current_command}')
+[ "$S15_CUR_CMD" != "claude" ] || echo "WARN scenario 15: pane_current_command=$S15_CUR_CMD (expected non-claude)"
+
+# Trigger arm-sweep.
+tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache $REPO/bin/claude-rescue-log arm-sweep"
+sleep 1
+
+# The guard must have kept @claude-pane-id + active file intact.
+S15_PUUID_AFTER=$(tmux -L "$SOCK" show-options -pv -t "$S15_P" @claude-pane-id 2>/dev/null)
+assert "scenario 15: arm-sweep preserves @claude-pane-id when claude is alive in subtree" "$S15_PUUID" "$S15_PUUID_AFTER"
+[ -f "$HOME_DIR/active/$S15_PUUID" ] && S15_ACTIVE_AFTER=present || S15_ACTIVE_AFTER=absent
+assert "scenario 15: arm-sweep preserves active file when claude is alive in subtree" "present" "$S15_ACTIVE_AFTER"
+
+# Cleanup: kill the sentinel so it doesn't haunt the test server.
+[ -n "$S15_SENTINEL_PID" ] && kill -TERM "$S15_SENTINEL_PID" 2>/dev/null
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"
