@@ -34,8 +34,21 @@
 
 set -eu
 
+# Resolve script dir via symlinks so we find lib/common.sh regardless of invoke path.
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
 LIVE_SOCKET="${CLAUDE_RESCUE_LIVE_SOCKET:-default}"
-TAIL=8
+TAIL=12
 OUTPUT=""
 
 while [ $# -gt 0 ]; do
@@ -47,10 +60,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 PROJECTS_ROOT="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
-DATA="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
-CAPTURES_DIR="$DATA/captures"
+CAPTURES_DIR="$CLAUDE_RESCUE_DATA_HOME/captures"
 
 emit() {
   if [ -n "$OUTPUT" ]; then printf '%s\n' "$1" >> "$OUTPUT"
@@ -75,33 +86,26 @@ tmux -L "$LIVE_SOCKET" list-panes -aF \
       source="empty"
 
       if [ "$cmd" = "claude" ]; then
-        # Live pane: scrape current display. tail=8 covers the status area
-        # (model line + sid line + bypass-permissions line + footer). The
-        # closest-to-bottom UUID is claude's own footer; earlier UUIDs in the
-        # captured area (tool output, etc.) lose to `tail -1`.
+        # Live pane: scrape current display via the shared helper. The
+        # tail window covers claude's status area (model line + sid line
+        # + bypass-permissions line + footer with margin for soft-wraps).
         sid="$(tmux -L "$LIVE_SOCKET" capture-pane -t "$pane_id" -p 2>/dev/null \
-               | tail -"$TAIL" \
-               | grep -oE "$UUID_RE" \
-               | tail -1)" || sid=""
+               | scrape_session_id_from_capture - "$TAIL")" || sid=""
         [ -n "$sid" ] && source="live"
       fi
 
       if [ -z "$sid" ] && [ -n "$puuid" ] && [ -f "$CAPTURES_DIR/$puuid.txt" ]; then
         # Hibernated / exited claude: read the on-disk capture saved by
-        # cmd_hibernate_arm at SIGTSTP time. ANSI escapes in the capture
-        # don't interfere with the UUID regex (UUIDs are alphanumeric +
-        # hyphens, no ANSI overlap).
-        sid="$(tail -"$TAIL" "$CAPTURES_DIR/$puuid.txt" 2>/dev/null \
-               | grep -oE "$UUID_RE" \
-               | tail -1)" || sid=""
+        # cmd_hibernate_arm at SIGTSTP time. ANSI escapes don't interfere
+        # with the UUID regex (UUIDs are alphanumeric + hyphens).
+        sid="$(scrape_session_id_from_capture "$CAPTURES_DIR/$puuid.txt" "$TAIL")" || sid=""
         [ -n "$sid" ] && source="capture"
       fi
 
       jsonl_path=""
       jsonl_exists="no"
       if [ -n "$sid" ]; then
-        # claude's project-dir encoding: replace both `/` and `.` with `-`.
-        encoded="$(printf '%s' "$cwd" | tr '/.' '--')"
+        encoded="$(encode_cwd_for_projects "$cwd")"
         jsonl_path="$PROJECTS_ROOT/$encoded/$sid.jsonl"
         [ -f "$jsonl_path" ] && jsonl_exists="yes"
       fi

@@ -168,9 +168,17 @@ cmd_session_end() {
   #   - arm.pid: a pending hibernation timer would otherwise tick down to a
   #     plain zsh and send Ctrl+Z (benign no-op, but wrong). 27 such orphans
   #     observed in production after users dismissed "Resume from summary?".
-  #   - active session_id file: no live session, no truth to record. Wrapper
-  #     falls back to find-sessions (priority 2) keyed by the still-set
-  #     @claude-pane-id.
+  #   - active session_id file: gated on absence of a hibernation marker.
+  #     The hard-hibernate timer fires `/exit` on claude, which triggers
+  #     this SessionEnd handler; if we cleared active/ here, the sid mapping
+  #     a user needs to resume would be lost (hibernated/<uuid>.json carries
+  #     only pane identity + pids, no sid/cwd). Preserving active/ when a
+  #     marker exists is the only mapping that survives until the user
+  #     returns. cmd_session_start overwrites active/ with the new sid (and
+  #     cleans the marker) the moment claude is back. For non-hibernation
+  #     exits (user-initiated /exit, claude crash), clear as before so
+  #     orphans don't accumulate; the wrapper still finds prior sessions via
+  #     find-sessions (priority 2) keyed by the still-set @claude-pane-id.
   #   - busy marker: safety net if Stop didn't fire (e.g. claude crashed).
   #
   # KEEP @claude-pane-id intact. The hard-hibernation marker is keyed by
@@ -183,7 +191,12 @@ cmd_session_end() {
   pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
   local san="${pane_id//[^A-Za-z0-9]/_}"
   rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
-  clear_active_session "$pane_uuid"
+  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  if [ -f "$hibernated_file" ]; then
+    log_err "session_end: preserving active/$pane_uuid (hibernation marker present, sid resume path)"
+  else
+    clear_active_session "$pane_uuid"
+  fi
   clear_busy "$pane_uuid"
 
   local window_uuid
@@ -951,6 +964,16 @@ cmd_hibernate_arm() {
       mv "$capture_txt.tmp" "$capture_txt"
     else
       rm -f "$capture_txt.tmp"
+    fi
+    # Fallback: if no session_id was recoverable from the event log (claude
+    # was started via a path that never fired SessionStart through our hook —
+    # e.g. /resume from another session, find-sessions fallback that bypassed
+    # cmd_session_start, or a window-log rebuild that lost the row), scrape
+    # the visible UUID from the capture we just wrote. This is the same
+    # signal capture-truthful-sids.sh uses for hibernated panes; doing it
+    # here ensures the meta file is authoritative without a second tool run.
+    if [ -z "$session_id" ] && [ -r "$capture_txt" ]; then
+      session_id="$(scrape_session_id_from_capture "$capture_txt")"
     fi
     jq -nc \
       --arg pane_uuid "$_puuid" \

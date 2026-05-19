@@ -325,6 +325,29 @@ sleep 1
 [ -f "$HOME_DIR/active/$S11_ORPHAN" ] && S11_ORPHAN_STATE=present || S11_ORPHAN_STATE=absent
 assert "scenario 11d: resurrect-restore preserves active dir" "present" "$S11_ORPHAN_STATE"
 
+# (e) SessionEnd PRESERVES active when a hibernation marker is present. The
+# hard-hibernate timer fires `/exit` on claude, which triggers SessionEnd;
+# without this gate the sid mapping the user needs to resume is destroyed
+# (hibernated/<uuid>.json carries no sid). Hit 21 panes in production
+# (postmortem 2026-05-19) — every hard-hibernated pane lost its resume target
+# and fell through to find-sessions's most-recent heuristic.
+SID11E=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S11_P" "$SID11E" "/tmp/s11" startup
+sleep 1
+# Simulate a hibernation arm having written the marker.
+mkdir -p "$HOME_DIR/cache/hibernated"
+cat > "$HOME_DIR/cache/hibernated/$S11_PUUID.json" <<EOF
+{"pane_id":"$S11_P","pane_uuid":"$S11_PUUID","ts":"2026-01-01T00:00:00Z","mode":"hard","pids":["1"],"hard_ts":"2026-01-01T00:00:01Z"}
+EOF
+tmux -L "$SOCK" send-keys -t "$S11_P" \
+  "echo '{\"session_id\":\"$SID11E\",\"cwd\":\"/tmp/s11\",\"hook_event_name\":\"SessionEnd\"}' | claude-rescue-log session_end" \
+  Enter
+sleep 2
+S11E_ACTIVE_CONTENT=$(cat "$HOME_DIR/active/$S11_PUUID" 2>/dev/null | tr -d '\n')
+assert "scenario 11e: SessionEnd preserves active sid when hibernated marker exists" "$SID11E" "$S11E_ACTIVE_CONTENT"
+# Clean up the marker so it doesn't bleed into later scenarios.
+rm -f "$HOME_DIR/cache/hibernated/$S11_PUUID.json"
+
 # ---------------------------------------------------------------------------
 # resurrect-save now diffs the new snapshot against the previous one (same
 # source-of-truth and dedupe key as bin/claude-rescue-backfill). Cross-server

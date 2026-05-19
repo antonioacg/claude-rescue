@@ -44,6 +44,41 @@ ensure_dirs() {
 
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
+# Encode a filesystem path the way Claude Code names its per-project
+# transcript directory under ~/.claude/projects/. Replaces every `/` and
+# every `.` with `-`. Leading `/` becomes a leading `-`, and dotfile
+# segments (`.claude/foo`) become double-dash (`--claude-foo`).
+#
+# Single source of truth — both runtime resolvers (capture-truthful-sids.sh,
+# verify-pane-sessions.sh, wrapper helpers) and operational audits must use
+# this so they all agree on where to look for a session's jsonl.
+encode_cwd_for_projects() {
+  printf '%s' "$1" | tr '/.' '--'
+}
+
+# Resolve a session_id by scraping the bottom-status footer of a claude
+# capture. Claude renders its active session UUID a few lines above the
+# "bypass permissions" footer; that string is the only signal that survives
+# /resume, --fork-session, manual jsonl moves, and stale --resume args.
+#
+# Accepts either a file path (capture saved to disk by cmd_hibernate_arm)
+# or `-` to read from stdin. Returns the LAST UUID-shaped token in the
+# trailing $2 lines (default 12 — covers model line + sid line +
+# bypass-permissions line + footer with margin for soft-wraps), since
+# claude's footer UUID is always the closest-to-bottom one.
+#
+# Empty stdout if no UUID found. Caller decides what to do with empty.
+UUID_RE='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+scrape_session_id_from_capture() {
+  local src="$1" tail_lines="${2:-12}"
+  if [ "$src" = "-" ]; then
+    tail -"$tail_lines" | grep -oE "$UUID_RE" | tail -1
+  else
+    [ -r "$src" ] || return 0
+    tail -"$tail_lines" "$src" 2>/dev/null | grep -oE "$UUID_RE" | tail -1
+  fi
+}
+
 # Walk up the process tree from $$ looking for an ancestor whose comm is
 # "claude". Used by hook handlers (SessionStart, SessionEnd, etc.) to capture
 # the originating claude PID into events for troubleshooting.
