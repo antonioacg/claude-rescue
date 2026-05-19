@@ -724,11 +724,11 @@ cmd_resurrect_restore() {
 
       # 1. Print the captured snapshot (uses default-arg path which reads
       #    @claude-pane-id re-applied from the sidecar above).
-      tmux send-keys -t "$pane_id" "claude-rescue print" Enter 2>/dev/null || true
+      send_keys_logged "post-restore-print" "$pane_id" "claude-rescue print" Enter
       sleep 0.5
       # 2. Pre-fill resume command (no Enter). User hits Enter to start.
       if [ -n "$sid" ]; then
-        tmux send-keys -t "$pane_id" "clr $sid" 2>/dev/null || true
+        send_keys_logged "post-restore-clr" "$pane_id" "clr $sid"
       fi
 
       # Marker NOT deleted here. The `clr <sid>` text is live readline input
@@ -991,7 +991,7 @@ cmd_hibernate_arm() {
 
     # === Soft hibernate: send Ctrl+Z. The tty driver issues SIGTSTP to the
     # foreground process group, the shell takes terminal control back. ===
-    tmux send-keys -t "$pane_id" C-z 2>/dev/null || true
+    send_keys_logged "hibernate-soft-suspend" "$pane_id" C-z
 
     jq -nc --arg pane "$pane_id" --arg puuid "$_puuid" --arg ts "$(now_iso)" \
            --arg pids "$pids" --arg mode "soft" \
@@ -1027,9 +1027,9 @@ cmd_hibernate_arm() {
     # which is claude's own slash command — fires SessionEnd cleanly, flushes
     # transcript, claude exits gracefully. Fall back to SIGTERM then SIGKILL
     # if claude is still alive (e.g. mid-stream and ignoring slash commands).
-    tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
+    send_keys_logged "hibernate-hard-fg" "$pane_id" "fg" Enter
     sleep 1
-    tmux send-keys -t "$pane_id" "/exit" Enter 2>/dev/null || true
+    send_keys_logged "hibernate-hard-exit" "$pane_id" "/exit" Enter
     sleep 3
 
     # Check claude is gone; if not, escalate. Each kill is guarded by
@@ -1076,7 +1076,7 @@ cmd_hibernate_arm() {
     resume_sid="$(jq -r '.session_id // empty' "$capture_meta" 2>/dev/null)"
     if [ -n "$resume_sid" ]; then
       sleep 1
-      tmux send-keys -t "$pane_id" "clr $resume_sid" 2>/dev/null || true
+      send_keys_logged "hibernate-hard-clr" "$pane_id" "clr $resume_sid"
     fi
 
     cmd_hibernated "$pane_id" "$pids" "hard" 2>/dev/null || true
@@ -1149,7 +1149,7 @@ cmd_hibernate_resume() {
 
   case "$mode" in
     soft)
-      tmux send-keys -t "$pane_id" "fg" Enter 2>/dev/null || true
+      send_keys_logged "hibernate-resume-fg" "$pane_id" "fg" Enter
       rm -f "$hibernated_file"
       cmd_unhibernated "$pane_id" "$mode" 2>/dev/null || true
       ;;

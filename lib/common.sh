@@ -107,6 +107,55 @@ log_err() {
   printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >> "$err_file"
 }
 
+# Logged wrapper around `tmux send-keys` for every internal injection we
+# do. Behavior is unchanged from a bare send-keys (still best-effort, never
+# blocks); the wrapper exists so we can post-incident reconstruct who typed
+# what into which pane and what the pane was running at the time.
+#
+# Observability target: the 2026-05-19 incident where pane %14 ended up
+# with `clr <sid>` typed twice (duplicate hibernation arm or sweep/arm
+# race) and pane %43 had `claude-rescue-resume …` typed into claude's
+# input (tmux-resurrect send-keys landed in a pane where claude was
+# already attached). Both leak vectors are now logged with caller context
+# so the next occurrence has full forensics.
+#
+# Args:
+#   $1 reason   short tag identifying the call site (e.g. "hibernate-clr",
+#                "hibernate-exit", "picker-resume-here"). Use kebab-case.
+#   $2 pane_id  tmux pane id (e.g. %43).
+#   $3..   args forwarded verbatim to `tmux send-keys -t <pane>`.
+#
+# Log file:
+#   $CLAUDE_RESCUE_DATA_HOME/send-keys.log
+#   Line format: `[<iso>] reason=<r> pane=<p> cur_cmd=<c> claudes_in_subtree=<n> keys=<quoted args>`
+send_keys_logged() {
+  local reason="$1"; shift
+  local pane="$1"; shift
+  local cur_cmd pane_pid claudes_in_subtree=0 keys_q=""
+  cur_cmd="$(tmux display-message -p -t "$pane" -F '#{pane_current_command}' 2>/dev/null || echo '<unknown>')"
+  pane_pid="$(tmux display-message -p -t "$pane" -F '#{pane_pid}' 2>/dev/null || echo '')"
+  if [ -n "$pane_pid" ]; then
+    # Walk the process subtree under the pane's shell. If `claude` is alive
+    # in there, our send-keys will land in claude's input — that is the
+    # leak signature we want surfaced.
+    local queue=("$pane_pid") cur child cmd
+    while [ ${#queue[@]} -gt 0 ]; do
+      cur="${queue[0]}"; queue=("${queue[@]:1}")
+      for child in $(pgrep -P "$cur" 2>/dev/null); do
+        queue+=("$child")
+        cmd="$(ps -o comm= -p "$child" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+        [ "$cmd" = "claude" ] && claudes_in_subtree=$((claudes_in_subtree + 1))
+      done
+    done
+  fi
+  local arg
+  for arg in "$@"; do keys_q+=" $(printf '%q' "$arg")"; done
+  printf '[%s] reason=%s pane=%s cur_cmd=%s claudes_in_subtree=%s keys=%s\n' \
+    "$(now_iso)" "$reason" "$pane" "$cur_cmd" "$claudes_in_subtree" "${keys_q# }" \
+    >> "$CLAUDE_RESCUE_DATA_HOME/send-keys.log" 2>/dev/null || true
+  tmux send-keys -t "$pane" "$@" 2>/dev/null || true
+}
+
 # Authority check for an in-flight hibernate-arm subshell.
 #
 # An arm subshell is detached from its tmux server (run-shell -b → PPID becomes

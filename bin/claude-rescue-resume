@@ -43,8 +43,30 @@ __rescue_log() {
 }
 {
   __ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '[%s] invoked pid=%s ppid=%s pane=%s argc=%s argv=' \
-    "$__ts" "$$" "${PPID:-?}" "${TMUX_PANE:-<unset>}" "$#"
+  # Observability: surface the pane's current state at wrapper entry.
+  # If claude is already alive in the pane's process subtree when the
+  # wrapper is invoked, any send-keys that delivered our cmdline landed in
+  # claude's input — the leak signature seen in pane %43 on 2026-05-19.
+  __pane_cur_cmd=""
+  __pane_pid=""
+  __claudes=0
+  if [ -n "${TMUX_PANE:-}" ]; then
+    __pane_cur_cmd="$(tmux display-message -p -t "$TMUX_PANE" -F '#{pane_current_command}' 2>/dev/null || echo '<unknown>')"
+    __pane_pid="$(tmux display-message -p -t "$TMUX_PANE" -F '#{pane_pid}' 2>/dev/null || echo '')"
+    if [ -n "$__pane_pid" ]; then
+      __q=("$__pane_pid")
+      while [ "${#__q[@]}" -gt 0 ]; do
+        __cur="${__q[0]}"; __q=("${__q[@]:1}")
+        for __ch in $(pgrep -P "$__cur" 2>/dev/null); do
+          __q+=("$__ch")
+          __cmd="$(ps -o comm= -p "$__ch" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+          [ "$__cmd" = "claude" ] && __claudes=$((__claudes + 1))
+        done
+      done
+    fi
+  fi
+  printf '[%s] invoked pid=%s ppid=%s pane=%s pane_cur_cmd=%s claudes_in_subtree=%s argc=%s argv=' \
+    "$__ts" "$$" "${PPID:-?}" "${TMUX_PANE:-<unset>}" "${__pane_cur_cmd:-<unset>}" "$__claudes" "$#"
   if [ "$#" -gt 0 ]; then printf '%q ' "$@"; fi
   printf '\n'
 } >> "$__rescue_wrapper_log" 2>/dev/null || true

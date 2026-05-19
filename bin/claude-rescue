@@ -366,7 +366,7 @@ action_resume_here() {
     echo "no originating pane to send to" >&2
     return 1
   fi
-  tmux send-keys -t "$target" " $(resume_command "$sid" "$cwd")" Enter
+  send_keys_logged "picker-resume-here" "$target" " $(resume_command "$sid" "$cwd")" Enter
 }
 
 action_resume_new_window() {
@@ -377,7 +377,7 @@ action_resume_new_window() {
   # prompt afterwards.
   local pane
   pane="$(tmux new-window -c "$cwd" -P -F '#{pane_id}')"
-  tmux send-keys -t "$pane" " $(resume_command "$sid" "$cwd")" Enter
+  send_keys_logged "picker-resume-new-window" "$pane" " $(resume_command "$sid" "$cwd")" Enter
 }
 
 action_resume_new_session() {
@@ -386,7 +386,7 @@ action_resume_new_session() {
   sname="claude-$(printf '%s' "$sid" | cut -c1-8)"
   tmux new-session -d -s "$sname" -c "$cwd"
   pane="$(tmux display-message -p -t "$sname" '#{pane_id}')"
-  tmux send-keys -t "$pane" " $(resume_command "$sid" "$cwd")" Enter
+  send_keys_logged "picker-resume-new-session" "$pane" " $(resume_command "$sid" "$cwd")" Enter
   tmux switch-client -t "$sname" 2>/dev/null || true
 }
 
