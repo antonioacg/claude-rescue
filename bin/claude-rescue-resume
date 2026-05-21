@@ -233,6 +233,26 @@ if [ "$debug" -eq 1 ]; then
   exec "${SHELL:-/bin/zsh}" -i
 fi
 
+# --- cwd-mismatch detection -----------------------------------------------
+# When resuming with -r <sid>, claude looks up the transcript jsonl under
+# the project dir derived from the SHELL's current cwd, not the session's
+# original cwd. If they differ, claude prints "No conversation found with
+# session ID: <sid>" and the user has to figure out where to cd. Catch the
+# divergence here so the log shows it the moment it happens.
+#
+# Source of truth for the session's cwd at hibernation time:
+# $DATA/captures/<pane_uuid>.json. If absent (pane was never hibernated,
+# or capture isn't current), fall back to find-sessions's reported cwd.
+session_cwd=""
+if [ -n "$pane_uuid" ] && [ -f "$__rescue_log_dir/captures/$pane_uuid.json" ]; then
+  session_cwd="$(jq -r '.cwd // empty' "$__rescue_log_dir/captures/$pane_uuid.json" 2>/dev/null || true)"
+fi
+[ -z "$session_cwd" ] && session_cwd="${found_cwd:-}"
+cwd_match="unknown"
+if [ -n "$session_cwd" ]; then
+  if [ "$PWD" = "$session_cwd" ]; then cwd_match="Y"; else cwd_match="N"; fi
+fi
+
 # --- Live: exec claude with the resolved args ------------------------------
-__rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>}"
+__rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>} pwd=$PWD session_cwd=${session_cwd:-<none>} cwd_match=$cwd_match"
 exec claude "${final_args[@]}"
