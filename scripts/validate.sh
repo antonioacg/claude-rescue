@@ -607,6 +607,88 @@ assert "scenario 15: arm-sweep preserves active file when claude is alive in sub
 [ -n "$S15_SENTINEL_PID" ] && kill -TERM "$S15_SENTINEL_PID" 2>/dev/null
 
 # ---------------------------------------------------------------------------
+# Archive tier — hardlink saves + content-addressed pane_contents.tar.gz.
+# cmd_resurrect_save now also hardlinks the snapshot's .txt + .tsv into
+# $DATA/archive/saves/ and md5-dedupes pane_contents into $DATA/archive/blobs/.
+# Two distinct retention caps gate prune: --keep N (count of saves) and
+# --blob-days M (age of blobs).
+echo "[scenario 16] archive tier (hardlink + content-addressed blobs)"
+
+S16_ARCHIVE_DIR="$HOME_DIR/archive-test"
+S16_SAVES="$S16_ARCHIVE_DIR/saves"
+S16_BLOBS="$S16_ARCHIVE_DIR/blobs"
+S16_RD=$(mktemp -d)
+
+# (a) First save with pane_contents A: archives one save + one blob.
+S16_STATE_1="$S16_RD/tmux_resurrect_20260521T000001.txt"
+printf 'window\tsess\t1\t1\t:\twuuid-A\npane\tsess\t1\t1\twuuid-A\tpuuid-A\n' > "$S16_STATE_1"
+printf 'content-A' > "$S16_RD/pane_contents.tar.gz"
+HASH_A=$(md5 -q "$S16_RD/pane_contents.tar.gz")
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_1" >/dev/null 2>&1 || true
+S16_TXT_LINKS=$(stat -f '%l' "$S16_STATE_1" 2>/dev/null)
+assert "scenario 16a: saved .txt is hardlinked into archive" "2" "$S16_TXT_LINKS"
+[ -f "$S16_BLOBS/$HASH_A.tar.gz" ] && S16_BLOB_A=present || S16_BLOB_A=absent
+assert "scenario 16a: pane_contents copied to content-addressed blob" "present" "$S16_BLOB_A"
+S16_HASH_FILE_A=$(cat "$S16_SAVES/tmux_resurrect_20260521T000001.pane_contents.hash" 2>/dev/null)
+assert "scenario 16a: .pane_contents.hash records the blob hash" "$HASH_A" "$S16_HASH_FILE_A"
+
+# (b) Second save, SAME pane_contents: blob is reused (dedupe), not recopied.
+S16_STATE_2="$S16_RD/tmux_resurrect_20260521T000002.txt"
+cp "$S16_STATE_1" "$S16_STATE_2"
+# pane_contents.tar.gz unchanged → same hash
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_2" >/dev/null 2>&1 || true
+S16_BLOB_COUNT_B=$(find "$S16_BLOBS" -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')
+assert "scenario 16b: identical pane_contents dedupes to single blob" "1" "$S16_BLOB_COUNT_B"
+
+# (c) Third save with DIFFERENT pane_contents: new blob created.
+printf 'content-B' > "$S16_RD/pane_contents.tar.gz"
+HASH_B=$(md5 -q "$S16_RD/pane_contents.tar.gz")
+S16_STATE_3="$S16_RD/tmux_resurrect_20260521T000003.txt"
+cp "$S16_STATE_1" "$S16_STATE_3"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_3" >/dev/null 2>&1 || true
+S16_BLOB_COUNT_C=$(find "$S16_BLOBS" -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')
+assert "scenario 16c: changed pane_contents creates second blob" "2" "$S16_BLOB_COUNT_C"
+[ -f "$S16_BLOBS/$HASH_B.tar.gz" ] && S16_BLOB_B=present || S16_BLOB_B=absent
+assert "scenario 16c: new blob is content-addressed by its hash" "present" "$S16_BLOB_B"
+
+# (d) Prune saves to --keep 2: oldest (state_1) is evicted, its trio removed.
+# Force the prune throttle to fire by clearing the marker.
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+S16_STATE_4="$S16_RD/tmux_resurrect_20260521T000004.txt"
+cp "$S16_STATE_1" "$S16_STATE_4"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_4" >/dev/null 2>&1 || true
+[ -f "$S16_SAVES/tmux_resurrect_20260521T000001.txt" ] && S16_EVICT=present || S16_EVICT=absent
+assert "scenario 16d: oldest save evicted when count exceeds --keep" "absent" "$S16_EVICT"
+S16_SAVE_COUNT=$(find "$S16_SAVES" -maxdepth 1 -name 'tmux_resurrect_*.txt' | wc -l | tr -d ' ')
+assert "scenario 16d: save count clamped to --keep" "2" "$S16_SAVE_COUNT"
+
+# (e) Blob GC: backdate a blob to 2020-01-01 (well past any plausible
+# --blob-days window), re-run save with blob_days=14, expect the aged blob
+# removed. GC is age-only — the .hash file persists as a tombstone.
+touch -t 202001010000 "$S16_BLOBS/$HASH_A.tar.gz" 2>/dev/null || true
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+S16_STATE_5="$S16_RD/tmux_resurrect_20260521T000005.txt"
+cp "$S16_STATE_1" "$S16_STATE_5"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=100 \
+  CLAUDE_RESCUE_ARCHIVE_BLOB_DAYS=14 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_5" >/dev/null 2>&1 || true
+[ -f "$S16_BLOBS/$HASH_A.tar.gz" ] && S16_BLOB_A_AFTER=present || S16_BLOB_A_AFTER=absent
+assert "scenario 16e: aged blob GC'd past --blob-days" "absent" "$S16_BLOB_A_AFTER"
+
+rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
+
+# ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"
 WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
 assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"

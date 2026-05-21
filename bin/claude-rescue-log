@@ -402,6 +402,132 @@ log_no_tmux() {
 
 # --- Resurrect hooks (post-save-layout / post-restore-all) ------------------
 
+# Compute an md5 hash of a file, portable across macOS (`md5 -q`) and Linux
+# (`md5sum`). Echoes the hex hash to stdout on success, empty on failure.
+# Used by the archive tier to dedupe pane_contents.tar.gz by content.
+__rescue_md5() {
+  local f="$1"
+  [ -r "$f" ] || return 1
+  if command -v md5 >/dev/null 2>&1; then
+    md5 -q "$f" 2>/dev/null
+  elif command -v md5sum >/dev/null 2>&1; then
+    md5sum "$f" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+# Archive a just-completed save into the long-term archive tier.
+#
+# Design (see chat thread 2026-05-21):
+#   - `archive/saves/<basename>.txt` and `.claude-userops.tsv` are HARDLINKS
+#     to the hot-tier files. Hot-tier cleanup unlinks its end; the archive
+#     hardlink keeps the inode alive. Cost: filesystem directory entries
+#     only — the actual content is shared with the hot tier until it's
+#     deleted there, then the archive becomes the sole owner.
+#   - `archive/blobs/<md5>.tar.gz` is the content-addressed store for
+#     pane_contents.tar.gz. The hot-tier overwrites pane_contents.tar.gz on
+#     every save, so we can't hardlink it — but most saves have IDENTICAL
+#     pane content (idle minutes), so md5-dedupe collapses them to one blob.
+#   - `archive/saves/<basename>.pane_contents.hash` records which blob this
+#     save's pane content lived in. If the blob is later GC'd (blob_days
+#     elapsed), the .hash file persists as a tombstone — the user can see
+#     "at time T the hash was X" even after the content is gone.
+#
+# Two retention caps:
+#   CLAUDE_RESCUE_ARCHIVE_KEEP        (default 100000)  saves retained
+#   CLAUDE_RESCUE_ARCHIVE_BLOB_DAYS   (default 14)      blob age limit
+# At 1 save/min and ~3MB/blob, defaults bound disk at ~2GB saves + ~variable
+# blob storage proportional to activity. Heavy active days produce more
+# unique blobs; idle days produce almost none.
+#
+# Pruning is throttled to once per hour (PRUNE_INTERVAL_S below) so each
+# save's hook stays fast — the full save+prune+gc cycle on a 100k-entry
+# archive would otherwise add seconds to every minute.
+__rescue_archive_save() {
+  local state_file="$1"
+  [ -n "$state_file" ] || return 0
+  [ -f "$state_file" ] || return 0
+
+  local archive_dir="${CLAUDE_RESCUE_ARCHIVE_DIR:-$CLAUDE_RESCUE_DATA_HOME/archive}"
+  local saves_dir="$archive_dir/saves"
+  local blobs_dir="$archive_dir/blobs"
+  local keep="${CLAUDE_RESCUE_ARCHIVE_KEEP:-100000}"
+  local blob_days="${CLAUDE_RESCUE_ARCHIVE_BLOB_DAYS:-14}"
+  local prune_interval_s=3600
+
+  mkdir -p "$saves_dir" "$blobs_dir" 2>/dev/null || return 0
+
+  local resurrect_dir; resurrect_dir="$(dirname "$state_file")"
+  local state_base; state_base="$(basename "$state_file" .txt)"
+
+  # 1. Hardlink the .txt and the paired sidecar TSV into saves/.
+  ln -f "$state_file" "$saves_dir/$state_base.txt" 2>/dev/null || true
+  local src_tsv="$resurrect_dir/$state_base.claude-userops.tsv"
+  [ -f "$src_tsv" ] && ln -f "$src_tsv" "$saves_dir/$state_base.claude-userops.tsv" 2>/dev/null || true
+
+  # 2. Content-address pane_contents.tar.gz. Hash check is cheap; the copy
+  # only fires when the blob is new (most idle minutes skip it).
+  local pc="$resurrect_dir/pane_contents.tar.gz"
+  if [ -f "$pc" ]; then
+    local hash; hash="$(__rescue_md5 "$pc")"
+    if [ -n "$hash" ]; then
+      local blob="$blobs_dir/$hash.tar.gz"
+      [ -f "$blob" ] || cp "$pc" "$blob" 2>/dev/null || true
+      printf '%s\n' "$hash" > "$saves_dir/$state_base.pane_contents.hash" 2>/dev/null || true
+    fi
+  fi
+
+  # 3. Throttled prune + blob GC. The marker file holds the unix ts of the
+  # last prune. Skip if we're inside the interval.
+  local prune_marker="$archive_dir/.last-prune"
+  local now last_prune=0
+  now="$(date +%s)"
+  [ -f "$prune_marker" ] && last_prune="$(cat "$prune_marker" 2>/dev/null || echo 0)"
+  if [ "$((now - last_prune))" -ge "$prune_interval_s" ]; then
+    __rescue_archive_prune "$saves_dir" "$blobs_dir" "$keep" "$blob_days"
+    printf '%s' "$now" > "$prune_marker" 2>/dev/null || true
+  fi
+}
+
+# Prune the archive's saves dir to --keep N (oldest evicted by mtime) and
+# GC blobs older than blob_days. Save eviction removes the .txt, .tsv, and
+# .pane_contents.hash trio. Blob GC is age-only — referenced-but-aged blobs
+# are still removed (the .hash file becomes a tombstone). If the same
+# content reappears later, a fresh blob is created.
+#
+# Uses the find+sort+sed pattern from cleanup-resurrect-snapshots.sh so it
+# stays correct under "argument list too long" at scale (~100k files).
+__rescue_archive_prune() {
+  local saves_dir="$1" blobs_dir="$2" keep="$3" blob_days="$4"
+
+  local total
+  total=$(find "$saves_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f 2>/dev/null | wc -l | tr -d ' ')
+
+  if [ "$total" -gt "$keep" ]; then
+    local del_count=$((total - keep))
+    local del_list; del_list="$(mktemp)"
+    find "$saves_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f \
+      -exec stat -f '%m %N' {} \; 2>/dev/null \
+      | sort -n \
+      | head -n "$del_count" \
+      | awk '{$1=""; sub(/^ /,""); print}' \
+      > "$del_list"
+    while IFS= read -r save_txt; do
+      [ -z "$save_txt" ] && continue
+      local base; base="$(basename "$save_txt" .txt)"
+      rm -f "$saves_dir/$base.txt" \
+            "$saves_dir/$base.claude-userops.tsv" \
+            "$saves_dir/$base.pane_contents.hash"
+    done < "$del_list"
+    rm -f "$del_list"
+  fi
+
+  # Blob GC: any *.tar.gz in blobs/ older than blob_days. Age-only; the
+  # tombstone .pane_contents.hash files retain the historical signal even
+  # without the content.
+  find "$blobs_dir" -maxdepth 1 -name '*.tar.gz' -type f -mtime +"$blob_days" \
+    -delete 2>/dev/null || true
+}
+
 cmd_resurrect_save() {
   # Hooked into tmux-resurrect via @resurrect-hook-post-save-layout.
   # Two jobs:
@@ -451,6 +577,12 @@ cmd_resurrect_save() {
         }'
   } > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
+
+  # 1b. Archive tier — hardlink saves + content-addressed pane_contents.
+  # Runs every save, independent of the diff step below (which early-returns
+  # on the very first save of a fresh resurrect-dir, when there's no prev).
+  # Best-effort; archive failures must not block sidecar bookkeeping.
+  __rescue_archive_save "$state_file" || true
 
   # 2. Snapshot diff. Find the snapshot immediately before $state_file in this
   # server's resurrect-dir and compare pane_title per (session_name,
