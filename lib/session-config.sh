@@ -22,7 +22,7 @@ session_config_builtin() {
 {
   "ask_on_edits": false,
   "ask_on_bash": false,
-  "editor_on_ask": false,
+  "editor_on_edits": false,
   "editor_command": "code -g"
 }
 JSON

@@ -40,9 +40,9 @@ render_lines() {
   cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
   printf 'ask_on_bash\t%s ask on bash    · gate Bash\n' "$cb"
 
-  v="$(jq -r '.editor_on_ask' <<<"$cfg")"
+  v="$(jq -r '.editor_on_edits' <<<"$cfg")"
   cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
-  printf 'editor_on_ask\t%s editor on ask  · open target file in editor when prompted\n' "$cb"
+  printf 'editor_on_edits\t%s editor on edits · open target file in editor on every Edit/Write\n' "$cb"
 
   v="$(jq -r '.editor_command' <<<"$cfg")"
   printf 'editor_command\t    editor command: %s\n' "$v"
@@ -63,7 +63,7 @@ toggle_or_edit() {
       [ -z "$new" ] && return 0
       set_session_config_value "$sid" "$key" "$(printf '%s' "$new" | jq -Rs '.')"
       ;;
-    ask_on_edits|ask_on_bash|editor_on_ask)
+    ask_on_edits|ask_on_bash|editor_on_edits)
       local next=true
       [ "$current" = "true" ] && next=false
       set_session_config_value "$sid" "$key" "$next"

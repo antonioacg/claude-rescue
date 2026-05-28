@@ -48,11 +48,13 @@
 # Recognized keys (with built-in defaults):
 #   ask_on_edits     false   prompt on Edit/Write/NotebookEdit/MultiEdit
 #   ask_on_bash      false   prompt on Bash
-#   editor_on_ask    false   open file in $editor_command when prompting
+#   editor_on_edits  false   open file in $editor_command on every edit
+#                            (independent of ask_on_edits — set this alone
+#                            to autonomously watch Claude's edits)
 #   editor_command   "code -g"   editor invocation (eval'd; flags supported)
 #
-# Example: always gate edits, open VS Code at the line of the edit.
+# Example: open VS Code on every edit, but don't prompt.
 #   mkdir -p "$CLAUDE_RESCUE_CONFIG_HOME"
 #   cat > "$CLAUDE_RESCUE_CONFIG_HOME/session-config-defaults.json" <<'JSON'
-#   { "ask_on_edits": true, "editor_on_ask": true, "editor_command": "code -g" }
+#   { "editor_on_edits": true, "editor_command": "code -g" }
 #   JSON
