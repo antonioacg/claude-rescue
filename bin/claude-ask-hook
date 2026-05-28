@@ -61,7 +61,10 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # back off, which makes a stuck flag painful. Bail silently when $TMUX is
 # unset so the harness is a tmux-only feature; users who want it elsewhere
 # can comment out this guard.
-[ -n "${TMUX:-}" ] || exit 0
+if [ -z "${TMUX:-}" ]; then
+  [ -n "${CLAUDE_HARNESS_TRACE:-}" ] && printf '[%s] skip: $TMUX unset\n' "$(date -u +%H:%M:%S)" >> /tmp/claude-ask-hook.trace
+  exit 0
+fi
 
 payload="$(cat)"
 hook_event="$(jq -r '.hook_event_name // ""' <<<"$payload")"
@@ -72,17 +75,29 @@ file_path="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<
 # Spawn the configured editor on <file>:<line>. Skips if the file is missing,
 # editor_on_edits is off, or no editor_command is set. Best-effort; never
 # blocks the hook.
+_trace() {
+  [ -n "${CLAUDE_HARNESS_TRACE:-}" ] || return 0
+  printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >> /tmp/claude-ask-hook.trace
+}
+
 spawn_editor() {
   local target_file="$1" target_line="${2:-1}"
-  [ -n "$target_file" ] || return 0
-  [ -f "$target_file" ] || return 0
-  [ "$(get_session_config_value "$session_id" "editor_on_edits")" = "true" ] || return 0
+  _trace "spawn_editor: sid=$session_id tool=$tool_name file=$target_file line=$target_line"
+  [ -n "$target_file" ] || { _trace "skip: empty target_file"; return 0; }
+  [ -f "$target_file" ] || { _trace "skip: file does not exist: $target_file"; return 0; }
+  [ "$(get_session_config_value "$session_id" "editor_on_edits")" = "true" ] || { _trace "skip: editor_on_edits != true"; return 0; }
   local editor_cmd
   editor_cmd="$(get_session_config_value "$session_id" "editor_command")"
-  [ -n "$editor_cmd" ] && [ "$editor_cmd" != "null" ] || return 0
+  [ -n "$editor_cmd" ] && [ "$editor_cmd" != "null" ] || { _trace "skip: no editor_command"; return 0; }
   local target="$target_file:$target_line"
+  _trace "exec: $editor_cmd \"$target\""
   # eval to allow flag args like `code -g`. Detach so Claude doesn't wait.
-  ( eval "$editor_cmd \"\$target\"" >/dev/null 2>&1 & ) || true
+  # Log stderr only when trace is on, to surface launch failures.
+  if [ -n "${CLAUDE_HARNESS_TRACE:-}" ]; then
+    ( eval "$editor_cmd \"\$target\"" >/dev/null 2>>/tmp/claude-ask-hook.trace & ) || true
+  else
+    ( eval "$editor_cmd \"\$target\"" >/dev/null 2>&1 & ) || true
+  fi
 }
 
 # PostToolUse: only opens new files for Write/NotebookEdit (Edit was already
