@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+# claude-session-config — popup config editor for per-session knobs.
+#
+# Resolves the session_id bound to the originating tmux pane and presents an
+# fzf list of the configurable knobs. Booleans toggle on Enter; string values
+# prompt for a new value inline. Each edit writes to a per-session override
+# file consumed by claude-ask-hook and any external indicator.
+#
+# Internal subcommands (used by fzf bindings):
+#   render-lines <sid>          TSV rows: <key>\t<display>
+#   toggle-or-edit <sid> <key>  flip bool or read new string
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+# shellcheck source=../lib/session-config.sh
+. "$REPO/lib/session-config.sh"
+ensure_dirs
+
+render_lines() {
+  local sid="$1"
+  local cfg v cb
+  cfg="$(resolve_session_config "$sid")"
+
+  v="$(jq -r '.ask_on_edits' <<<"$cfg")"
+  cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
+  printf 'ask_on_edits\t%s ask on edits   · gate Edit/Write/NotebookEdit/MultiEdit\n' "$cb"
+
+  v="$(jq -r '.ask_on_bash' <<<"$cfg")"
+  cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
+  printf 'ask_on_bash\t%s ask on bash    · gate Bash\n' "$cb"
+
+  v="$(jq -r '.editor_on_ask' <<<"$cfg")"
+  cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
+  printf 'editor_on_ask\t%s editor on ask  · open target file in editor when prompted\n' "$cb"
+
+  v="$(jq -r '.editor_command' <<<"$cfg")"
+  printf 'editor_command\t    editor command: %s\n' "$v"
+}
+
+toggle_or_edit() {
+  local sid="$1" key="$2"
+  [ -n "$sid" ] || { echo "no session id" >&2; return 1; }
+  local current
+  current="$(get_session_config_value "$sid" "$key")"
+  case "$key" in
+    editor_command)
+      local new=""
+      {
+        printf '\n  current: %s\n  new value (empty to cancel): ' "$current"
+      } > /dev/tty
+      IFS= read -r new < /dev/tty || true
+      [ -z "$new" ] && return 0
+      set_session_config_value "$sid" "$key" "$(printf '%s' "$new" | jq -Rs '.')"
+      ;;
+    ask_on_edits|ask_on_bash|editor_on_ask)
+      local next=true
+      [ "$current" = "true" ] && next=false
+      set_session_config_value "$sid" "$key" "$next"
+      ;;
+    *)
+      echo "unknown key: $key" >&2
+      return 1
+      ;;
+  esac
+}
+
+popup_main() {
+  local sid
+  sid="$(resolve_pane_session_id)"
+  if [ -z "$sid" ]; then
+    {
+      printf 'No claude session bound to this pane.\n'
+      printf '  (no @claude-pane-id, or no active session_id recorded yet)\n\n'
+      printf 'Press Enter to close: '
+    } > /dev/tty
+    IFS= read -r _ < /dev/tty || true
+    return 1
+  fi
+
+  local header
+  header="$(printf '\033[1;36msession\033[0m %s\nkey                 value' "${sid:0:8}…")"
+  local footer=$'↩ toggle / edit · ⎋ close'
+
+  "$0" render-lines "$sid" \
+    | fzf \
+        --ansi --reverse --no-multi \
+        --with-nth=2.. --delimiter=$'\t' \
+        --prompt='config> ' \
+        --header="$header" \
+        --footer="$footer" \
+        --bind "enter:execute($0 toggle-or-edit $sid {1})+reload($0 render-lines $sid)" \
+        >/dev/null || true
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  render-lines)    shift; render_lines "$@" ;;
+  toggle-or-edit)  shift; toggle_or_edit "$@" ;;
+  '')
+    if [ -z "${TMUX:-}" ]; then
+      echo "claude-session-config must be run inside tmux" >&2
+      exit 1
+    fi
+    if [ -z "${CLAUDE_RESCUE_IN_POPUP:-}" ]; then
+      orig_pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
+      [ -z "$orig_pane" ] && orig_pane="${TMUX_PANE:-}"
+      exec tmux display-popup -E -h 40% -w 75% \
+        env CLAUDE_RESCUE_IN_POPUP=1 \
+            CLAUDE_RESCUE_CONFIG_HOME="$CLAUDE_RESCUE_CONFIG_HOME" \
+            CLAUDE_RESCUE_DATA_HOME="$CLAUDE_RESCUE_DATA_HOME" \
+            CLAUDE_RESCUE_CACHE_HOME="$CLAUDE_RESCUE_CACHE_HOME" \
+            CLAUDE_RESCUE_ORIG_PANE="$orig_pane" \
+            "$0"
+    fi
+    popup_main
+    ;;
+  *)
+    echo "unknown subcommand: $cmd" >&2
+    exit 2
+    ;;
+esac

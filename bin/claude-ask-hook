@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# claude-ask-hook — combined Pre/PostToolUse hook for the claude-harness
+# session-config gating. Same per-session knobs drive both events.
+#
+# PreToolUse:  conditionally returns permissionDecision: "ask" for
+#              Edit/Write/NotebookEdit/MultiEdit (when ask_on_edits is on) or
+#              Bash (when ask_on_bash is on). When ask is forced AND the
+#              target file already exists AND editor_on_ask is on, also pops
+#              the file open in $editor_command at the line of the change.
+# PostToolUse: for Write/NotebookEdit (file just landed on disk), pops the
+#              new file open in $editor_command. Same ask_on_edits +
+#              editor_on_ask gating as Pre. Closes the Write/new-file UX gap
+#              that Pre can't cover — VS Code's `code -g` on a nonexistent
+#              path opens an untitled-like buffer that doesn't refresh when
+#              the file later appears, so Pre intentionally skips it.
+#
+# Wire from ~/.claude/settings.json:
+#
+#   {
+#     "hooks": {
+#       "PreToolUse": [
+#         {
+#           "matcher": "Edit|Write|NotebookEdit|MultiEdit|Bash",
+#           "hooks": [{ "type": "command", "command": "claude-ask-hook" }]
+#         }
+#       ],
+#       "PostToolUse": [
+#         {
+#           "matcher": "Write|NotebookEdit",
+#           "hooks": [{ "type": "command", "command": "claude-ask-hook" }]
+#         }
+#       ]
+#     }
+#   }
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+# shellcheck source=../lib/session-config.sh
+. "$REPO/lib/session-config.sh"
+
+# Outside tmux there's no `claude-session-config` popup to toggle the gate
+# back off, which makes a stuck ask_on_edits=true in the defaults file
+# painful — every edit prompts and the user has no fast way out. Bail
+# silently when $TMUX is unset so the gate is a tmux-only feature; users who
+# want it elsewhere can comment out this guard.
+[ -n "${TMUX:-}" ] || exit 0
+
+payload="$(cat)"
+hook_event="$(jq -r '.hook_event_name // ""' <<<"$payload")"
+session_id="$(jq -r '.session_id // ""'      <<<"$payload")"
+tool_name="$(jq -r '.tool_name // ""'        <<<"$payload")"
+file_path="$(jq -r '.tool_input.file_path // .tool_input.notebook_path // ""' <<<"$payload")"
+
+# Fire the configured editor at <file>:<line>. Skips if the file is missing,
+# editor_on_ask is off, or no editor_command is set. Always best-effort;
+# never blocks the hook.
+spawn_editor() {
+  local target_file="$1" target_line="${2:-1}"
+  [ -n "$target_file" ] || return 0
+  [ -f "$target_file" ] || return 0
+  [ "$(get_session_config_value "$session_id" "editor_on_ask")" = "true" ] || return 0
+  local editor_cmd
+  editor_cmd="$(get_session_config_value "$session_id" "editor_command")"
+  [ -n "$editor_cmd" ] && [ "$editor_cmd" != "null" ] || return 0
+  local target="$target_file:$target_line"
+  # eval to allow flag args like `code -g`. Detach so Claude doesn't wait.
+  ( eval "$editor_cmd \"\$target\"" >/dev/null 2>&1 & ) || true
+}
+
+# PostToolUse: only opens new files for Write/NotebookEdit (Edit was already
+# opened by Pre on existing files). Gated on ask_on_edits so we don't surprise
+# users who never opted into the ask flow. No JSON output.
+if [ "$hook_event" = "PostToolUse" ]; then
+  case "$tool_name" in
+    Write|NotebookEdit)
+      if [ "$(get_session_config_value "$session_id" "ask_on_edits")" = "true" ]; then
+        spawn_editor "$file_path" 1
+      fi
+      ;;
+  esac
+  exit 0
+fi
+
+# PreToolUse path (default) -------------------------------------------------
+
+ask=false
+gate=""
+case "$tool_name" in
+  Edit|Write|NotebookEdit|MultiEdit)
+    if [ "$(get_session_config_value "$session_id" "ask_on_edits")" = "true" ]; then
+      ask=true; gate="edits"
+    fi
+    ;;
+  Bash)
+    if [ "$(get_session_config_value "$session_id" "ask_on_bash")" = "true" ]; then
+      ask=true; gate="bash"
+    fi
+    ;;
+esac
+
+if [ "$ask" != true ]; then
+  exit 0
+fi
+
+# Edit on an existing file: anchor at the first non-empty line of old_string.
+# Write/new-file: spawn_editor's existence check will skip — the Post hook
+# picks it up after the file lands.
+line=1
+if [ "$tool_name" = "Edit" ] && [ -f "$file_path" ]; then
+  needle="$(jq -r '.tool_input.old_string // ""' <<<"$payload" | sed -n '/./{p;q;}')"
+  if [ -n "$needle" ]; then
+    hit="$(grep -nF -- "$needle" "$file_path" 2>/dev/null | head -1 | cut -d: -f1)"
+    [ -n "$hit" ] && line="$hit"
+  fi
+fi
+spawn_editor "$file_path" "$line"
+
+jq -nc --arg gate "$gate" '
+  {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "ask",
+      permissionDecisionReason: ("claude-harness: " + $gate + " gate active for this session")
+    }
+  }
+'

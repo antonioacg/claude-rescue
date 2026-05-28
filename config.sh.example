@@ -36,3 +36,23 @@
 # CLAUDE_RESCUE_RESURRECT_DIR="$HOME/.local/share/tmux/resurrect/default"
 # CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
 # CLAUDE_RESCUE_MAX_SNAPSHOTS=0                         # 0 = unbounded
+
+# --- Per-session config (claude-harness) -----------------------------------
+# Per-session knobs are stored as JSON under
+# $CLAUDE_RESCUE_DATA_HOME/session-config/<session_id>.json and edited via
+# the `claude-session-config` popup (bound to prefix+a by rescue.tmux.conf).
+#
+# Optional user defaults inherited by every new session live at:
+#   $CLAUDE_RESCUE_CONFIG_HOME/session-config-defaults.json
+#
+# Recognized keys (with built-in defaults):
+#   ask_on_edits     false   prompt on Edit/Write/NotebookEdit/MultiEdit
+#   ask_on_bash      false   prompt on Bash
+#   editor_on_ask    false   open file in $editor_command when prompting
+#   editor_command   "code -g"   editor invocation (eval'd; flags supported)
+#
+# Example: always gate edits, open VS Code at the line of the edit.
+#   mkdir -p "$CLAUDE_RESCUE_CONFIG_HOME"
+#   cat > "$CLAUDE_RESCUE_CONFIG_HOME/session-config-defaults.json" <<'JSON'
+#   { "ask_on_edits": true, "editor_on_ask": true, "editor_command": "code -g" }
+#   JSON
