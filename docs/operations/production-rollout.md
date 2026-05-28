@@ -490,16 +490,24 @@ running server. Code rollback can wait.
 - **Resurrect snapshot dir cleanup** — tmux-resurrect's built-in rotation
   (`@resurrect-delete-backup-after`) breaks past ~6000 `.txt` files
   ("argument list too long"). With `@continuum-save-interval=1` the dir
-  hits this scale in under a week. Run weekly:
+  hits this scale in under a week.
+
+  Auto-runs from `__rescue_archive_save` on the same 1-hour throttle as
+  the archive prune. Defaults: keep newest 2000 (tune via
+  `CLAUDE_RESCUE_HOT_KEEP`). The archive tier's hardlinks preserve any
+  inode dropped here, so eviction is information-preserving — only the
+  resurrect-loadable surface shrinks.
+
+  Manual invocation (dry-run / one-shot override / different `--dir`):
 
   ```bash
   bash ~/dev/claude-rescue/scripts/cleanup-resurrect-snapshots.sh --dry-run
   bash ~/dev/claude-rescue/scripts/cleanup-resurrect-snapshots.sh --keep 2000
   ```
 
-  The script uses `find` (no glob), keeps the newest N (default 200, tune
-  via `--keep`), preserves the `last` symlink target, and removes paired
-  `.claude-userops.tsv` sidecars alongside their `.txt` snapshots.
+  The script uses `find` (no glob), preserves the `last` symlink target,
+  and removes paired `.claude-userops.tsv` sidecars alongside their
+  `.txt` snapshots.
 
 - **Orphan `active/` files** — if a previous failed restore minted fresh
   `@claude-pane-id` UUIDs (sidecar miss), the old UUIDs' `active/` files

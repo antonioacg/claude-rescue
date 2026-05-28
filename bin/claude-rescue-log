@@ -478,14 +478,32 @@ __rescue_archive_save() {
 
   # 3. Throttled prune + blob GC. The marker file holds the unix ts of the
   # last prune. Skip if we're inside the interval.
+  # Also runs the hot-tier prune (resurrect_dir itself) on the same cadence —
+  # tmux-resurrect's own rotation breaks past ~6k files ("argument list too
+  # long" in its `ls -t … | tail` chain), so without this the snapshot dir
+  # grows unboundedly until manual cleanup.
   local prune_marker="$archive_dir/.last-prune"
   local now last_prune=0
   now="$(date +%s)"
   [ -f "$prune_marker" ] && last_prune="$(cat "$prune_marker" 2>/dev/null || echo 0)"
   if [ "$((now - last_prune))" -ge "$prune_interval_s" ]; then
     __rescue_archive_prune "$saves_dir" "$blobs_dir" "$keep" "$blob_days"
+    __rescue_hot_prune "$resurrect_dir"
     printf '%s' "$now" > "$prune_marker" 2>/dev/null || true
   fi
+}
+
+# Prune the tmux-resurrect hot dir to CLAUDE_RESCUE_HOT_KEEP (default 2000)
+# newest snapshots via scripts/cleanup-resurrect-snapshots.sh. The archive
+# tier's hardlinks preserve any inode we drop here, so eviction is
+# information-preserving — only the resurrect-loadable surface shrinks.
+__rescue_hot_prune() {
+  local resurrect_dir="$1"
+  [ -d "$resurrect_dir" ] || return 0
+  local hot_keep="${CLAUDE_RESCUE_HOT_KEEP:-2000}"
+  local cleanup="$REPO/scripts/cleanup-resurrect-snapshots.sh"
+  [ -x "$cleanup" ] || return 0
+  "$cleanup" --keep "$hot_keep" --dir "$resurrect_dir" >/dev/null 2>&1 || true
 }
 
 # Prune the archive's saves dir to --keep N (oldest evicted by mtime) and
