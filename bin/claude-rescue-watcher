@@ -52,9 +52,39 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$REPO/lib/common.sh"
 
-PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher.pid"
-OUTDIR="$CLAUDE_RESCUE_DATA_HOME/scrollback"
+# Per-server isolation: a second tmux server (e.g. for testing alongside the
+# live default one) gets its own scrollback dir + pid file. tmux's per-server
+# socket_path basename is the convention already used by @resurrect-dir
+# (see dot_tmux.conf), so following the same name keeps the resurrect-dir
+# and the watcher scrollback dir in sync for save-guarded.sh's bundle step.
+SOCKET_PATH="$(tmux display-message -p '#{socket_path}' 2>/dev/null || true)"
+SERVER_NAME="$(basename "${SOCKET_PATH:-default}")"
+[ -z "$SERVER_NAME" ] && SERVER_NAME="default"
+
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher-$SERVER_NAME.pid"
+OUTDIR="$CLAUDE_RESCUE_DATA_HOME/scrollback/$SERVER_NAME"
 STATE_FILE="$OUTDIR/.state"
+SERVER_PID_FILE="$OUTDIR/.server-pid"
+
+# One-time migration: pre-multi-server layout wrote pane-*/.hash-*/.touch-*
+# at the flat $DATA/scrollback/ root. If the new per-server dir is empty and
+# the flat root has watcher files, move them into the default-server dir.
+# Idempotent — second invocation finds the new dir non-empty, skips.
+__migrate_legacy_layout() {
+  [ "$SERVER_NAME" = "default" ] || return 0
+  local flat="$CLAUDE_RESCUE_DATA_HOME/scrollback"
+  # Move only if any pane-* live at the flat root.
+  if ls "$flat"/pane-* >/dev/null 2>&1; then
+    mkdir -p "$OUTDIR" 2>/dev/null
+    # Move per-pane state files; don't trample anything already in OUTDIR.
+    for f in "$flat"/pane-* "$flat"/.hash-* "$flat"/.touch-*; do
+      [ -e "$f" ] || continue
+      [ -e "$OUTDIR/$(basename "$f")" ] || mv "$f" "$OUTDIR/" 2>/dev/null || true
+    done
+    # State / audit are root-level concepts in the new layout (don't move).
+  fi
+}
+__migrate_legacy_layout
 
 VISIBLE_FLOOR_S="${CLAUDE_RESCUE_WATCHER_VISIBLE_FLOOR_S:-5}"
 BACKGROUND_FLOOR_S="${CLAUDE_RESCUE_WATCHER_BACKGROUND_FLOOR_S:-300}"
@@ -164,6 +194,26 @@ floor_exceeded() {
 
 while :; do
   tmux info >/dev/null 2>&1 || exit 0
+
+  # Server-restart detection: tmux's pane_id is per-server-lifetime (%0 in
+  # the old server is unrelated to %0 in the new one), so a .state from
+  # before a `kill-server`/restore cycle is poison — its pane_ids would all
+  # look "vanished" (56 spurious pane-died) and every current pane would
+  # look "new" (56 spurious pane-created in the per-window event logs).
+  # Detect via tmux's server PID changing: nuke .state so the sweep
+  # below skips, and the first_tick path suppresses pane-created.
+  # The per-pane .hash-/.touch-/pane-* files are keyed by spec
+  # (<session>:<window>.<pane>), which resurrect-restore reconstructs
+  # identically — they stay valid across restart.
+  current_server_pid="$(tmux display-message -p '#{pid}' 2>/dev/null || echo '')"
+  if [ -n "$current_server_pid" ]; then
+    stored_server_pid="$(cat "$SERVER_PID_FILE" 2>/dev/null || echo '')"
+    if [ "$current_server_pid" != "$stored_server_pid" ]; then
+      rm -f "$STATE_FILE"
+      mkdir -p "$(dirname "$SERVER_PID_FILE")" 2>/dev/null
+      printf '%s' "$current_server_pid" > "$SERVER_PID_FILE" 2>/dev/null || true
+    fi
+  fi
 
   # Cold-start detection: no state file = first tick after (re)start, so
   # "new pane" deltas are really "first observation," not actual new panes.

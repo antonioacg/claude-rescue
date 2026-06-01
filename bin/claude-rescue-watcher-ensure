@@ -21,7 +21,12 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$REPO/lib/common.sh"
 
-PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher.pid"
+# Per-server PID file — second tmux server gets its own watcher running in
+# parallel (matches the per-server $OUTDIR convention in the daemon itself).
+SOCKET_PATH="$(tmux display-message -p '#{socket_path}' 2>/dev/null || true)"
+SERVER_NAME="$(basename "${SOCKET_PATH:-default}")"
+[ -z "$SERVER_NAME" ] && SERVER_NAME="default"
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher-$SERVER_NAME.pid"
 
 if [ -f "$PIDFILE" ]; then
   other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"

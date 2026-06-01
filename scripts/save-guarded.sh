@@ -29,7 +29,14 @@ fi
 # sampler hasn't populated anything yet (cold start, never ran), this is a
 # no-op and save just writes a .txt with no pane_contents.
 DATA_HOME="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
-SCROLLBACK_DIR="$DATA_HOME/scrollback"
+# Per-server scrollback dir matches the convention @resurrect-dir already
+# uses (basename of socket_path). For the live default server this is
+# $DATA/scrollback/default; a second test server gets its own dir and its
+# own watcher writes into it independently. Fall back to "default" when the
+# resurrect-dir basename can't be derived (shouldn't happen in practice).
+SERVER_NAME="$(basename "${RESURRECT_DIR:-/default}")"
+[ -z "$SERVER_NAME" ] && SERVER_NAME="default"
+SCROLLBACK_DIR="$DATA_HOME/scrollback/$SERVER_NAME"
 if [ -n "$RESURRECT_DIR" ] && [ -d "$SCROLLBACK_DIR" ]; then
   # Only bundle if at least one pane-* file is present. Globbing in a guard
   # so an empty dir doesn't produce an empty tar.
