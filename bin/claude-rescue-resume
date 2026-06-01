@@ -255,4 +255,14 @@ fi
 
 # --- Live: exec claude with the resolved args ------------------------------
 __rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>} pwd=$PWD session_cwd=${session_cwd:-<none>} cwd_match=$cwd_match"
-exec claude "${final_args[@]}"
+# Guard the same way the rebuilt[] array is guarded earlier: bash 3.2 + set -u
+# treats an empty array's "${arr[@]}" as unbound. Hits when the saved cmd is
+# just `claude -r <UUID>` AND the wrapper resolves no target (active_sid +
+# find-sessions both empty — happens during a pane_uuid lookup miss on
+# restore). Without the guard, the exec crashes with "unbound variable" and
+# the pane falls back to the calling shell — claude never starts, even fresh.
+if [ "${#final_args[@]}" -gt 0 ]; then
+  exec claude "${final_args[@]}"
+else
+  exec claude
+fi
