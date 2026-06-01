@@ -107,6 +107,23 @@ log_err() {
   printf '[rescue-log %s] %s\n' "$(now_iso)" "$*" >> "$err_file"
 }
 
+# log_debug <namespace> <fields...>
+# Append a single timestamped TSV row to $DATA/debug/<namespace>-YYYY-MM-DD.log.
+# Files self-rotate by date; __rescue_debug_prune (called from
+# __rescue_archive_save's hourly throttle) drops anything older than
+# CLAUDE_RESCUE_DEBUG_KEEP_DAYS (default 7). Use for instrumentation that
+# wants high-volume per-event traces without committing to keeping them
+# forever — alert-activity / alert-bell fit this; a final wiring decision
+# can be made after a few days of data.
+log_debug() {
+  local ns="$1"; shift
+  local dir="$CLAUDE_RESCUE_DATA_HOME/debug"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  local day; day="$(date -u +%F)"
+  printf '%s\t%s\n' "$(now_iso)" "$*" \
+    >> "$dir/$ns-$day.log" 2>/dev/null || true
+}
+
 # Logged wrapper around `tmux send-keys` for every internal injection we
 # do. Behavior is unchanged from a bare send-keys (still best-effort, never
 # blocks); the wrapper exists so we can post-incident reconstruct who typed

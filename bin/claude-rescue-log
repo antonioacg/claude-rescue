@@ -314,6 +314,25 @@ cmd_pane_created() {
   rebuild_meta "$window_uuid"
 }
 
+# Instrumentation only — wired from tmux's alert-activity / alert-bell
+# hooks to debug logs (not the per-window event stream). Records each fire
+# alongside light context (pane_active, unseen, current command, last-emit
+# delta) so we can later decide whether to wire alert-activity into the
+# watcher's capture queue. No state mutation, no captures triggered, no
+# events emitted into windows/*.jsonl. Pure observation.
+__cmd_alert_log() {
+  local kind="$1" pane_id="$2"
+  [ -z "$pane_id" ] && return 0
+  # Fields available from the live pane — cheap to read even at high rate.
+  local active unseen cur_cmd
+  active="$(tmux display-message -p -t "$pane_id" '#{pane_active}' 2>/dev/null || echo '?')"
+  unseen="$(tmux display-message -p -t "$pane_id" '#{pane_unseen_changes}' 2>/dev/null || echo '?')"
+  cur_cmd="$(tmux display-message -p -t "$pane_id" '#{pane_current_command}' 2>/dev/null || echo '?')"
+  log_debug "$kind" "pane=$pane_id active=$active unseen=$unseen cmd=$cur_cmd"
+}
+cmd_alert_activity() { __cmd_alert_log "alert-activity" "${1:-}"; }
+cmd_alert_bell()     { __cmd_alert_log "alert-bell"     "${1:-}"; }
+
 cmd_pane_died() {
   local pane_id="$1"
   [ -z "$pane_id" ] && return 0
@@ -533,8 +552,20 @@ __rescue_archive_save() {
   if [ "$((now - last_prune))" -ge "$prune_interval_s" ]; then
     __rescue_archive_prune "$saves_dir" "$blobs_dir" "$keep" "$blob_days"
     __rescue_hot_prune "$resurrect_dir"
+    __rescue_debug_prune
     printf '%s' "$now" > "$prune_marker" 2>/dev/null || true
   fi
+}
+
+# Drop debug log files (lib/common.sh's log_debug helper writes here) older
+# than CLAUDE_RESCUE_DEBUG_KEEP_DAYS (default 7). Filenames are self-dated
+# (<namespace>-YYYY-MM-DD.log), so mtime-based age is the right signal.
+__rescue_debug_prune() {
+  local debug_dir="$CLAUDE_RESCUE_DATA_HOME/debug"
+  [ -d "$debug_dir" ] || return 0
+  local keep_days="${CLAUDE_RESCUE_DEBUG_KEEP_DAYS:-7}"
+  find "$debug_dir" -maxdepth 1 -type f -name '*.log' -mtime "+$keep_days" \
+    -delete 2>/dev/null || true
 }
 
 # Prune the tmux-resurrect hot dir to CLAUDE_RESCUE_HOT_KEEP (default 2000)
@@ -1354,6 +1385,8 @@ case "$cmd" in
   title-now)          cmd_title_now "$@" ;;
   pane-died)          cmd_pane_died "$@" ;;
   pane-created)       cmd_pane_created "$@" ;;
+  alert-activity)     cmd_alert_activity "$@" ;;
+  alert-bell)         cmd_alert_bell "$@" ;;
   client-detached)    cmd_client_detached "$@" ;;
   hibernated)         cmd_hibernated "$@" ;;
   unhibernated)       cmd_unhibernated "$@" ;;
