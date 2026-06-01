@@ -15,7 +15,16 @@ is untouched. Tick boxes as you go.
 
 ## Phase 1 — Setup test panes on the test server
 
-- [ ] Set `@resurrect-strategy-nvim 'session'` (so nvim buffers survive)
+- [ ] **Plain shell window**: run commands that produce identifiable
+      output so Phase 5 has something to verify. Bad test target: a pane
+      running only `sleep 600` — its capture is just the shell prompt,
+      indistinguishable from a freshly-spawned zsh after restore. Good
+      target: send a few `echo "marker-line-N"` lines and an `ls -la /tmp`
+      via `tmux send-keys` before saving, so the restored pane has visible
+      scrollback content we can grep for as a positive signal.
+- [ ] Set `@resurrect-strategy-nvim 'session'` (this is in dot_tmux.conf
+      now; verify it's set on the test server — `tmux -L test show -gqv
+      @resurrect-strategy-nvim` should return `session`)
 - [ ] Create a target file for nvim (e.g. `/tmp/restore-test.md` with a
       few lines and a designated edit point)
 - [ ] Add nvim window editing the target file, cursor at known line
