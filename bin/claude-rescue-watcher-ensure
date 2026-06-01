@@ -28,6 +28,12 @@ SERVER_NAME="$(basename "${SOCKET_PATH:-default}")"
 [ -z "$SERVER_NAME" ] && SERVER_NAME="default"
 PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher-$SERVER_NAME.pid"
 
+# Diagnostic trace: every invocation logs to the debug stream so we can
+# tell whether the tmux hook actually fires us on client-attached.
+# (Cheap; one append per invoke. Useful while we're validating multi-
+# server wiring; remove after the dust settles.)
+log_debug "watcher-ensure" "server=$SERVER_NAME socket=${SOCKET_PATH:-} pid=$$ tmux_env=${TMUX:-unset}"
+
 if [ -f "$PIDFILE" ]; then
   other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
   if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
