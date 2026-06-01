@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# claude-rescue-sampler-ensure — idempotent spawn for the sampler daemon.
+#
+# Wired into tmux's client-attached hook. Cheap to call repeatedly: if a
+# sampler is already running (PID file points at a live process), this is
+# a no-op. Otherwise, spawn claude-rescue-sampler detached (nohup + </dev/null
+# >/dev/null 2>&1 &) so tmux's run-shell wrapper returns immediately and
+# the sampler outlives the originating client.
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/sampler.pid"
+
+if [ -f "$PIDFILE" ]; then
+  other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+nohup "$REPO/bin/claude-rescue-sampler" </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true

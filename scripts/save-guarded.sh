@@ -22,6 +22,36 @@ if [ -n "$RESURRECT_DIR" ] && [ -f "$LOCK_FILE" ]; then
   exit 0
 fi
 
+# Bundle the async sampler's per-pane scrollback into pane_contents.tar.gz
+# before the real save runs. With @resurrect-capture-pane-contents off,
+# save.sh leaves this tar alone — so we get scrollback restore without ever
+# letting capture-pane block tmux's main thread during the save. If the
+# sampler hasn't populated anything yet (cold start, never ran), this is a
+# no-op and save just writes a .txt with no pane_contents.
+DATA_HOME="${CLAUDE_RESCUE_DATA_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/claude-rescue}"
+SCROLLBACK_DIR="$DATA_HOME/scrollback"
+if [ -n "$RESURRECT_DIR" ] && [ -d "$SCROLLBACK_DIR" ]; then
+  # Only bundle if at least one pane-* file is present. Globbing in a guard
+  # so an empty dir doesn't produce an empty tar.
+  if compgen -G "$SCROLLBACK_DIR/pane-*" >/dev/null 2>&1; then
+    tar_stage="$(mktemp -d -t claude-rescue-tar.XXXXXX)"
+    mkdir -p "$tar_stage/pane_contents"
+    # Hardlink instead of copy — same filesystem, near-zero cost.
+    for f in "$SCROLLBACK_DIR"/pane-*; do
+      ln "$f" "$tar_stage/pane_contents/$(basename "$f")" 2>/dev/null \
+        || cp "$f" "$tar_stage/pane_contents/$(basename "$f")" 2>/dev/null \
+        || true
+    done
+    # Write atomically: tar to .tmp, mv into place.
+    if ( cd "$tar_stage" && tar cf - pane_contents/ | gzip > "$RESURRECT_DIR/pane_contents.tar.gz.tmp" ); then
+      mv -f "$RESURRECT_DIR/pane_contents.tar.gz.tmp" "$RESURRECT_DIR/pane_contents.tar.gz"
+    else
+      rm -f "$RESURRECT_DIR/pane_contents.tar.gz.tmp"
+    fi
+    rm -rf "$tar_stage"
+  fi
+fi
+
 # Path to the real save script. Overridable via env for validate.sh
 # (which exercises this wrapper's lock-check behavior without invoking
 # tmux-resurrect's real save against the live resurrect-dir).

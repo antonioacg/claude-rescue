@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# claude-rescue-sampler — async pane-scrollback sampler.
+#
+# Background loop that walks the tmux pane list and calls `capture-pane -p`
+# one pane at a time, with a short sleep between calls. Replaces
+# tmux-resurrect's synchronous capture burst during save: instead of the
+# main thread serializing 50+ panes × 20k lines in one event, the work is
+# paced over many seconds with the user's keystrokes interleaved.
+#
+# Per-pane output is written to $CLAUDE_RESCUE_DATA_HOME/scrollback/pane-<spec>
+# where <spec> is "<session>:<window_idx>.<pane_idx>" — the exact filename
+# tmux-resurrect's restore looks up in pane_contents.tar.gz. The save path
+# (scripts/save-guarded.sh) bundles these files into the tar before invoking
+# the real save; @resurrect-capture-pane-contents stays off so save.sh
+# doesn't re-capture.
+#
+# Three knobs (env overrides):
+#   CLAUDE_RESCUE_SAMPLER_LINES   (default 2000) per-pane -S -N cap
+#   CLAUDE_RESCUE_SAMPLER_PACE_MS (default 200)  sleep between captures
+#   CLAUDE_RESCUE_SAMPLER_CYCLE_S (default 60)   sleep between full cycles
+#
+# Single-instance via PID file; bails silently if another sampler is alive.
+# Self-terminates if `tmux info` ever fails — re-spawn happens via the
+# client-attached hook calling claude-rescue-sampler-ensure.
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/sampler.pid"
+OUTDIR="$CLAUDE_RESCUE_DATA_HOME/scrollback"
+LINES="${CLAUDE_RESCUE_SAMPLER_LINES:-2000}"
+PACE_MS="${CLAUDE_RESCUE_SAMPLER_PACE_MS:-200}"
+CYCLE_S="${CLAUDE_RESCUE_SAMPLER_CYCLE_S:-60}"
+
+# Pre-compute the per-capture sleep as seconds.fraction so the inner loop
+# isn't paying for awk per pane.
+PACE_S="$(awk -v ms="$PACE_MS" 'BEGIN{printf "%.3f", ms/1000}')"
+
+mkdir -p "$OUTDIR"
+
+# Single-instance gate.
+if [ -f "$PIDFILE" ]; then
+  other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+while :; do
+  # Bail if tmux is gone — let client-attached re-spawn us when it returns.
+  tmux info >/dev/null 2>&1 || exit 0
+
+  # Per-cycle live-pane snapshot drives the stale-file sweep at the end.
+  # No per-pane change gate: tmux has no public counter we can read here
+  # ("#{pane_changes}" isn't a real variable). Each cycle re-captures
+  # every pane — bounded cost since -S -$LINES caps depth.
+  live_specs="$(mktemp)"
+  trap 'rm -f "$live_specs" "$PIDFILE"' EXIT INT TERM
+
+  tmux list-panes -aF '#{pane_id}'$'\t''#{session_name}'$'\t''#{window_index}'$'\t''#{pane_index}' 2>/dev/null \
+    | while IFS=$'\t' read -r pane_id sn wi pi; do
+        [ -z "$pane_id" ] && continue
+        spec="$sn:$wi.$pi"
+        printf 'pane-%s\n' "$spec" >> "$live_specs"
+
+        target="$OUTDIR/pane-$spec"
+        tmpfile="$OUTDIR/.pane-$spec.tmp"
+        if tmux capture-pane -epJ -S "-$LINES" -t "$pane_id" -p > "$tmpfile" 2>/dev/null; then
+          mv -f "$tmpfile" "$target"
+        else
+          rm -f "$tmpfile"
+        fi
+        sleep "$PACE_S"
+      done
+
+  # Stale-file sweep — drop pane-* files whose spec is no longer in the live
+  # set (session rename, window reorder, pane killed). Cheap: one grep over
+  # the snapshot per file.
+  if [ -s "$live_specs" ]; then
+    find "$OUTDIR" -maxdepth 1 -name 'pane-*' -type f 2>/dev/null \
+      | while read -r f; do
+          base="$(basename "$f")"
+          grep -Fxq "$base" "$live_specs" || rm -f "$f"
+        done
+  fi
+  rm -f "$live_specs"
+  trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+  sleep "$CYCLE_S"
+done
