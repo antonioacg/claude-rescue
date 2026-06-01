@@ -44,11 +44,24 @@ is untouched. Tick boxes as you go.
       window-uuid + pane-uuid (these are what `claude-rescue-resume` needs
       to look up the session on restore)
 
-## Phase 4 — Cycle the test server
+## Phase 4 — Cycle the test server (simulate a crash, don't detach)
 
-- [ ] User detaches the test session (prefix + d)
-- [ ] `tmux -L test kill-server` (keep `resurrect/test/` intact — that's
-      what continuum will restore from)
+Real failures (tmux OOM, system reboot, panic, network glitch dropping
+the socket, host force-kill) don't give the user a chance to `prefix + d`
+first. The cycle test should match: the user STAYS ATTACHED, the server
+dies under them, their client gets disconnected abruptly. Anything that
+relies on a clean detach beforehand is testing a graceful shutdown, not
+a crash.
+
+- [ ] User stays attached in their terminal (do NOT `prefix + d`)
+- [ ] From any other shell, simulate the crash. Two options:
+      - Graceful-from-tmux-POV but unexpected for client:
+        `tmux -L test kill-server`
+      - Closer to a real crash (instant, no cleanup signals):
+        `kill -9 $(tmux -L test display-message -p '#{pid}')`
+      Either way the user's attached client disconnects with "lost server".
+- [ ] `resurrect/test/` is preserved — that's what continuum will restore
+      from on next start
 - [ ] User runs **`tmux -L test new-session -A -s 0`** in a fresh non-tmux
       terminal.
       **Critical:** do NOT use bare `tmux -L test new-session`. That always
