@@ -209,7 +209,21 @@ while :; do
   if [ -n "$current_server_pid" ]; then
     stored_server_pid="$(cat "$SERVER_PID_FILE" 2>/dev/null || echo '')"
     if [ "$current_server_pid" != "$stored_server_pid" ]; then
+      # Server restart detected. .state is keyed by pane_id (per-server-life)
+      # so it's already invalid — and .hash-/.touch-/pane-* are spec-keyed
+      # (<session>:<window>.<pane>) so they SURVIVE the cycle, but their
+      # content reflects the OLD server's pane contents. After resurrect-
+      # restore, the same specs hold new live content. First post-restore
+      # capture would then see new_hash != prev_hash → return code 0
+      # ("content changed vs prior baseline") → the floor-only queue
+      # entry gets flagged as floor-caught even though it's actually
+      # expected post-restart churn, not an event coverage hole.
+      # Surgical filename-pattern find (-maxdepth 1, specific globs) so
+      # nothing outside OUTDIR/pane-*/.hash-*/.touch-* is touched.
       rm -f "$STATE_FILE"
+      find "$OUTDIR" -maxdepth 1 -type f \
+        \( -name 'pane-*' -o -name '.hash-*' -o -name '.touch-*' \) \
+        -delete 2>/dev/null || true
       mkdir -p "$(dirname "$SERVER_PID_FILE")" 2>/dev/null
       printf '%s' "$current_server_pid" > "$SERVER_PID_FILE" 2>/dev/null || true
     fi
