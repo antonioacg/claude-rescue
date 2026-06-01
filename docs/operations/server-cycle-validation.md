@@ -49,7 +49,18 @@ is untouched. Tick boxes as you go.
 - [ ] User detaches the test session (prefix + d)
 - [ ] `tmux -L test kill-server` (keep `resurrect/test/` intact — that's
       what continuum will restore from)
-- [ ] User runs `tmux -L test new-session` in fresh non-tmux terminal
+- [ ] User runs **`tmux -L test new-session -A -s 0`** in a fresh non-tmux
+      terminal.
+      **Critical:** do NOT use bare `tmux -L test new-session`. That always
+      creates a *new* session alongside whatever continuum restored, leaving
+      the user on an empty session next to the populated one. Symptom: "I
+      restarted, nothing is back." The restored windows are sitting in the
+      sibling session you didn't attach to. `-A -s 0` says "attach to
+      session `0` if it exists, create it if not" — and since restore fires
+      during config load (before tmux processes the command-line directive),
+      session `0` already exists by the time `-A` evaluates.
+      Alternative: `tmux -L test start-server; sleep 1; tmux -L test attach`
+      (two steps but explicit).
 - [ ] Continuum auto-restore fires (saw `@continuum-boot-started` get set)
 
 ## Phase 5 — Verify restore
