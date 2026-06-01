@@ -270,6 +270,50 @@ cmd_title_commit() {
   rebuild_meta "$window_uuid"
 }
 
+# Immediate-commit variant — used by claude-rescue-watcher, whose 1Hz polling
+# loop already debounces (a title we observe is by definition stable for at
+# least the tick interval). Skips cmd_title's spawn-sleep-commit chain; the
+# dedup-against-last check still runs so successive emits of the same value
+# are no-ops.
+cmd_title_now() {
+  local pane_id="$1" title="$2"
+  [ -z "$pane_id" ] && return 0
+  [ -z "$title" ] && return 0
+
+  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  if [ -f "$last" ] && [ "$(cat "$last" 2>/dev/null)" = "$title" ]; then
+    return 0
+  fi
+
+  local window_uuid pane_uuid session_id
+  window_uuid="$(tmux_get_window_uuid "$pane_id")"
+  [ -z "$window_uuid" ] && return 0
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
+
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg t "$title" \
+    --arg puuid "$pane_uuid" --arg sid "${session_id:-}" \
+    '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
+     (if $sid == "" then {} else {session_id:$sid} end)')"
+  mkdir -p "$(dirname "$last")" 2>/dev/null || true
+  printf '%s' "$title" > "$last"
+  rebuild_meta "$window_uuid"
+}
+
+cmd_pane_created() {
+  local pane_id="$1"
+  [ -z "$pane_id" ] && return 0
+  local window_uuid pane_uuid
+  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  [ -z "$window_uuid" ] && return 0
+  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
+    '{ts:$ts, kind:"pane_created", pane_uuid:$puuid}')"
+  rebuild_meta "$window_uuid"
+}
+
 cmd_pane_died() {
   local pane_id="$1"
   [ -z "$pane_id" ] && return 0
@@ -597,111 +641,15 @@ cmd_resurrect_save() {
   mv "$sidecar.tmp" "$sidecar"
 
   # 1b. Archive tier — hardlink saves + content-addressed pane_contents.
-  # Runs every save, independent of the diff step below (which early-returns
-  # on the very first save of a fresh resurrect-dir, when there's no prev).
   # Best-effort; archive failures must not block sidecar bookkeeping.
   __rescue_archive_save "$state_file" || true
 
-  # 2. Snapshot diff. Find the snapshot immediately before $state_file in this
-  # server's resurrect-dir and compare pane_title per (session_name,
-  # window_index, pane_index). Sort by filename (NOT mtime) — tmux-resurrect
-  # names files `tmux_resurrect_<YYYYMMDDTHHMMSS>.txt`, so lexical order is
-  # chronological order. mtime sort would be wrong under concurrent saves
-  # (two hooks firing within the same second can write files in mtime order
-  # different from filename order, which would point our diff at the wrong
-  # base).
-  # First save on a fresh server has no prev; nothing to diff against.
-  local resurrect_dir; resurrect_dir="$(dirname "$state_file")"
-  local prev_state
-  prev_state="$(find "$resurrect_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f 2>/dev/null \
-                 | awk -v cur="$state_file" '$0 < cur' \
-                 | sort | tail -1)"
-  if [ -z "$prev_state" ] || [ ! -f "$prev_state" ]; then
-    return 0
-  fi
-
-  local prev_sidecar="${prev_state%.txt}.claude-userops.tsv"
-
-  # awk diff: emit one record per (sn, wi, pi) whose title changed, plus one
-  # per pane present in prev but absent in current (pane_died).
-  # Output columns (TAB-separated):
-  #   TITLE \t session_name \t window_index \t pane_index \t pane_title \t pane_command
-  #   DIED  \t session_name \t window_index \t pane_index
-  # Resurrect pane line layout — same as bin/claude-rescue-backfill:
-  #   $1=pane $2=sn $3=wi $4=window_active $5=:flags
-  #   $6=pi   $7=pane_title $8=:dir $9=pane_active $10=pane_command
-  local diff_out
-  diff_out="$(awk -F'\t' '
-    FILENAME == prev_file {
-      if ($1 == "pane") {
-        key = $2 "\t" $3 "\t" $6
-        prev_title[key] = $7
-      }
-      next
-    }
-    $1 == "pane" {
-      key = $2 "\t" $3 "\t" $6
-      curr_seen[key] = 1
-      if ($7 != "" && $7 != prev_title[key]) {
-        printf("TITLE\t%s\t%s\t%s\t%s\t%s\n", $2, $3, $6, $7, $10)
-      }
-    }
-    END {
-      for (k in prev_title) {
-        if (!(k in curr_seen)) {
-          split(k, parts, "\t")
-          printf("DIED\t%s\t%s\t%s\n", parts[1], parts[2], parts[3])
-        }
-      }
-    }
-  ' prev_file="$prev_state" "$prev_state" "$state_file")"
-
-  [ -z "$diff_out" ] && return 0
-
-  # Resolve uuids and emit events. Sidecar lookups use the CURRENT sidecar for
-  # TITLE (the pane is alive now), the PREVIOUS sidecar for DIED (the pane is
-  # gone; its uuids were captured in prev_state's sidecar).
-  local touched_windows; touched_windows="$(mktemp)"
-  while IFS=$'\t' read -r kind sn wi pi title pane_cmd; do
-    local kind_window_uuid="" kind_pane_uuid=""
-    case "$kind" in
-      TITLE)
-        kind_window_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" \
-          '$1=="window" && $2==sn && $3==wi {print $5; exit}' "$sidecar")"
-        kind_pane_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" -v pi="$pi" \
-          '$1=="pane" && $2==sn && $3==wi && $4==pi {print $5; exit}' "$sidecar")"
-        [ -z "$kind_window_uuid" ] && continue
-        local session_id
-        session_id="$(latest_open_session_in_pane "$kind_window_uuid" "$kind_pane_uuid")"
-        append_event "$kind_window_uuid" "$(jq -nc \
-          --arg ts "$(now_iso)" --arg t "$title" \
-          --arg puuid "${kind_pane_uuid:-}" --arg sid "${session_id:-}" \
-          '{ts:$ts, kind:"title", pane_uuid:$puuid, title:$t} +
-           (if $sid == "" then {} else {session_id:$sid} end)')"
-        echo "$kind_window_uuid" >> "$touched_windows"
-        ;;
-      DIED)
-        if [ -f "$prev_sidecar" ]; then
-          kind_window_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" \
-            '$1=="window" && $2==sn && $3==wi {print $5; exit}' "$prev_sidecar")"
-          kind_pane_uuid="$(awk -F'\t' -v sn="$sn" -v wi="$wi" -v pi="$pi" \
-            '$1=="pane" && $2==sn && $3==wi && $4==pi {print $5; exit}' "$prev_sidecar")"
-        fi
-        [ -z "$kind_window_uuid" ] && continue
-        append_event "$kind_window_uuid" "$(jq -nc \
-          --arg ts "$(now_iso)" --arg puuid "${kind_pane_uuid:-}" \
-          '{ts:$ts, kind:"pane_died", pane_uuid:$puuid, source:"snapshot_diff"}')"
-        echo "$kind_window_uuid" >> "$touched_windows"
-        ;;
-    esac
-  done <<< "$diff_out"
-
-  # Rebuild meta only for windows that received events here. Other code paths
-  # (cmd_session_start, cmd_session_end, etc.) call rebuild_meta themselves.
-  sort -u "$touched_windows" 2>/dev/null | while IFS= read -r wuuid; do
-    [ -n "$wuuid" ] && rebuild_meta "$wuuid"
-  done
-  rm -f "$touched_windows"
+  # Title-diff and pane-died inference used to live here (snapshot-vs-prev-
+  # snapshot diff against tmux_resurrect_*.txt files). Retired in favor of
+  # claude-rescue-watcher's 1Hz polling, which emits these events in real
+  # time via cmd_title_now / cmd_pane_died. Keeping the diff here would
+  # produce duplicate title events (cmd_title_now's last-value dedup catches
+  # them, but it's wasted work) and duplicate pane_died events (no dedup).
 }
 
 cmd_resurrect_pre_restore_all() {
@@ -1403,7 +1351,9 @@ case "$cmd" in
   stop)               cmd_stop "$@" ;;
   title)              cmd_title "$@" ;;
   title-commit)       cmd_title_commit "$@" ;;
+  title-now)          cmd_title_now "$@" ;;
   pane-died)          cmd_pane_died "$@" ;;
+  pane-created)       cmd_pane_created "$@" ;;
   client-detached)    cmd_client_detached "$@" ;;
   hibernated)         cmd_hibernated "$@" ;;
   unhibernated)       cmd_unhibernated "$@" ;;

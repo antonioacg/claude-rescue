@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# claude-rescue-watcher — 1s-tick event watcher + targeted pane-content sampler.
+#
+# Replaces claude-rescue-sampler (which did flat 60s polling of all panes).
+# This daemon is event-driven: it polls tmux state at 1Hz, detects per-pane
+# changes (title diff, unseen-changes flip, pane_active flip, lifecycle), and
+# captures only panes that changed plus a tiered timed floor.
+#
+# Events emitted via claude-rescue-log:
+#   title <pane_id> <cleaned_title>     pane_title changed (post window-label.sh)
+#   pane-died <pane_id>                  pane in prev tick, absent in current
+#   pane-created <pane_id>               pane in current, absent in prev
+#   floor-caught <pane_id>               floor-triggered capture detected real
+#                                        content change without any event-driven
+#                                        trigger (self-monitoring metric — if
+#                                        these accumulate, our event coverage
+#                                        has a hole)
+#
+# Captures triggered on:
+#   title change | unseen_changes 0↔1 | pane_active flip | pane-created
+#   plus the timed floor:
+#     visible (pane_active=1)       — VISIBLE_FLOOR_S    (default 5s)
+#     backgrounded                  — BACKGROUND_FLOOR_S (default 300s)
+#
+# Hash dedup: each capture's md5 is compared to .hash-<spec>. Identical →
+# skip the disk rewrite (existing pane-<spec> is still correct), only bump
+# .touch-<spec> so the floor advances.
+#
+# Env knobs:
+#   CLAUDE_RESCUE_WATCHER_VISIBLE_FLOOR_S    (default 5)
+#   CLAUDE_RESCUE_WATCHER_BACKGROUND_FLOOR_S (default 300)
+#   CLAUDE_RESCUE_WATCHER_LINES              (default 2000)  per-pane -S -N cap
+#   CLAUDE_RESCUE_WATCHER_QUEUE_PER_TICK     (default 8)     captures per tick
+#   CLAUDE_RESCUE_WATCHER_PACE_MS            (default 50)    between captures
+#   CLAUDE_RESCUE_TITLE_FORMATTER            optional; overrides window-label.sh
+#                                            Called as `$F <wn> <cmd> <title> <host>`
+#
+# Single-instance via PID file. Self-terminates if `tmux info` ever fails;
+# re-spawn on next client-attached via claude-rescue-watcher-ensure.
+
+set -uo pipefail
+
+__script="$0"
+while [ -L "$__script" ]; do
+  __link="$(readlink "$__script")"
+  case "$__link" in
+    /*) __script="$__link" ;;
+    *)  __script="$(cd "$(dirname "$__script")" && pwd)/$__link" ;;
+  esac
+done
+REPO="$(cd "$(dirname "$__script")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$REPO/lib/common.sh"
+
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher.pid"
+OUTDIR="$CLAUDE_RESCUE_DATA_HOME/scrollback"
+STATE_FILE="$OUTDIR/.state"
+
+VISIBLE_FLOOR_S="${CLAUDE_RESCUE_WATCHER_VISIBLE_FLOOR_S:-5}"
+BACKGROUND_FLOOR_S="${CLAUDE_RESCUE_WATCHER_BACKGROUND_FLOOR_S:-300}"
+LINES="${CLAUDE_RESCUE_WATCHER_LINES:-2000}"
+QUEUE_PER_TICK="${CLAUDE_RESCUE_WATCHER_QUEUE_PER_TICK:-8}"
+PACE_MS="${CLAUDE_RESCUE_WATCHER_PACE_MS:-50}"
+PACE_S="$(awk -v ms="$PACE_MS" 'BEGIN{printf "%.3f", ms/1000}')"
+HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
+
+# window-label.sh is the default cleaned-title formatter; CLAUDE_RESCUE_TITLE_FORMATTER
+# overrides. Inline strip is a fallback if neither resolves (just drops the leading
+# non-ASCII run, same as bin/claude-rescue's format_title).
+DEFAULT_LABEL_SCRIPT="$HOME/.config/tmux/scripts/window-label.sh"
+
+mkdir -p "$OUTDIR"
+
+# Single-instance gate.
+if [ -f "$PIDFILE" ]; then
+  other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
+  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+echo "$$" > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+# Compute the cleaned/display title for a pane. Lazy: caller only invokes this
+# when raw inputs differ from the previous tick, so we don't fork per pane per
+# second.
+cleaned_title() {
+  local wn="$1" cmd="$2" raw_title="$3"
+  if [ -n "${CLAUDE_RESCUE_TITLE_FORMATTER:-}" ] && [ -x "$CLAUDE_RESCUE_TITLE_FORMATTER" ]; then
+    "$CLAUDE_RESCUE_TITLE_FORMATTER" "$wn" "$cmd" "$raw_title" "$HOST_SHORT" 2>/dev/null
+    return
+  fi
+  if [ -x "$DEFAULT_LABEL_SCRIPT" ]; then
+    "$DEFAULT_LABEL_SCRIPT" title "$wn" "$cmd" "$raw_title" "$HOST_SHORT" 2>/dev/null
+    return
+  fi
+  printf '%s' "$raw_title" | sed -E 's/^[^ -~]+ *//'
+}
+
+md5_of() {
+  if command -v md5 >/dev/null 2>&1; then
+    md5 -q "$1" 2>/dev/null
+  else
+    md5sum "$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+# Read all of a pane's prev-tick fields in ONE awk call. Bash 3.2 has no
+# associative arrays so we can't pre-load into a hash; per-pane awk would
+# fork 4× per pane × 57 panes = ~230 awk procs/tick (~2.5s). One awk per
+# pane emitting all four fields cuts that to 57 (~400ms). Output: cleaned
+# title \t unseen \t active \t raw_key.
+prev_fields() {
+  local pane_id="$1"
+  [ -f "$STATE_FILE" ] || { printf '\t\t\t'; return; }
+  awk -F'\t' -v id="$pane_id" '$1==id{printf "%s\t%s\t%s\t%s", $4, $5, $6, $7; exit}' "$STATE_FILE"
+}
+
+# Capture one pane. Always touches .touch-<spec> (floor signal). Hash-checks
+# the new content against .hash-<spec>. Returns:
+#   0  content changed vs prior capture (prev hash existed and differed)
+#   1  content unchanged (prev hash existed and matched); pane-<spec> untouched
+#   2  capture failed (tmux call errored)
+#   3  first capture (no prev hash to compare); pane-<spec> created
+capture_pane() {
+  local pane_id="$1" spec="$2"
+  local target="$OUTDIR/pane-$spec"
+  local hash_file="$OUTDIR/.hash-$spec"
+  local touch_file="$OUTDIR/.touch-$spec"
+  local tmpfile="$OUTDIR/.pane-$spec.tmp"
+
+  if ! tmux capture-pane -epJ -S "-$LINES" -t "$pane_id" -p > "$tmpfile" 2>/dev/null; then
+    rm -f "$tmpfile"
+    return 2
+  fi
+
+  : > "$touch_file"
+
+  local new_hash; new_hash="$(md5_of "$tmpfile")"
+  local prev_hash; prev_hash="$(cat "$hash_file" 2>/dev/null || echo "")"
+  if [ -n "$new_hash" ] && [ "$new_hash" = "$prev_hash" ]; then
+    rm -f "$tmpfile"
+    return 1
+  fi
+
+  mv -f "$tmpfile" "$target"
+  [ -n "$new_hash" ] && printf '%s' "$new_hash" > "$hash_file"
+
+  # First capture (no prev hash) vs. real content change — caller needs to
+  # know to avoid false-positive "floor-caught" events on cold start.
+  [ -z "$prev_hash" ] && return 3
+  return 0
+}
+
+# Floor-elapsed check. mtime of .touch-<spec> vs floor.
+floor_exceeded() {
+  local spec="$1" floor="$2"
+  local touch_file="$OUTDIR/.touch-$spec"
+  [ -f "$touch_file" ] || return 0   # never captured → floor exceeded
+  local mtime; mtime="$(stat -f '%m' "$touch_file" 2>/dev/null || echo 0)"
+  local now; now="$(date +%s)"
+  [ "$((now - mtime))" -ge "$floor" ]
+}
+
+while :; do
+  tmux info >/dev/null 2>&1 || exit 0
+
+  # Cold-start detection: no state file = first tick after (re)start, so
+  # "new pane" deltas are really "first observation," not actual new panes.
+  # Suppress pane-created emits this tick.
+  first_tick=0
+  [ -f "$STATE_FILE" ] || first_tick=1
+
+  # Truly-visible panes: pane_active=1 (active in its window) AND
+  # window_active=1 (window is current in its session) AND
+  # session_attached>0 (session has at least one client). pane_active alone
+  # is window-scope (every window has one); on a 46-window setup that'd
+  # over-count visibility by ~10× and flood the capture queue with re-
+  # captures of nominally-active but backgrounded panes. The triple
+  # criterion narrows to ~one pane per attached client. Wrap in spaces so
+  # the case-match below tests exact pane_id (else %1 matches %10).
+  #
+  # Empty @claude-pane-id is expected for panes whose claude session has
+  # been hard-hibernated (the option clears with the process). Not a
+  # malfunction — the sentinel encoding handles it.
+  visible_pids=" $(tmux list-panes -aF '#{?pane_active,#{?window_active,#{?session_attached,#{pane_id} ,},},}' 2>/dev/null | tr -d '\n') "
+
+  current="$(mktemp)"
+  queue="$(mktemp)"            # one line per queued pane: pane_id\tspec\twas_floor_only
+  emit_seen="$(mktemp)"        # pane_ids that emitted any event this tick
+  trap 'rm -f "$current" "$queue" "$emit_seen" "$PIDFILE"' EXIT INT TERM
+
+  # Per-tick state snapshot. Fields: 1=pane_id 2=spec 3=uuid 4=cleaned_title
+  # 5=unseen 6=active 7=raw_key.
+  # Empty fields (e.g. @claude-pane-id unset on most panes) get sentinel-encoded
+  # as `-` because `IFS=$'\t' read` collapses consecutive tabs — tab is IFS
+  # whitespace, and bash's POSIX read coalesces runs of whitespace IFS chars,
+  # eating the empty field and shifting everything after it. The codebase has
+  # the same workaround at claude-rescue-log's sidecar write (see comment
+  # there). Sentinels stay in state for the rest of this tick; they only
+  # matter for comparisons, which are sentinel-vs-sentinel and consistent.
+  tmux list-panes -aF \
+    '#{pane_id}'$'\t''#{session_name}:#{window_index}.#{pane_index}'$'\t''#{@claude-pane-id}'$'\t''#{window_name}'$'\t''#{pane_current_command}'$'\t''#{pane_title}'$'\t''#{pane_unseen_changes}'$'\t''#{pane_active}' \
+    2>/dev/null \
+    | awk -F'\t' 'BEGIN{OFS="\t"} {for(i=1;i<=NF;i++) if($i=="") $i="-"; print}' \
+    > "$current.raw"
+
+  while IFS=$'\t' read -r pane_id spec uuid wn cmd raw_title unseen active; do
+    [ -z "$pane_id" ] && continue
+    raw_key="$wn|$cmd|$raw_title"
+
+    # One awk per pane reads all 4 prev fields. cleaned/unseen/active/raw_key.
+    IFS=$'\t' read -r prev_cleaned prev_unseen prev_active prev_raw < <(prev_fields "$pane_id")
+
+    # Lazy cleaned-title compute: only re-run formatter when raw inputs differ
+    # and prev_cleaned isn't the empty sentinel.
+    if [ "$raw_key" = "$prev_raw" ] && [ -n "$prev_cleaned" ] && [ "$prev_cleaned" != "-" ]; then
+      cleaned="$prev_cleaned"
+    else
+      cleaned="$(cleaned_title "$wn" "$cmd" "$raw_title")"
+      [ -z "$cleaned" ] && cleaned="-"
+    fi
+
+    # All fields default to "-" when empty so the row never contains empty
+    # tab-adjacent fields (which IFS=$'\t' read would collapse on the next
+    # tick's prev_fields lookup). Same reason awk above sentinel-encodes
+    # the tmux list-panes output.
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${pane_id:--}" "${spec:--}" "${uuid:--}" "$cleaned" "${unseen:--}" "${active:--}" "${raw_key:--}" >> "$current"
+
+    queued=0
+
+    # On cold start (no state file existed at tick entry), every pane looks
+    # "new" — but they're not new to tmux, just new to the watcher. Suppress
+    # the pane-created emit on cold start; still queue a capture so we get a
+    # baseline. $first_tick is set once at the top of each iteration's pane
+    # loop.
+    if [ -z "$prev_raw" ] && [ -z "$prev_unseen" ] && [ -z "$prev_active" ]; then
+      if [ "$first_tick" = 0 ]; then
+        claude-rescue-log pane-created "$pane_id" 2>/dev/null &
+        echo "$pane_id" >> "$emit_seen"
+      fi
+      printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"
+      queued=1
+    else
+      if [ "$cleaned" != "$prev_cleaned" ] && [ -n "$cleaned" ]; then
+        claude-rescue-log title-now "$pane_id" "$cleaned" 2>/dev/null &
+        echo "$pane_id" >> "$emit_seen"
+        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+      fi
+      if [ "$unseen" != "$prev_unseen" ]; then
+        echo "$pane_id" >> "$emit_seen"
+        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+      fi
+      if [ "$active" != "$prev_active" ]; then
+        # Active flip — no separate event log, but refresh the capture.
+        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+      fi
+    fi
+
+    # --- floor check (only if not already queued by an event) ---
+    if [ "$queued" = 0 ]; then
+      case "$visible_pids" in
+        *" $pane_id "*) floor="$VISIBLE_FLOOR_S" ;;
+        *)              floor="$BACKGROUND_FLOOR_S" ;;
+      esac
+      if floor_exceeded "$spec" "$floor"; then
+        printf '%s\t%s\t1\n' "$pane_id" "$spec" >> "$queue"
+      fi
+    fi
+  done < "$current.raw"
+  rm -f "$current.raw"
+
+  # --- pane-died detection: prev rows whose pane_id is missing from current ---
+  if [ -f "$STATE_FILE" ]; then
+    awk -F'\t' -v cur="$current" '
+      BEGIN { while ((getline l < cur) > 0) { split(l, a, "\t"); seen[a[1]] = 1 } }
+      { if (!($1 in seen)) print $1 "\t" $2 }
+    ' "$STATE_FILE" | while IFS=$'\t' read -r dead_id dead_spec; do
+      claude-rescue-log pane-died "$dead_id" 2>/dev/null &
+      rm -f "$OUTDIR/pane-$dead_spec" "$OUTDIR/.hash-$dead_spec" "$OUTDIR/.touch-$dead_spec"
+    done
+  fi
+
+  # --- drain capture queue (rate-limited) ---
+  if [ -s "$queue" ]; then
+    drained=0
+    while IFS=$'\t' read -r q_pane_id q_spec q_floor_only; do
+      [ "$drained" -ge "$QUEUE_PER_TICK" ] && break
+      capture_pane "$q_pane_id" "$q_spec"; rc=$?
+      # Only treat rc=0 (real content change with prior baseline) as a hole;
+      # rc=3 (first capture, no baseline) is expected on cold start.
+      if [ "$rc" = 0 ] && [ "$q_floor_only" = "1" ]; then
+        if ! grep -Fxq "$q_pane_id" "$emit_seen" 2>/dev/null; then
+          printf '%s\tfloor-caught\t%s\t%s\n' \
+            "$(date -u +%FT%TZ)" "$q_pane_id" "$q_spec" \
+            >> "$CLAUDE_RESCUE_DATA_HOME/watcher-audit.log" 2>/dev/null || true
+        fi
+      fi
+      drained=$((drained + 1))
+      [ "$drained" -lt "$QUEUE_PER_TICK" ] && sleep "$PACE_S"
+    done < "$queue"
+  fi
+
+  mv -f "$current" "$STATE_FILE"
+  rm -f "$queue" "$emit_seen"
+  trap 'rm -f "$PIDFILE"' EXIT INT TERM
+
+  sleep 1
+done

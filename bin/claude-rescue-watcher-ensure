@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# claude-rescue-sampler-ensure — idempotent spawn for the sampler daemon.
+# claude-rescue-watcher-ensure — idempotent spawn for the watcher daemon.
 #
 # Wired into tmux's client-attached hook. Cheap to call repeatedly: if a
-# sampler is already running (PID file points at a live process), this is
-# a no-op. Otherwise, spawn claude-rescue-sampler detached (nohup + </dev/null
-# >/dev/null 2>&1 &) so tmux's run-shell wrapper returns immediately and
-# the sampler outlives the originating client.
+# watcher is already running (PID file points at a live process), this is
+# a no-op. Otherwise, spawn claude-rescue-watcher detached so tmux's
+# run-shell wrapper returns immediately and the watcher outlives its
+# originating client.
 
 set -uo pipefail
 
@@ -21,7 +21,7 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$REPO/lib/common.sh"
 
-PIDFILE="$CLAUDE_RESCUE_DATA_HOME/sampler.pid"
+PIDFILE="$CLAUDE_RESCUE_DATA_HOME/watcher.pid"
 
 if [ -f "$PIDFILE" ]; then
   other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
@@ -30,5 +30,5 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 
-nohup "$REPO/bin/claude-rescue-sampler" </dev/null >/dev/null 2>&1 &
+nohup "$REPO/bin/claude-rescue-watcher" </dev/null >/dev/null 2>&1 &
 disown 2>/dev/null || true
