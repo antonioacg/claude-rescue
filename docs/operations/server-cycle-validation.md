@@ -77,8 +77,14 @@ is untouched. Tick boxes as you go.
       visible)
 - [ ] **Active claude pane**: claude resumed the SAME session
       (transcript continues, same session_id, prompt + history intact)
-- [ ] **Hibernated claude pane**: `clr <sid>` text visible in re-painted
-      scrollback; typing Enter resumes the session
+- [ ] **Hibernated claude pane**: verify via `tmux -L test capture-pane
+      -p -t <pane>` (the rendered visible buffer, not the byte stream).
+      The bottom of the pane should show `❯ clr <sid>` and the tmux
+      cursor (`tmux display-message -p '#{cursor_x},#{cursor_y}'`) should
+      be on that line, past the end of the session_id. That confirms
+      Enter will actually run the resume command. Do NOT verify by
+      grep-ing the captured pane file — that only proves the text exists
+      somewhere in the byte stream, not that it's at the input prompt.
 - [ ] `watcher-audit.log` has no new `floor-caught` entries from the
       restored panes (would indicate event coverage holes)
 
