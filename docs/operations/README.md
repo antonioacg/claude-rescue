@@ -12,6 +12,7 @@ environment without touching the live tmux server.
 | [production-rollout.md](./production-rollout.md) | Step-by-step runbook for cutting a live machine over to a new release — state dump, apply, server restart, verify, rollback. |
 | [rollout-2026-05-11-postmortem.md](./rollout-2026-05-11-postmortem.md) | Postmortem of the first production rollout. Bugs caught, root causes unresolved at that time, recovery paths validated. |
 | [rollout-2026-05-12-postmortem.md](./rollout-2026-05-12-postmortem.md) | Second rollout on the same machine. Snapshot race (continuum-save during restore), wrapper P3-fallback bug, active/ bulk-clear bug; five patches that make the restore path durable. **Read this before doing the rollout on another machine** — the 2026-05-11 hypotheses became reproducible here. |
+| [rca-2026-06-05-restore-keystroke-race.md](./rca-2026-06-05-restore-keystroke-race.md) | Real macOS crash → continuum auto-restore fired **twice**, double-running the non-idempotent post-restore UX path. The two passes concatenated `clr <sid>` + `claude-rescue print` and executed the garble; every hard-hibernated session failed to resume and landed in `~`. Recovery procedure + proposed fixes (single restore trigger, idempotency guard, cwd-correct pre-fill). |
 
 ## Where things live
 
