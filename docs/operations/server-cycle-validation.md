@@ -146,6 +146,12 @@ a crash.
   (`@continuum-restore off` + restore-wrapper as sole path) is tracked as a
   follow-up; see `rca-2026-06-05-restore-keystroke-race.md`. Until then, the
   idempotency guard is what prevents recurrence.
+- The idempotency guard is proven against the **real** production dual-trigger
+  (continuum auto-restore + boot-guard, both firing on one boot) by the
+  containerized harness in `test/docker/` — the host can't reproduce the
+  dual-trigger because continuum self-suppresses when another tmux server is
+  running. `test/docker/orchestrate.py` fans the proof out over parallel,
+  isolated runs; see `test/docker/README.md`.
 
 ## Run log
 

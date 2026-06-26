@@ -1,0 +1,11 @@
+# Pinned tool versions for the restore-test container.
+#
+# These EXACTLY match the host's mise tools (see ~/.config/mise/config.toml) so
+# the version-sensitive tmux restore hooks behave identically to production.
+# Pinned to exact versions (not "latest"/"lts") for reproducible test runs.
+# Single source of truth — the Dockerfile just `mise install`s this file.
+[tools]
+tmux   = "3.6a"
+neovim = "0.12.0"
+claude = "2.1.170"
+node   = "24.14.1"

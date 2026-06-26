@@ -1,0 +1,30 @@
+# Dual-trigger restore idempotency test — service definition.
+#
+# Clean boundaries:
+#   Dockerfile + mise.toml   image (tools at host-pinned versions)
+#   entrypoint.sh            env prep (creds, hooks, onboarding flags)
+#   harness.sh               in-container test logic (tmux-native, emits JSON)
+#   container.tmux.conf      production-mirroring dual restore-trigger config
+#   run.sh                   single run / interactive shell
+#   orchestrate.py           parallel scenario matrix over isolated projects
+#
+# The claude-rescue working tree, host tmux plugins + restore-wrapper, zsh
+# aliases, and the Keychain-extracted credential seed are mounted read-only at
+# runtime (CLR_SEED is set by run.sh / orchestrate.py).
+services:
+  harness:
+    build: .
+    image: clr-restore-test
+    init: true
+    entrypoint: ["bash", "/opt/claude-rescue/test/docker/entrypoint.sh"]
+    command: ["bash", "/opt/claude-rescue/test/docker/harness.sh"]
+    environment:
+      IS_SANDBOX: "1"
+      NPANES: "${NPANES:-2}"
+      CLAUDE_RESCUE_SOFT_DELAY: "${CLAUDE_RESCUE_SOFT_DELAY:-6}"
+      CLAUDE_RESCUE_HARD_DELAY: "${CLAUDE_RESCUE_HARD_DELAY:-12}"
+    volumes:
+      - ../../:/opt/claude-rescue:ro
+      - ${HOME}/.config/tmux:/home/tester/.config/tmux:ro
+      - ${HOME}/.config/zsh:/home/tester/.config/zsh:ro
+      - ${CLR_SEED:?set CLR_SEED to the credential seed dir (run.sh/orchestrate.py do this)}:/seed:ro
