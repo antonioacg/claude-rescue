@@ -266,5 +266,108 @@ incident; patches are a follow-up decision.
   racing to rebuild the same named sessions (why *some* panes came back
   as `bash` in `$HOME`) was inferred from the log, not independently
   reproduced. The fix (single restore trigger) makes it moot.
-- No patches landed yet. The recommended fixes above are the proposed
-  remediation, pending a decision on which to take.
+- Patches landed in commit `9c58999` (2026-06-26) — recommended fixes 2–5;
+  fix 1 (single restore trigger) is a deferred chezmoi change. The
+  Resolution section below records what shipped and the gaps a post-fix
+  code review surfaced.
+
+---
+
+## Resolution — 2026-06-26 (commit `9c58999`)
+
+`fix(restore): idempotent, cwd-anchored post-restore pre-fill` hardened the
+post-restore UX path. Status against the Recommended fixes above:
+
+- **Fix 2 (idempotency guard) — DONE.** Per-pane, per-server-PID atomic
+  `mkdir` claim at `$CACHE/post-restore-claims/<server-pid>__<pane_uuid>`,
+  claimed before any keystroke; the loser of a concurrent race `continue`s.
+- **Fix 3 (cwd-correct + Enter-safe) — DONE.** Pre-fill is now
+  `cd <launch-cwd> && clr <sid>`, led by `C-u`. Launch cwd from
+  `claude-rescue find-sessions --pane-uuid` col 6, `[ -d ]`-guarded, with a
+  fallback to the capture cwd, then bare `clr`.
+- **Fix 4 (no Enter-terminated keystroke) — DONE.** The auto
+  `claude-rescue print` is dropped; nothing the subshell sends carries Enter.
+- **Fix 5 (validation) — DONE (partial — see coverage gaps).**
+  `validate-crash-restore.sh` scenarios 5 (concurrent double-fire) and 6
+  (vanished-dir fallback); `server-cycle-validation.md` Phase 5 updated.
+- **Fix 1 (single restore trigger) — DEFERRED.** chezmoi
+  `@continuum-restore off` cleanup; the guard makes it non-load-bearing, but
+  the double restore still fires on every real boot.
+
+Structural note: dropping the Enter keystroke (fix 4) plus the leading `C-u`
+(fix 3) already make a double-fire benign on their own — no Enter ⇒ nothing
+executes; `C-u` ⇒ the last writer leaves a clean buffer (tmux processes each
+`send-keys` atomically, so no character interleave). The `mkdir` claim adds
+exactly-once cleanliness on top. Three independent layers — good depth.
+
+### Review follow-ups (gaps remaining after `9c58999`)
+
+Found by reading the full diff against the prior code review. **None re-open
+the incident** — they are sharp edges and coverage holes on top of a sound
+fix.
+
+**Worth fixing before calling it closed:**
+
+1. **Unquoted launch cwd (latent bug).** `bin/claude-rescue-log` builds
+   `prefill="cd $launch_cwd && clr $sid"` — `$launch_cwd` is interpolated
+   unquoted into text typed at the shell. A launch dir containing a space
+   (or shell metachar) types a broken `cd`; the `[ -d "$launch_cwd" ]` test
+   is quoted but the emitted line is not. The picker's `resume_command`
+   already `%q`-quotes (`cd %q && claude --resume %q`) — match it. (The
+   `claude-rescue-resume` wrapper is unaffected: it `exec`s claude with a
+   quoted argv, never types into a shell.)
+2. **cwd/sid provenance not pinned to one session.** `sid` comes from
+   `captures/<pane_uuid>.json`, but `launch_cwd` comes from
+   `find-sessions --pane-uuid <uuid> | head -1` col 6 — not filtered to
+   `$sid`. A pane that hosted more than one session (the scenario-3 case:
+   hard → fresh `cl` → hard again) can surface a row for a *different*
+   session, yielding `cd <other-session-cwd> && clr <sid>`. Worst case is the
+   same picker fallback as pre-fix (not a regression), but it silently
+   defeats the cwd anchoring for exactly the multi-copy case the
+   "Contributing" section warns about. Confirm `find-sessions --pane-uuid`'s
+   row count/sort and match the row on col 1 == `$sid`.
+
+**Coverage gaps (the headline mechanism is under-tested):**
+
+3. **The primary find-sessions cwd path has no automated coverage.** Both
+   new scenarios fall through to the *capture-json fallback* — scenario 6's
+   own comment notes "find-sessions won't resolve a fixture sid in the real
+   projects dir." So `cd <launch-cwd>` is only ever exercised via the
+   fallback; the jsonl-validated primary source is validated only manually
+   (server-cycle-validation Phase 5).
+4. **cwd correctness is asserted only as format, not value.** Scenario 5
+   matches `cd .* && clr <sid>` (any target) and never lands a pane in
+   `$HOME` to prove the `cd` actually *rescues* a mis-restored pane — the
+   real-world failure the fix targets. A wrong cwd would still pass.
+5. **Idempotency is tested at the subcommand level, not the real
+   double-trigger.** Scenario 5 calls `claude-rescue-log resurrect-restore`
+   twice directly; it does not exercise continuum + `restore-wrapper` +
+   `restore.sh`, nor the `$HOME`-landing collateral. Faithful unit test of
+   the `mkdir` claim; the system-level repro still needs the chezmoi path
+   (which staging deliberately suppresses).
+
+**Lower priority:**
+
+6. **claims_dir-unwritable ⇒ silent total skip.** If `$server_pid` is set
+   but `mkdir "$claim"` fails for a non-race reason (dir unwritable / ENOSPC),
+   every pane `continue`s and *zero* pre-fills happen, silently — asymmetric
+   with the empty-`server_pid` path, which falls through and pre-fills all.
+7. **Same-epoch deliberate re-restore is a no-op; claims linger.** The claim
+   epoch is the whole server lifetime, so a manual `prefix+Ctrl-r` later
+   skips already-claimed panes; claims are cleaned only when a new server
+   PID sweeps them. Correct for the incident, bounded and harmless, but
+   mildly surprising.
+8. **Twin pre-fill site lacks `C-u`.** The hard-hibernation arm path
+   (`hibernate-hard-clr`, ~`claude-rescue-log:1256`) still sends a bare
+   `clr <sid>` without the leading `C-u`. Not a cwd risk (absent a restore
+   the pane keeps its dir), but inconsistent with the hardened restore path.
+
+**Still open, system-wide (pre-existing, out of this commit's scope):**
+
+9. **`claude-rescue-resume` resumes in the wrong `$PWD` knowingly.** The
+   soft-hibernation wrapper-resume path (distinct from this hard-hibernation
+   pre-fill) computes `cwd_match=N` (`~claude-rescue-resume:251-254`), logs
+   it, and `exec claude` in the inherited `$PWD` anyway — silently starting
+   a fresh session when restore lands the pane in the wrong dir. The cwd
+   class is hardened for hard-hibernation here but not closed for
+   wrapper-resume.
