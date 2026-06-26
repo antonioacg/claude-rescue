@@ -12,9 +12,9 @@
 #        - marker cleaned up by session_start when wrapper-launched claude boots
 #   2. Hard → save (cmd=zsh) → kill -9 → restore:
 #        - restored pane comes back as zsh (no claude)
-#        - post-restore-keys subshell runs `claude-rescue print` (capture
-#          provenance visible in scrollback)
-#        - `clr <sid>` pre-filled at the shell prompt
+#        - `clr <sid>` pre-filled at the shell prompt (no auto `claude-rescue
+#          print` — that Enter-terminated step was dropped; capture header must
+#          NOT auto-paint)
 #        - marker SURVIVES (cleaned up only when user presses Enter and claude
 #          actually restarts — protects against a second crash before resume)
 #   3. Hard → focus-in → fresh `cl` → hard again → crash → restore:
@@ -26,6 +26,14 @@
 #          baked into the saved tmux-resurrect cmdline. Catches the regression
 #          where in-claude `/resume` switches sessions and the wrapper resumes
 #          the wrong (frozen-at-save-time) conversation after a crash-restore.
+#   5. Hard → DOUBLE concurrent post-restore (the 2026-06-05 incident):
+#        - the post-restore hook fired twice concurrently (continuum auto-
+#          restore + restore-wrapper) is idempotent — exactly ONE pre-fill per
+#          pane, no executed garble, stray prompt text wiped (C-u), pre-fill
+#          cwd-anchored as `cd <launch-cwd> && clr <sid>`.
+#   6. Hard → post-restore with a vanished launch dir:
+#        - falls back to a bare `clr <sid>` (never emits `cd <gone-dir> &&`,
+#          which would fail on Enter).
 #
 # Exit 0 on all-pass, non-zero on any failure. Cleans up on exit.
 
@@ -230,13 +238,20 @@ if [ -n "$RESTORED_P0" ]; then
   RESTORED_CMD="$(tmux -L "$SOCK" display-message -p -t "$RESTORED_P0" '#{pane_current_command}' 2>/dev/null)"
   assert "scenario 2: restored pane is zsh (not auto-resumed)" "zsh" "$RESTORED_CMD"
 
-  # The post-restore-keys subshell should have run `claude-rescue print` (provenance visible)
-  # and pre-filled `clr <SAVED_SID>` at the prompt (no Enter, so it's in the line buffer).
+  # The post-restore-keys subshell pre-fills `clr <SAVED_SID>` at the prompt
+  # (no Enter, so it's in the line buffer), now anchored with `cd <cwd> &&`.
+  # No auto `claude-rescue print` runs anymore (it was the dangerous, Enter-
+  # terminated half), so the capture header should NOT be auto-painted.
   PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t "$RESTORED_P0" -S - 2>/dev/null)"
-  assert_contains "scenario 2: 'claude-rescue capture' header in scrollback" \
-    "# claude-rescue capture" "$PANE_CONTENT"
+  if printf '%s' "$PANE_CONTENT" | grep -q "# claude-rescue capture"; then
+    RESULTS+=("FAIL  scenario 2: auto-print should be gone (capture header auto-painted)")
+    FAIL=$((FAIL + 1))
+  else
+    RESULTS+=("PASS  scenario 2: no auto-print (capture header not auto-painted)")
+    PASS=$((PASS + 1))
+  fi
   assert_contains "scenario 2: 'clr <saved_sid>' pre-filled at prompt" \
-    "❯ clr $SAVED_SID" "$PANE_CONTENT"
+    "clr $SAVED_SID" "$PANE_CONTENT"
 fi
 
 # Marker must SURVIVE post-restore-keys (the `clr <sid>` text on the prompt
@@ -338,8 +353,8 @@ assert_nonempty "scenario 3: restored pane found by pane_uuid" "$RESTORED_P0"
 if [ -n "$RESTORED_P0" ]; then
   PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t "$RESTORED_P0" -S - 2>/dev/null)"
   assert_contains "scenario 3: post-restore-keys pre-filled clr <NEW_SID>" \
-    "❯ clr $NEW_SID" "$PANE_CONTENT"
-  if printf '%s' "$PANE_CONTENT" | grep -q "❯ clr $ORIGINAL_SID"; then
+    "clr $NEW_SID" "$PANE_CONTENT"
+  if printf '%s' "$PANE_CONTENT" | grep -q "clr $ORIGINAL_SID"; then
     RESULTS+=("FAIL  scenario 3: original sid leaked into prompt (stale marker bug)")
     FAIL=$((FAIL + 1))
   else
@@ -398,6 +413,113 @@ else
   fi
 
   rm -f "$DATA_DIR/active/$S4_PUUID"
+fi
+
+# ===========================================================================
+echo ""
+echo "[5] hard → DOUBLE concurrent post-restore: exactly-once, cwd-anchored, Enter-safe"
+
+bring_up_fresh
+
+P0=%0
+P0_UUID="$(tmux -L "$SOCK" show-options -pv -t $P0 @claude-pane-id 2>/dev/null)"
+SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
+  [.[] | select(.pane_uuid == $p and (.kind | startswith("session_start")))]
+  | sort_by(.ts) | last | .session_id // empty
+' "$DATA_DIR/windows/"*.jsonl 2>/dev/null)"
+assert_nonempty "scenario 5: SAVED_SID extracted" "$SAVED_SID"
+
+# Hard-hibernate → pane ends at zsh with a genuine (non-crash-promote) marker.
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep $((HARD_DELAY + 8))
+assert "scenario 5: marker mode=hard" "hard" \
+  "$(jq -r '.mode // empty' "$CACHE_DIR/hibernated/$P0_UUID.json" 2>/dev/null)"
+
+# Sidecar so cmd_resurrect_restore proceeds to the post-restore subshell.
+force_save
+
+# Leave a stray half-typed line on the prompt — the pre-fill's C-u must wipe it.
+tmux -L "$SOCK" send-keys -t $P0 "garbage-leftover-xyz"
+sleep 0.3
+
+# Scope the idempotency count to this scenario.
+: > "$DATA_DIR/send-keys.log"
+
+# Fire the post-restore hook TWICE concurrently — reproduces the two restore
+# triggers (continuum auto-restore + restore-wrapper boot path) racing on one
+# boot, which is what corrupted the 2026-06-05 restore.
+tmux -L "$SOCK" run-shell -b "claude-rescue-log resurrect-restore"
+tmux -L "$SOCK" run-shell -b "claude-rescue-log resurrect-restore"
+sleep 9   # each subshell: 5s sleep + send-keys
+
+# Exactly ONE pre-fill for this session despite two concurrent passes. This is
+# the load-bearing idempotency check: the C-u in each burst means a second
+# (un-guarded) pass would still LOOK clean in the pane (it wipes the first
+# pre-fill and re-types), so only the send COUNT proves the claim skipped it.
+# Match on the bare sid — send_keys_logged %q-quotes the keys, so the space in
+# `clr <sid>` is logged as `clr\ <sid>`; the uuid itself is unquoted.
+CLR_COUNT="$(grep -c "post-restore-clr.*$SAVED_SID" "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
+assert "scenario 5: exactly one post-restore-clr (idempotent under double-fire)" "1" "${CLR_COUNT:-0}"
+# Direct proof the guard claimed the pane exactly once.
+CLAIM_COUNT="$(find "$CACHE_DIR/post-restore-claims" -mindepth 1 -maxdepth 1 -type d -name "*__$P0_UUID" 2>/dev/null | wc -l | tr -d ' ')"
+assert "scenario 5: exactly one idempotency claim dir for the pane" "1" "${CLAIM_COUNT:-0}"
+
+# Pane stayed at the shell — no garbled claude got executed.
+assert "scenario 5: pane still zsh (no executed garble)" "zsh" \
+  "$(tmux -L "$SOCK" display-message -p -t $P0 '#{pane_current_command}' 2>/dev/null)"
+
+PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t $P0 -S - 2>/dev/null)"
+assert_contains "scenario 5: pre-fill is cwd-anchored 'cd .. && clr <sid>'" \
+  "cd .* && clr $SAVED_SID" "$PANE_CONTENT"
+if printf '%s' "$PANE_CONTENT" | grep -q "garbage-leftover-xyz.*clr $SAVED_SID"; then
+  RESULTS+=("FAIL  scenario 5: stray text not cleared before pre-fill (C-u missing)"); FAIL=$((FAIL + 1))
+else
+  RESULTS+=("PASS  scenario 5: stray prompt text cleared before pre-fill (C-u)"); PASS=$((PASS + 1))
+fi
+if printf '%s' "$PANE_CONTENT" | grep -qE "clr ${SAVED_SID}[A-Za-z]"; then
+  RESULTS+=("FAIL  scenario 5: garbled concatenation after sid (double-fire leaked)"); FAIL=$((FAIL + 1))
+else
+  RESULTS+=("PASS  scenario 5: no garbled concatenation after sid"); PASS=$((PASS + 1))
+fi
+
+# ===========================================================================
+echo ""
+echo "[6] hard → post-restore with a vanished launch dir: bare 'clr' fallback (no broken cd)"
+
+bring_up_fresh
+
+P0=%0
+P0_UUID="$(tmux -L "$SOCK" show-options -pv -t $P0 @claude-pane-id 2>/dev/null)"
+SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
+  [.[] | select(.pane_uuid == $p and (.kind | startswith("session_start")))]
+  | sort_by(.ts) | last | .session_id // empty
+' "$DATA_DIR/windows/"*.jsonl 2>/dev/null)"
+assert_nonempty "scenario 6: SAVED_SID extracted" "$SAVED_SID"
+
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep $((HARD_DELAY + 8))
+assert "scenario 6: marker mode=hard" "hard" \
+  "$(jq -r '.mode // empty' "$CACHE_DIR/hibernated/$P0_UUID.json" 2>/dev/null)"
+force_save
+
+# Point the only resolvable cwd (capture json — find-sessions won't resolve a
+# fixture sid in the real projects dir) at a directory that does not exist.
+GONE="/tmp/claude-rescue-gone-$$"
+rm -rf "$GONE"
+S6_TMP="$(mktemp)"
+jq --arg c "$GONE" '.cwd=$c' "$DATA_DIR/captures/$P0_UUID.json" > "$S6_TMP" \
+  && mv "$S6_TMP" "$DATA_DIR/captures/$P0_UUID.json"
+
+: > "$DATA_DIR/send-keys.log"
+tmux -L "$SOCK" run-shell -b "claude-rescue-log resurrect-restore"
+sleep 9
+
+PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t $P0 -S - 2>/dev/null)"
+assert_contains "scenario 6: bare 'clr <sid>' pre-filled" "clr $SAVED_SID" "$PANE_CONTENT"
+if printf '%s' "$PANE_CONTENT" | grep -q "cd $GONE"; then
+  RESULTS+=("FAIL  scenario 6: emitted 'cd <gone-dir>' (would fail on Enter)"); FAIL=$((FAIL + 1))
+else
+  RESULTS+=("PASS  scenario 6: no 'cd <gone-dir>' emitted (graceful fallback)"); PASS=$((PASS + 1))
 fi
 
 # ---------------------------------------------------------------------------

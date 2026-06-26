@@ -101,12 +101,27 @@ a crash.
       (transcript continues, same session_id, prompt + history intact)
 - [ ] **Hibernated claude pane**: verify via `tmux -L test capture-pane
       -p -t <pane>` (the rendered visible buffer, not the byte stream).
-      The bottom of the pane should show `❯ clr <sid>` and the tmux
-      cursor (`tmux display-message -p '#{cursor_x},#{cursor_y}'`) should
-      be on that line, past the end of the session_id. That confirms
-      Enter will actually run the resume command. Do NOT verify by
-      grep-ing the captured pane file — that only proves the text exists
-      somewhere in the byte stream, not that it's at the input prompt.
+      The bottom of the pane should show `❯ cd <launch-cwd> && clr <sid>`
+      and the tmux cursor (`tmux display-message -p '#{cursor_x},#{cursor_y}'`)
+      should be on that line, past the end of the command. That confirms
+      Enter will actually run the resume command **in the right directory**.
+      Do NOT verify by grep-ing the captured pane file — that only proves
+      the text exists somewhere in the byte stream, not that it's at the
+      input prompt.
+- [ ] **Pre-fill is cwd-anchored**: the `cd <launch-cwd>` prefix matches
+      where the session's `.jsonl` lives under `~/.claude/projects/` (the
+      launch cwd, not necessarily the last-active path). If the launch dir
+      no longer exists, the pre-fill is a bare `clr <sid>` (never a
+      `cd <gone-dir> &&` that would fail on Enter).
+- [ ] **Idempotent under double-fire**: a real crash can fire restore
+      twice (continuum's own auto-restore + the `restore-wrapper.sh` boot
+      path), so the post-restore hook can run concurrently with a twin.
+      Confirm each hibernated pane has **exactly one** clean pre-fill — no
+      garbled concatenation (`clr <sid>claude-rescue …`), no executed
+      command, pane still at the shell. Cross-check `send-keys.log`: one
+      `post-restore-clr` per pane, and
+      `ls $CLAUDE_RESCUE_CACHE_HOME/post-restore-claims/` shows one claim
+      dir per handled pane (named `<server-pid>__<pane_uuid>`).
 - [ ] `watcher-audit.log` has no new `floor-caught` entries from the
       restored panes (would indicate event coverage holes)
 
@@ -122,8 +137,15 @@ a crash.
 - Simulated hibernated state vs. real hibernation diverge in one way: real
   hibernation has the SOFT (Ctrl+Z) phase first, leaving claude in a `T`
   state before the hard exit. The simulation skips that. Pane-content-wise
-  the end state (`clr <sid>` in the pane) is identical, which is what the
-  restore path consumes.
+  the end state (`cd <cwd> && clr <sid>` in the pane) is identical, which is
+  what the restore path consumes.
+- The post-restore pre-fill path is idempotent by construction (per-pane,
+  per-server-PID `mkdir` claim under
+  `$CLAUDE_RESCUE_CACHE_HOME/post-restore-claims/`), so it is safe even when
+  restore fires more than once. The remaining single-trigger config cleanup
+  (`@continuum-restore off` + restore-wrapper as sole path) is tracked as a
+  follow-up; see `rca-2026-06-05-restore-keystroke-race.md`. Until then, the
+  idempotency guard is what prevents recurrence.
 
 ## Run log
 

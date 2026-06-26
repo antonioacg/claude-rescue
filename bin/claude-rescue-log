@@ -812,23 +812,54 @@ cmd_resurrect_restore() {
   # each file is overwritten in place; orphaned entries for vanished
   # pane_uuids are harmless (the wrapper only queries by live pane_uuid).
 
-  # === Post-restore UX: for each pane with a hard-hibernation marker AND no
-  # live claude process, run `claude-rescue print` (shows the captured
-  # snapshot) and pre-fill `clr <sid>` (no Enter — user reviews and presses
-  # Enter to resume). Skip if claude is alive in the pane: tmux-resurrect
-  # reports pane_current_command='claude' even when claude was Ctrl+Z'd to
-  # background, so soft-hibernated panes get auto-resumed by the resurrect
-  # @resurrect-processes wrapper. In that case, sending keys would feed text
-  # into the running claude — not what we want.
+  # === Post-restore UX: for each pane with a genuine hard-hibernation marker,
+  # pre-fill `cd <launch-cwd> && clr <sid>` (no Enter — the user reviews and
+  # presses Enter to resume) so a crashed-then-restored session is one
+  # keystroke from coming back in the RIGHT directory. `clr -r <sid>` resolves
+  # the transcript against the cwd it launches in; restore can drop a pane back
+  # in $HOME, so we anchor the cwd explicitly.
   #
-  # Done in a backgrounded subshell to avoid blocking the pre-restore hook;
-  # sleeps long enough for resurrect to finish launching pane processes and
-  # the shell (or restored claude) to render its prompt.
+  # IDEMPOTENT BY CONSTRUCTION. This hook (pre-restore-pane-processes) fires
+  # once per tmux-resurrect restore.sh invocation, but a real boot can trigger
+  # restore more than once (continuum's own auto-restore + the restore-wrapper
+  # boot path), so this subshell can run concurrently with a twin. A per-pane,
+  # per-server-instance claim (atomic mkdir) makes each pane handled exactly
+  # once per restore epoch. Without it, a second pass appends its keystrokes
+  # onto the first pass's un-terminated pre-fill and a stray Enter executes the
+  # garble — the 2026-06-05 incident
+  # (docs/operations/rca-2026-06-05-restore-keystroke-race.md).
+  #
+  # We send NO Enter-terminated keystroke: the auto `claude-rescue print` that
+  # used to run here was the half that turned a duplicate pre-fill into an
+  # executed command. The capture stays on disk; `claude-rescue print` is the
+  # user's to run. Each pre-fill leads with C-u to wipe any raced/leftover
+  # readline input (resurrect's own restore keystrokes, a half-typed command).
+  #
+  # crash-promote markers (soft-hibernated panes resurrect is auto-resuming via
+  # the @resurrect-processes wrapper) are skipped: their pane is racing through
+  # shell → claude-rescue-resume → claude and any keystroke corrupts the resume.
+  #
+  # Done in a backgrounded subshell to avoid blocking the hook; sleeps long
+  # enough for resurrect to finish launching pane processes and the shell to
+  # render its prompt.
   (
     exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/restore-keys.err"
     sleep 5
 
+    # Per-restore-epoch claim dir, scoped by the live tmux server PID so a
+    # later reboot (new PID) re-treats each pane. Claims from prior server
+    # instances are harmless orphans; sweep them once up front.
+    local server_pid claims_dir
+    server_pid="$(tmux display-message -p '#{pid}' 2>/dev/null || echo '')"
+    claims_dir="$CLAUDE_RESCUE_CACHE_HOME/post-restore-claims"
+    mkdir -p "$claims_dir" 2>/dev/null || true
+    if [ -n "$server_pid" ]; then
+      find "$claims_dir" -mindepth 1 -maxdepth 1 -type d \
+        ! -name "${server_pid}__*" -exec rm -rf {} + 2>/dev/null || true
+    fi
+
     local pane_id pane_uuid hib_marker mode hard_source sid cap_meta
+    local claim row launch_cwd prefill
     while IFS=$'\t' read -r pane_id pane_uuid; do
       [ -n "$pane_uuid" ] || continue
       hib_marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
@@ -850,20 +881,37 @@ cmd_resurrect_restore() {
 
       cap_meta="$CLAUDE_RESCUE_DATA_HOME/captures/$pane_uuid.json"
       sid="$(jq -r '.session_id // empty' "$cap_meta" 2>/dev/null)"
+      [ -n "$sid" ] || continue
 
-      # 1. Print the captured snapshot (uses default-arg path which reads
-      #    @claude-pane-id re-applied from the sidecar above).
-      send_keys_logged "post-restore-print" "$pane_id" "claude-rescue print" Enter
-      sleep 0.5
-      # 2. Pre-fill resume command (no Enter). User hits Enter to start.
-      if [ -n "$sid" ]; then
-        send_keys_logged "post-restore-clr" "$pane_id" "clr $sid"
+      # Idempotency claim: atomic mkdir; the loser of a concurrent race skips.
+      # Only the winning pass falls through to send keys. (If we couldn't read
+      # a server PID, fall through unguarded rather than never resuming.)
+      if [ -n "$server_pid" ]; then
+        claim="$claims_dir/${server_pid}__${pane_uuid}"
+        mkdir "$claim" 2>/dev/null || continue
       fi
 
-      # Marker NOT deleted here. The `clr <sid>` text is live readline input
-      # (not captured by tmux-resurrect), so a second crash before the user
-      # presses Enter would lose the recipe. cmd_session_start cleans it up
-      # when claude actually restarts; cmd_pane_died handles orphans.
+      # Resolve the LAUNCH cwd (where `claude -r <sid>` finds the transcript).
+      # find-sessions col 6 is jsonl-validated and authoritative; the capture
+      # json cwd is last-active (unreliable for resumed-across-dirs sessions)
+      # and only a fallback. Never emit a `cd` to a dir that no longer exists.
+      launch_cwd=""
+      row="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null | head -1)"
+      [ -n "$row" ] && launch_cwd="$(printf '%s' "$row" | awk -v FS=$'\x1f' '{print $6}')"
+      [ -z "$launch_cwd" ] && launch_cwd="$(jq -r '.cwd // empty' "$cap_meta" 2>/dev/null)"
+
+      prefill="clr $sid"
+      if [ -n "$launch_cwd" ] && [ -d "$launch_cwd" ]; then
+        prefill="cd $launch_cwd && clr $sid"
+      fi
+
+      # C-u clears any raced/leftover readline input, then pre-fill (no Enter).
+      send_keys_logged "post-restore-clr" "$pane_id" C-u "$prefill"
+
+      # Marker NOT deleted here. The pre-fill is live readline input (not
+      # captured by tmux-resurrect), so a second crash before the user presses
+      # Enter would lose the recipe. cmd_session_start cleans it up when claude
+      # actually restarts; cmd_pane_died handles orphans.
     done < <(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}' 2>/dev/null)
   ) &
   disown 2>/dev/null || true
