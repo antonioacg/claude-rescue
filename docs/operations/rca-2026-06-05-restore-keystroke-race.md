@@ -434,3 +434,28 @@ still brings back claude pre-fills **and** nvim.
   `@claude-pane-id` reapply could land on the wrong pane. Surfaced only in
   the container's mixed claude+nvim layout (both trigger modes equally — not
   cleanup-related). The harness now keeps test panes out of the first window.
+
+**Residual test coverage (correct by inspection, not pinned by a regression
+test).** Two of the follow-up fixes verify by reading the code but are never
+*driven* by the container harness, which exercises the post-restore pre-fill
+happy path — one session per pane, hard hibernation. A future refactor could
+regress either of these and the suite would still pass green:
+
+- **#2 (cwd/sid provenance).** The harness launches a single session per
+  pane, so `find-sessions --pane-uuid` returns one row and the new
+  `col1 == $sid` match behaves identically to the old `head -1`. The
+  multi-session-per-pane case the fix targets (hard → fresh `cl` → hard
+  again, i.e. ≥2 rows for one `pane_uuid`) is never reproduced, so the
+  disambiguation itself is unverified. A scenario that runs two sessions in
+  one pane and asserts the pre-fill anchors the *intended* session's cwd
+  (not the other row's) would pin it.
+- **#9 (wrapper-resume cwd-rescue).** The new `claude-rescue-resume`
+  cd-to-launch-dir logic lives on the soft-hibernation / `@resurrect-processes`
+  relaunch path. The harness asserts the *hard*-hibernation pre-fill, not a
+  soft-hibernated claude that the wrapper relaunches in a wrong `$PWD`. A
+  scenario that soft-hibernates a pane, forces restore to land it in `$HOME`,
+  and asserts the wrapper resumes the *same* session (not a fresh one) would
+  pin it.
+
+Neither is a correctness concern today; the code is unambiguous on read. The
+gap is purely regression protection for two paths the harness doesn't reach.
