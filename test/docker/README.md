@@ -48,8 +48,11 @@ portability. Keep the host `scripts/validate-*.sh` for that.
 | `Dockerfile` + `mise.toml` | Image: base tools + host-pinned tmux/nvim/claude/node |
 | `entrypoint.sh` | Env prep: credentials, claude-rescue hooks, onboarding flags |
 | `container.tmux.conf` | Production-mirroring config that fires BOTH restore triggers at boot |
-| `harness.sh` | In-container test (tmux-native, bash). Emits `RESULT_JSON:` |
-| `run.sh` | Single run / interactive shell |
+| `container-single-trigger.tmux.conf` | Cleanup variant: continuum-restore off, restore-wrapper sole path (one trigger) |
+| `harness.sh` | Default scenario: N hard-hibernated panes → dual/single idempotency + nvim restore. Emits `RESULT_JSON:` |
+| `harness-multisession.sh` | #2 regression: ≥2 sessions in one pane → pre-fill anchors the *captured* session's cwd (not find-sessions `head -1`) |
+| `harness-wrapper-resume.sh` | #9 regression: soft-hibernate + force restore into `$HOME` → the `@resurrect-processes` wrapper cd-rescues and resumes the *same* session |
+| `run.sh` | Single run / scenario / interactive shell |
 | `orchestrate.py` | Parallel scenario matrix over isolated compose projects |
 | `docker-compose.yml` | Service wiring (build, mounts, env) |
 
@@ -61,6 +64,10 @@ test/docker/run.sh
 
 # single-trigger cleanup variant (continuum off, restore-wrapper sole path)
 CLR_MODE=single test/docker/run.sh
+
+# review follow-up regression scenarios (each is a self-contained run)
+test/docker/run.sh multisession     # #2 — multi-session-per-pane cwd disambiguation
+test/docker/run.sh wrapper-resume   # #9 — wrapper-resume cd-rescue into the right dir
 
 # interactive zsh in the wired container — cl/clr are ready
 test/docker/run.sh shell

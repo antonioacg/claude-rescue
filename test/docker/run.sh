@@ -22,9 +22,12 @@ security find-generic-password -w -s "Claude Code-credentials" -a "$(whoami)" \
 chmod 600 "$CLR_SEED/.credentials.json"
 [ -s "$CLR_SEED/.credentials.json" ] || { echo "FATAL: could not extract claude token from Keychain" >&2; exit 1; }
 
+D=/opt/claude-rescue/test/docker
 case "${1:-test}" in
-  build) exec docker compose build ;;
-  test)  exec docker compose run --rm harness ;;
-  shell) exec docker compose run --rm harness zsh -i ;;
-  *) echo "usage: $0 [build|test|shell]" >&2; exit 2 ;;
+  build)          exec docker compose build ;;
+  test)           exec docker compose run --rm harness ;;
+  multisession)   exec docker compose run --rm harness bash "$D/harness-multisession.sh" ;;     # #2 regression
+  wrapper-resume) exec docker compose run --rm harness bash "$D/harness-wrapper-resume.sh" ;;   # #9 regression
+  shell)          exec docker compose run --rm harness zsh -i ;;
+  *) echo "usage: $0 [build|test|multisession|wrapper-resume|shell]" >&2; exit 2 ;;
 esac
