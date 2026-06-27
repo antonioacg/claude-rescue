@@ -459,3 +459,19 @@ regress either of these and the suite would still pass green:
 
 Neither is a correctness concern today; the code is unambiguous on read. The
 gap is purely regression protection for two paths the harness doesn't reach.
+
+**Closed — 2026-06-27.** Both gaps are now pinned by self-contained container
+scenarios that drive the exact code paths (a revert of either fix fails the
+suite):
+
+- **#2 → `test/docker/harness-multisession.sh` (7/0).** Runs a real session A
+  in `proj-a`, then fabricates a *newer* find-sessions row (session B in
+  `proj-b` for the same `pane_uuid`) so `head -1` = `proj-b` (wrong) and
+  `col1 == $sid` = `proj-a` (right). After save → crash → restore it asserts
+  the pre-fill anchors `proj-a` and never `proj-b`.
+- **#9 → `test/docker/harness-wrapper-resume.sh` (10/0).** Soft-hibernates a
+  real claude (HARD_DELAY huge so it stays soft, which writes the capture json
+  the rescue reads), saves, then edits the snapshot's pane dir to `$HOME` to
+  force the wrong cwd. After restore it asserts the `@resurrect-processes`
+  wrapper cd-rescued the pane back to `proj-a`, resumed the *same* session
+  (`-r <sid>` + active-file unchanged), and logged the `cwd-rescue`.
