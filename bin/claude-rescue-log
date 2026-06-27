@@ -888,21 +888,36 @@ cmd_resurrect_restore() {
       # a server PID, fall through unguarded rather than never resuming.)
       if [ -n "$server_pid" ]; then
         claim="$claims_dir/${server_pid}__${pane_uuid}"
-        mkdir "$claim" 2>/dev/null || continue
+        if ! mkdir "$claim" 2>/dev/null; then
+          # A failed mkdir is only a "skip" if it's EEXIST — i.e. a concurrent
+          # pass already claimed this pane. Any OTHER failure (claims_dir
+          # unwritable, ENOSPC) must NOT silently skip every pane; fall through
+          # and pre-fill, matching the empty-server_pid path. Distinguish by
+          # whether the claim dir now actually exists.
+          [ -d "$claim" ] && continue
+        fi
       fi
 
       # Resolve the LAUNCH cwd (where `claude -r <sid>` finds the transcript).
-      # find-sessions col 6 is jsonl-validated and authoritative; the capture
-      # json cwd is last-active (unreliable for resumed-across-dirs sessions)
-      # and only a fallback. Never emit a `cd` to a dir that no longer exists.
+      # Pin to THIS session: a pane that hosted more than one session yields
+      # multiple find-sessions rows, so match col1 == $sid rather than taking
+      # head -1 (which could surface a *different* session's cwd and silently
+      # defeat the anchoring for the multi-copy case). col 6 is the
+      # jsonl-validated launch cwd; the capture json cwd is last-active and only
+      # a fallback. Never emit a `cd` to a dir that no longer exists.
       launch_cwd=""
-      row="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null | head -1)"
+      row="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null \
+              | awk -v FS=$'\x1f' -v s="$sid" '$1==s {print; exit}')"
       [ -n "$row" ] && launch_cwd="$(printf '%s' "$row" | awk -v FS=$'\x1f' '{print $6}')"
       [ -z "$launch_cwd" ] && launch_cwd="$(jq -r '.cwd // empty' "$cap_meta" 2>/dev/null)"
 
+      # Build the pre-fill. %q-quote the cwd: it is typed into a shell, so a dir
+      # with a space or shell metachar would otherwise produce a broken `cd`.
+      # The sid is a UUID (no special chars), left bare so `clr <sid>` reads
+      # naturally. Mirrors the picker's resume_command quoting.
       prefill="clr $sid"
       if [ -n "$launch_cwd" ] && [ -d "$launch_cwd" ]; then
-        prefill="cd $launch_cwd && clr $sid"
+        prefill="$(printf 'cd %q && clr %s' "$launch_cwd" "$sid")"
       fi
 
       # C-u clears any raced/leftover readline input, then pre-fill (no Enter).
@@ -1253,7 +1268,11 @@ cmd_hibernate_arm() {
     resume_sid="$(jq -r '.session_id // empty' "$capture_meta" 2>/dev/null)"
     if [ -n "$resume_sid" ]; then
       sleep 1
-      send_keys_logged "hibernate-hard-clr" "$pane_id" "clr $resume_sid"
+      # C-u first, mirroring the post-restore pre-fill: clears any stray text
+      # the shell may have on the line before typing the resume recipe. No cwd
+      # anchor here — absent a restore the pane keeps its launch dir, so a bare
+      # `clr <sid>` already resolves.
+      send_keys_logged "hibernate-hard-clr" "$pane_id" C-u "clr $resume_sid"
     fi
 
     cmd_hibernated "$pane_id" "$pids" "hard" 2>/dev/null || true

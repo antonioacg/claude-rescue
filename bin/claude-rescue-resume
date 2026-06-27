@@ -255,6 +255,29 @@ fi
 
 # --- Live: exec claude with the resolved args ------------------------------
 __rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>} pwd=$PWD session_cwd=${session_cwd:-<none>} cwd_match=$cwd_match"
+
+# --- cwd rescue: land in the session's launch dir before exec --------------
+# A restore can drop this pane in the wrong $PWD (e.g. $HOME). `claude -r <sid>`
+# resolves the transcript against $PWD's project dir, so a wrong $PWD silently
+# starts a FRESH session instead of resuming. If we have a confident target and
+# the current $PWD does NOT hold its jsonl, cd to a candidate launch dir that
+# DOES. The jsonl-existence check is the safety net: we only move to a dir where
+# the resume is guaranteed to resolve, so a bad candidate can never make things
+# worse than the inherited $PWD (no-op on the happy path, where $PWD is right).
+if [ -n "${target_uuid:-}" ]; then
+  __projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+  if [ ! -f "$__projects_root/$(encode_cwd_for_projects "$PWD")/${target_uuid}.jsonl" ]; then
+    for __cand in "${found_cwd:-}" "${session_cwd:-}"; do
+      [ -n "$__cand" ] && [ -d "$__cand" ] || continue
+      if [ -f "$__projects_root/$(encode_cwd_for_projects "$__cand")/${target_uuid}.jsonl" ]; then
+        __rescue_log "cwd-rescue: cd $__cand (was $PWD) so -r $target_uuid resolves"
+        cd "$__cand" 2>/dev/null || __rescue_log "cwd-rescue: cd $__cand failed; resuming in $PWD"
+        break
+      fi
+    done
+  fi
+fi
+
 # Guard the same way the rebuilt[] array is guarded earlier: bash 3.2 + set -u
 # treats an empty array's "${arr[@]}" as unbound. Hits when the saved cmd is
 # just `claude -r <UUID>` AND the wrapper resolves no target (active_sid +
