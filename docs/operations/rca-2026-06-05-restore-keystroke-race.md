@@ -371,3 +371,66 @@ fix.
    a fresh session when restore lands the pane in the wrong dir. The cwd
    class is hardened for hard-hibernation here but not closed for
    wrapper-resume.
+
+---
+
+## Follow-up resolution — 2026-06-27
+
+All review follow-ups addressed across two commits (`bin/` fixes +
+container-harness expansion) plus the deferred config cleanup. Validated in
+a real-stack Docker harness (`test/docker/`) that reproduces the genuine
+continuum + restore-wrapper dual-trigger — the system-level repro staging
+can't do — and now also the single-trigger cleanup. Matrix: 4/4 green
+(NPANES 1,2 × dual,single).
+
+- **#1 unquoted launch cwd — FIXED.** Pre-fill built with
+  `printf 'cd %q && clr %s'` (mirrors the picker's `resume_command`).
+- **#2 cwd not pinned to sid — FIXED.** Launch cwd taken from the
+  `find-sessions --pane-uuid` row whose col 1 == `$sid` (awk match), not
+  `head -1`.
+- **#3 find-sessions primary path uncovered — FIXED.** The container runs
+  real claude → real transcripts, so find-sessions resolves for real; the
+  harness asserts it returns the launch cwd for the sid (primary path, not
+  the capture-json fallback).
+- **#4 cwd asserted as format not value — FIXED.** The harness asserts the
+  exact value (`cd /work/projN && clr <sid>`) and that the restored nvim
+  process is editing the saved file.
+- **#5 idempotency not tested at the real dual-trigger — RESOLVED.** The
+  container fires the genuine continuum + restore-wrapper double-restore
+  (hook fires ≥2×) and asserts exactly one pre-fill per pane. Single mode
+  asserts the hook fires exactly once.
+- **#6 mkdir-claim silent total skip — FIXED.** A failed claim distinguishes
+  EEXIST (race → skip) from a real failure (→ fall through and pre-fill).
+- **#7 same-epoch re-restore no-op — ACKNOWLEDGED (by design).** Epoch is
+  the server lifetime; claims are swept on the next server PID. Bounded and
+  harmless; left as-is.
+- **#8 twin pre-fill lacked `C-u` — FIXED.** `hibernate-hard-clr` now leads
+  with `C-u`.
+- **#9 wrapper-resume wrong `$PWD` — FIXED.** `claude-rescue-resume` cd's to
+  the session's launch dir before `exec claude` when the inherited `$PWD`
+  can't resolve the target's transcript, guarded by a `<cwd>/<sid>.jsonl`
+  existence check (only ever helps; never cd's somewhere the resume would
+  fail).
+
+**Config cleanup (the original fix 1) — DONE.** `dot_tmux.conf`:
+`@continuum-restore off` + the boot guard rewired so `restore-wrapper.sh` is
+the sole restore path (gated only on `@continuum-boot-started`, no longer on
+`@continuum-restore = on` — which would otherwise silence both triggers).
+Container-proven equivalent: `CLR_MODE=single` restores exactly once and
+still brings back claude pre-fills **and** nvim.
+
+**Incidental findings (harness/fidelity, not product bugs):**
+
+- **mise/argv parity.** The container originally lacked `mise activate`, so
+  `nvim` resolved via the mise shim and was saved with its full install path
+  as argv[0] — which tmux-resurrect's anchored `^nvim ` proc-match can't
+  match, so nvim never restored. macOS captures bare `nvim` (install bin
+  ahead of the shim via `mise activate`). Adding `mise activate zsh` to the
+  image restores argv parity, so the *same* production `@resurrect-processes`
+  restores nvim in-container. **The host is unaffected** — its real
+  snapshots already save bare `nvim`.
+- **First-window restore.** A claude pane in a session's *first* window
+  restores via resurrect's session-create path; the sidecar's index-keyed
+  `@claude-pane-id` reapply could land on the wrong pane. Surfaced only in
+  the container's mixed claude+nvim layout (both trigger modes equally — not
+  cleanup-related). The harness now keeps test panes out of the first window.
