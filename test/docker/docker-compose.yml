@@ -21,10 +21,16 @@ services:
     environment:
       IS_SANDBOX: "1"
       NPANES: "${NPANES:-2}"
+      # dual = both restore triggers (2026-06-05 production wiring); single =
+      # the cleanup variant (continuum off, restore-wrapper as sole path).
+      CLR_MODE: "${CLR_MODE:-dual}"
       CLAUDE_RESCUE_SOFT_DELAY: "${CLAUDE_RESCUE_SOFT_DELAY:-6}"
       CLAUDE_RESCUE_HARD_DELAY: "${CLAUDE_RESCUE_HARD_DELAY:-12}"
     volumes:
       - ../../:/opt/claude-rescue:ro
       - ${HOME}/.config/tmux:/home/tester/.config/tmux:ro
       - ${HOME}/.config/zsh:/home/tester/.config/zsh:ro
+      # nvim config so resurrect's @resurrect-strategy-nvim 'session' behaves as
+      # on the host (otherwise nvim restore is unfaithful — vanilla nvim).
+      - ${HOME}/.config/nvim:/home/tester/.config/nvim:ro
       - ${CLR_SEED:?set CLR_SEED to the credential seed dir (run.sh/orchestrate.py do this)}:/seed:ro

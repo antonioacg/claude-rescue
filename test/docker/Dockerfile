@@ -45,9 +45,17 @@ ENV PATH="/home/tester/.local/bin:/home/tester/.local/share/mise/shims:/opt/clau
 RUN mise install \
     && tmux -V && nvim --version | head -1 && claude --version
 
-# Minimal zsh rc: source the (mounted) cl/clr aliases if present; keep PATH.
+# Minimal zsh rc. `mise activate zsh` mirrors the host's ~/.zshrc:28 — it
+# prepends the ACTIVE tools' install bins ahead of the mise shims, so a command
+# like `nvim` resolves directly to .../installs/neovim/X/bin/nvim and the process
+# argv[0] stays bare `nvim` — exactly as on macOS. Without it, the only nvim on
+# PATH is the shim, which re-execs with the full install path as argv[0]; that
+# full path then fails tmux-resurrect's anchored `^nvim ` proc-match and nvim
+# never restores. Activating mise makes container argv match macOS so the SAME
+# production @resurrect-processes ('nvim', not '~nvim') restores nvim here too.
 RUN printf '%s\n' \
   'export PATH=/home/tester/.local/bin:/home/tester/.local/share/mise/shims:/opt/claude-rescue/bin:$PATH' \
+  'eval "$(mise activate zsh)"' \
   '[ -f $HOME/.config/zsh/aliases.zsh ] && source $HOME/.config/zsh/aliases.zsh 2>/dev/null' \
   'PROMPT="%~ %# "' \
   > /home/tester/.zshrc

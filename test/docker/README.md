@@ -24,6 +24,10 @@ identically:
 
 - **tmux 3.6a, neovim 0.12.0, claude 2.1.170, node 24.14.1** — installed via
   mise, pinned in `mise.toml` (mirrors the host's `~/.config/mise/config.toml`).
+  The image runs `mise activate zsh` (like the host `~/.zshrc`) so commands
+  resolve to their install bins and process **argv stays bare** (`nvim`, not the
+  shim's full install path) — matching macOS, so the *same* production
+  `@resurrect-processes` proc-match restores nvim/claude in the container.
 - **Real, authenticated claude** — the OAuth token is extracted from the macOS
   Keychain at runtime into a 0700 tmpdir, mounted read-only as the seed; it
   never lands in the image or the repo. Runs as a **non-root** user (claude
@@ -52,31 +56,49 @@ portability. Keep the host `scripts/validate-*.sh` for that.
 ## Usage
 
 ```sh
-# one run (NPANES defaults to 2)
+# one run (NPANES defaults to 2, dual-trigger)
 test/docker/run.sh
+
+# single-trigger cleanup variant (continuum off, restore-wrapper sole path)
+CLR_MODE=single test/docker/run.sh
 
 # interactive zsh in the wired container — cl/clr are ready
 test/docker/run.sh shell
 
 # parallel scenario matrix (build once, fan out, aggregate)
 test/docker/orchestrate.py --npanes 1 2 3
-test/docker/orchestrate.py --npanes 2 --repeat 5   # flakiness confidence
+test/docker/orchestrate.py --mode dual single        # prod wiring vs the cleanup
+test/docker/orchestrate.py --npanes 2 --repeat 5     # flakiness confidence
 ```
+
+## Trigger modes
+
+- **`dual`** (default) — mirrors the deployed `dot_tmux.conf`: continuum's own
+  auto-restore **and** the boot-guard `restore-wrapper.sh` both fire. Proves the
+  idempotency guard holds under the genuine double-fire.
+- **`single`** (`CLR_MODE=single`) — the proposed cleanup: `@continuum-restore
+  off` + the boot-guard rewired so `restore-wrapper.sh` is the sole restore
+  path. Proves restore still fires **exactly once** and still brings back claude
+  pre-fills **and nvim** — i.e. the cleanup loses nothing.
 
 Requires Docker Desktop running and the claude token in the macOS Keychain
 (service `Claude Code-credentials`).
 
 ## What it asserts
 
-Per pane, after a `kill -9` crash + dual-trigger reboot:
+After a `kill -9` crash + reboot:
 
-- both restore triggers fired (`resurrect-restore` hook ≥2× this boot);
-- **exactly one** `post-restore-clr` per session (idempotency guard held under
-  the real concurrent double-fire) — the load-bearing check;
-- exactly one idempotency claim dir;
-- the pre-fill is cwd-anchored `cd <launch-cwd> && clr <sid>` (launch cwd via
-  `find-sessions`, which real claude transcripts exercise), present in exactly
-  one pane, at a shell, with no garbled concatenation.
+- restore triggers fired the expected number of times — `≥2` in `dual` mode,
+  **exactly 1** in `single` mode (the cleanup proof);
+- per pane, **exactly one** `post-restore-clr` per session (idempotency guard;
+  load-bearing in `dual`, trivially true in `single`) and exactly one claim dir;
+- the pre-fill is cwd-anchored `cd <launch-cwd> && clr <sid>`, with launch cwd
+  resolved via the `find-sessions` **primary** path (asserted directly — real
+  claude transcripts make it resolvable), present in exactly one pane, at a
+  shell, with no garbled concatenation;
+- **nvim is restored** (process back + buffer content visible) — proves restore
+  brings back non-claude processes too, in both modes (the single-mode case
+  answers "does the cleanup still restore nvim?").
 
 ## Notes
 

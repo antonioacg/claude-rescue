@@ -10,9 +10,10 @@ This is the layer that's meant to evolve: add scenarios, vary config, or repeat
 for flakiness confidence, without touching the proven in-container bash harness.
 
 Examples:
-  ./orchestrate.py                    # default matrix: NPANES=1 and NPANES=2
-  ./orchestrate.py --npanes 1 2 3     # three scenarios
-  ./orchestrate.py --npanes 2 --repeat 5   # same scenario 5x in parallel
+  ./orchestrate.py                          # default: dual-trigger, NPANES=1 and 2
+  ./orchestrate.py --npanes 1 2 3           # three pane counts, dual-trigger
+  ./orchestrate.py --mode dual single       # both trigger modes (cleanup vs prod)
+  ./orchestrate.py --npanes 2 --repeat 5    # same scenario 5x in parallel
   ./orchestrate.py --max-parallel 2
 """
 import argparse
@@ -44,9 +45,9 @@ def extract_token(seed_dir: str) -> None:
     raise SystemExit("FATAL: could not extract claude token from Keychain")
 
 
-def run_scenario(idx: int, npanes: int, env: dict) -> dict:
+def run_scenario(idx: int, npanes: int, mode: str, env: dict) -> dict:
     proj = f"clr-rt-{idx}"
-    e = dict(env, NPANES=str(npanes))
+    e = dict(env, NPANES=str(npanes), CLR_MODE=mode)
     run = subprocess.run(
         ["docker", "compose", "-p", proj, "run", "--rm", "harness"],
         cwd=HERE, env=e, capture_output=True, text=True,
@@ -61,7 +62,7 @@ def run_scenario(idx: int, npanes: int, env: dict) -> dict:
     # Tear down the per-scenario project (network etc.); the container is --rm'd.
     subprocess.run(["docker", "compose", "-p", proj, "down", "-v"],
                    cwd=HERE, env=e, capture_output=True, text=True)
-    return {"idx": idx, "npanes": npanes, "exit": run.returncode,
+    return {"idx": idx, "npanes": npanes, "mode": mode, "exit": run.returncode,
             "result": result, "stdout": run.stdout, "stderr": run.stderr}
 
 
@@ -69,13 +70,24 @@ def is_green(r: dict) -> bool:
     return r["exit"] == 0 and bool(r["result"]) and r["result"].get("fail") == 0
 
 
+def image_exists(name: str = "clr-restore-test") -> bool:
+    r = subprocess.run(["docker", "images", "-q", name], capture_output=True, text=True)
+    return bool(r.stdout.strip())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--npanes", type=int, nargs="+", default=[1, 2],
                     help="pane counts to test (default: 1 2)")
+    ap.add_argument("--mode", nargs="+", choices=["dual", "single"], default=["dual"],
+                    help="restore-trigger mode(s): dual (default) and/or single (cleanup variant)")
     ap.add_argument("--repeat", type=int, default=1,
                     help="repeat each scenario N times for flakiness confidence")
     ap.add_argument("--max-parallel", type=int, default=4)
+    ap.add_argument("--build", action="store_true",
+                    help="force `docker compose build` even if the image exists "
+                         "(default: skip when present — the base-image metadata "
+                         "pull can hang offline, and all test code is mounted)")
     args = ap.parse_args()
 
     env = dict(os.environ)
@@ -85,22 +97,26 @@ def main() -> int:
     try:
         extract_token(seed_dir)
 
-        print("building image once...", flush=True)
-        if subprocess.run(["docker", "compose", "build"], cwd=HERE, env=env).returncode != 0:
-            raise SystemExit("image build failed")
+        if args.build or not image_exists():
+            print("building image once...", flush=True)
+            if subprocess.run(["docker", "compose", "build"], cwd=HERE, env=env).returncode != 0:
+                raise SystemExit("image build failed")
+        else:
+            print("image clr-restore-test present; skipping build (pass --build to force)", flush=True)
 
-        scenarios = list(enumerate(n for n in args.npanes for _ in range(args.repeat)))
+        combos = [(n, m) for n in args.npanes for m in args.mode for _ in range(args.repeat)]
+        scenarios = list(enumerate(combos))
         print(f"running {len(scenarios)} scenario(s), up to {args.max_parallel} in parallel...\n", flush=True)
 
         results = []
         with cf.ThreadPoolExecutor(max_workers=args.max_parallel) as ex:
-            futs = {ex.submit(run_scenario, i, n, env): (i, n) for i, n in scenarios}
+            futs = {ex.submit(run_scenario, i, n, m, env): (i, n, m) for i, (n, m) in scenarios}
             for fut in cf.as_completed(futs):
                 r = fut.result()
                 results.append(r)
                 res = r["result"] or {}
                 tag = "PASS" if is_green(r) else "FAIL"
-                print(f"  [{tag}] scenario {r['idx']} npanes={r['npanes']} "
+                print(f"  [{tag}] scenario {r['idx']} mode={r['mode']} npanes={r['npanes']} "
                       f"pass={res.get('pass','?')} fail={res.get('fail','?')} exit={r['exit']}",
                       flush=True)
 
@@ -109,7 +125,7 @@ def main() -> int:
         if green != len(results):
             for r in sorted(results, key=lambda r: r["idx"]):
                 if not is_green(r):
-                    print(f"\n--- scenario {r['idx']} npanes={r['npanes']} (exit {r['exit']}) tail ---")
+                    print(f"\n--- scenario {r['idx']} mode={r['mode']} npanes={r['npanes']} (exit {r['exit']}) tail ---")
                     print("\n".join(r["stdout"].splitlines()[-25:]))
                     if r["stderr"].strip():
                         print("[stderr]", "\n".join(r["stderr"].splitlines()[-10:]))
