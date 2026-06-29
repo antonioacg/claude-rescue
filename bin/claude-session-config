@@ -40,6 +40,13 @@ render_lines() {
   cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
   printf 'ask_on_bash\t%s ask on bash    · gate Bash\n' "$cb"
 
+  v="$(jq -r '.edit_filter_enabled' <<<"$cfg")"
+  cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
+  printf 'edit_filter_enabled\t%s edit filter  · narrow edit gate by globs below (! to negate)\n' "$cb"
+
+  v="$(jq -r '.edit_filter_globs' <<<"$cfg")"
+  printf 'edit_filter_globs\t    filter globs: %s\n' "$v"
+
   v="$(jq -r '.editor_on_edits' <<<"$cfg")"
   cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
   printf 'editor_on_edits\t%s editor on edits · open target file in editor on every Edit/Write\n' "$cb"
@@ -54,16 +61,22 @@ toggle_or_edit() {
   local current
   current="$(get_session_config_value "$sid" "$key")"
   case "$key" in
-    editor_command)
-      local new=""
-      {
-        printf '\n  current: %s\n  new value (empty to cancel): ' "$current"
-      } > /dev/tty
-      IFS= read -r new < /dev/tty || true
-      [ -z "$new" ] && return 0
+    editor_command|edit_filter_globs)
+      # Pre-fill the current value into fzf's query line so a small tweak
+      # doesn't mean retyping the whole list. The user edits in place and
+      # presses Enter; --print-query echoes the edited line. Esc (exit 130)
+      # cancels and leaves the value untouched. fzf (not `read -e -i`, which
+      # needs bash 4+) keeps this working on the system bash 3.2.
+      local new status
+      new="$(printf '' | fzf \
+                --print-query --query "$current" \
+                --prompt "$key> " --height=100% --no-info \
+                --header="edit value · ↩ save · ⎋ cancel" 2>/dev/null)"
+      status=$?
+      [ "$status" -eq 130 ] && return 0
       set_session_config_value "$sid" "$key" "$(printf '%s' "$new" | jq -Rs '.')"
       ;;
-    ask_on_edits|ask_on_bash|editor_on_edits)
+    ask_on_edits|ask_on_bash|editor_on_edits|edit_filter_enabled)
       local next=true
       [ "$current" = "true" ] && next=false
       set_session_config_value "$sid" "$key" "$next"
@@ -89,7 +102,7 @@ popup_main() {
   fi
 
   local header
-  header="$(printf '\033[1;36msession\033[0m %s\nkey                 value' "${sid:0:8}…")"
+  header="$(printf '\033[1;36msession\033[0m %s\nkey                 value' "$sid")"
   local footer=$'↩ toggle / edit · ⎋ close'
 
   "$0" render-lines "$sid" \

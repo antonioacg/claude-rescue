@@ -48,6 +48,12 @@
 # Recognized keys (with built-in defaults):
 #   ask_on_edits     false   prompt on Edit/Write/NotebookEdit/MultiEdit
 #   ask_on_bash      false   prompt on Bash
+#   edit_filter_enabled false  when true, edit_filter_globs carves exceptions
+#                            out of the ask_on_edits gate (no effect when off).
+#   edit_filter_globs ""     comma-separated globs; each matched on its own.
+#                            "!" excludes a match from gating, a bare entry
+#                            re-gates it (last match wins). `*` spans `/`. E.g.
+#                            "!*Tests/*" stops prompting on edits under Tests/.
 #   editor_on_edits  false   open file in $editor_command on every edit
 #                            (independent of ask_on_edits — set this alone
 #                            to autonomously watch Claude's edits)

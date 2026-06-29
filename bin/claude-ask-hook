@@ -6,6 +6,12 @@
 #   ask_on_edits / ask_on_bash — when true, return permissionDecision: "ask"
 #     for the matching tool class so Claude pauses for manual confirmation.
 #
+#   edit_filter_enabled / edit_filter_globs — carve exceptions out of the
+#     ask_on_edits gate. When enabled, each comma-separated glob is matched on
+#     its own: a "!"-prefixed entry that matches excludes the file from
+#     gating; a bare entry re-gates it (last match wins). No effect when
+#     ask_on_edits is off. See edit_filter_gates in lib/session-config.sh.
+#
 #   editor_on_edits — when true, pop the target file open in $editor_command
 #     for every Edit/Write/NotebookEdit/MultiEdit, INDEPENDENT of the ask
 #     gates. Lets you "watch" Claude's edits autonomously without forcing
@@ -133,6 +139,17 @@ case "$tool_name" in
   Edit|Write|NotebookEdit|MultiEdit)
     if [ "$(get_session_config_value "$session_id" "ask_on_edits")" = "true" ]; then
       ask=true; gate="edits"
+      # Optional glob filter narrows the edit gate. The list is matched
+      # last-wins; "!" negates an entry. See edit_filter_gates for the full
+      # whitelist/blacklist semantics.
+      if [ "$(get_session_config_value "$session_id" "edit_filter_enabled")" = "true" ]; then
+        globs="$(get_session_config_value "$session_id" "edit_filter_globs")"
+        [ "$globs" = "null" ] && globs=""
+        if [ -n "$globs" ] && ! edit_filter_gates "$file_path" "$globs"; then
+          ask=false; gate=""
+          _trace "filter released gate for $file_path"
+        fi
+      fi
     fi
     ;;
   Bash)

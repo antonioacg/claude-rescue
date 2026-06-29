@@ -22,10 +22,47 @@ session_config_builtin() {
 {
   "ask_on_edits": false,
   "ask_on_bash": false,
+  "edit_filter_enabled": false,
+  "edit_filter_globs": "",
   "editor_on_edits": false,
   "editor_command": "code -g"
 }
 JSON
+}
+
+# Decide whether an edit to $1 should be gated, given the filter list $2.
+# The baseline is "gate" (ask_on_edits gates every edit); the filter just
+# carves exceptions. Each comma-separated entry is a shell glob matched on its
+# own: a bare entry that matches keeps the edit gated, a "!"-prefixed entry
+# that matches excludes it from gating. Globs match with `case` semantics,
+# where `*` spans `/` too, so `*Tests/*` matches /repo/src/Tests/Foo.cs.
+#
+# The last matching entry wins, so order lets you exclude broadly then re-gate:
+#   !*Tests/*                   → gate everything except tests
+#   !*Tests/*, */Tests/Critical/* → ...but still gate the critical tests
+#
+# Returns 0 to gate (ask), 1 to skip. No match (or an empty list) returns 0.
+edit_filter_gates() {
+  local path="$1" globs="$2" g pat neg
+  local decided=""
+  local IFS=','
+  for g in $globs; do
+    g="${g#"${g%%[![:space:]]*}"}"   # ltrim
+    g="${g%"${g##*[![:space:]]}"}"   # rtrim
+    [ -n "$g" ] || continue
+    neg=0; pat="$g"
+    if [ "${pat#!}" != "$pat" ]; then
+      neg=1; pat="${pat#!}"
+      pat="${pat#"${pat%%[![:space:]]*}"}"   # ltrim after the "!"
+    fi
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2254  # glob in the case pattern is intentional
+    case "$path" in
+      $pat) [ "$neg" -eq 1 ] && decided=1 || decided=0 ;;
+    esac
+  done
+  [ -n "$decided" ] && return "$decided"
+  return 0
 }
 
 resolve_session_config() {
