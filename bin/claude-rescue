@@ -6,7 +6,8 @@
 #   claude-rescue              Open the two-stage drill-down picker.
 #
 # Internal subcommands (used by fzf and re-execs):
-#   list-windows                    TSV of windows for the picker.
+#   list-windows                    Display rows of windows for the picker
+#                                   (\x1f-separated; see list_windows_tsv).
 #   list-sessions <window>          TSV of sessions for a given window.
 #   preview-window <window>         Preview text for the highlighted window row.
 #   preview-session <window> <sid>  Preview text for the highlighted session row.
@@ -42,39 +43,58 @@ ensure_dirs
 # ---------------------------------------------------------------------------
 # Data formatters
 
-# TSV columns: uuid \t last_seen \t session_count \t window_name \t primary_cwd \t last_title
-# Filters out windows with zero sessions — those have title history only and
-# nothing to resume, so showing them in the picker just adds noise.
+# Display-ready rows for the picker's level-1 window list, newest-first.
+# Emits \x1f-separated: window_uuid, age, session_count, label
+#   age    humanized relative time (computed in jq)
+#   label  the window's last sampled title — which the watcher already ran
+#          through window-label.sh at sample time, so it matches the status
+#          bar — with a defensive leading-glyph strip; falls back to the
+#          tildified primary_cwd when the window never sampled a title.
+# Windows with zero sessions are skipped (title-only history, nothing to resume).
 #
-# Enumerates from windows/*.meta.json directly. Each meta has its own
-# last_seen / window_name / primary_cwd, so no separate index is needed.
-# Sorted lexicographically by ISO last_seen, descending (newest first).
+# One jq pass over ALL meta files (not one per file), with age + label + sort
+# all done inside jq. On a few-hundred-window store that is the difference
+# between ~6s (a jq fork per file plus a date/sed fork per row) and <100ms to
+# first paint.
 list_windows_tsv() {
   local meta_dir="$CLAUDE_RESCUE_DATA_HOME/windows"
   [ -d "$meta_dir" ] || return 0
 
-  # nullglob-equivalent: skip the loop entirely if no meta files.
   shopt -s nullglob
   local metas=("$meta_dir"/*.meta.json)
   shopt -u nullglob
   [ ${#metas[@]} -eq 0 ] && return 0
 
-  for f in "${metas[@]}"; do
-    jq -r '
-      (.sessions // []) as $s
-      | ($s | length) as $count
-      | if $count == 0 then empty else
-          [
-            .window_uuid,
-            (.last_seen // ""),
-            $count,
-            (.window_name // ""),
-            (.primary_cwd // ""),
-            ($s | map(.last_title) | map(select(. != null)) | .[0] // "")
-          ] | @tsv
-        end
-    ' "$f"
-  done | sort -t$'\t' -k2,2r
+  jq -rn \
+    --argjson now "$(date -u +%s)" \
+    --arg strip '^[^ -~]+ *' \
+    --arg home "$HOME" '
+    def age($ts):
+      if ($ts // "") == "" then "?"
+      else (try ($ts | fromdateiso8601) catch null) as $t
+        | if   $t == null            then "?"
+          elif ($now - $t) < 60      then "just now"
+          elif ($now - $t) < 3600    then "\((($now - $t) / 60)    | floor)m ago"
+          elif ($now - $t) < 86400   then "\((($now - $t) / 3600)  | floor)h ago"
+          else                            "\((($now - $t) / 86400) | floor)d ago"
+          end
+      end;
+    def tildify($p):
+      if   $p == $home                    then "~"
+      elif ($p | startswith($home + "/")) then "~" + ($p[($home | length):])
+      else $p end;
+    [ inputs ]
+    | map(
+        (.sessions // []) as $s | ($s | length) as $c | select($c > 0)
+        | (($s | map(.last_title) | map(select(. != null)) | .[0]) // "") as $t
+        | { uuid: .window_uuid, ls: (.last_seen // ""), c: $c,
+            label: (if $t == "" then tildify(.primary_cwd // "?")
+                    else ($t | gsub($strip; "")) end) }
+      )
+    | sort_by(.ls) | reverse
+    | .[] | [ .uuid, age(.ls), (.c | tostring), .label ]
+    | join("")
+  ' "${metas[@]}"
 }
 
 # Columns: session_id ⎵ started ⎵ ended ⎵ cwd ⎵ pane_uuid ⎵ source ⎵ window_name ⎵ label
@@ -268,19 +288,15 @@ humanize_age() {
 }
 
 format_window_rows() {
-  # Reads list_windows_tsv on stdin, emits "uuid<TAB>display" rows for fzf.
-  # Columns: age(8L) #(3R) label
-  # The label column uses the configured title formatter, which already
-  # encodes window_name (e.g. "Implement storage… - claude"), so a separate
-  # window column would be redundant.
-  while IFS=$'\t' read -r uuid last_seen scount wname cwd last_title; do
-    local age line cwd_short label
-    age="$(humanize_age "$last_seen")"
-    cwd_short="$(tildify "${cwd:-?}")"
-    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
-    label="${label:-$cwd_short}"
-    line="$(printf '%-8s %3s  %s' "$age" "$scount" "$label")"
-    printf '%s\t%s\n' "$uuid" "$line"
+  # Reads list_windows_tsv on stdin (\x1f-separated: uuid, age, count, label)
+  # and emits "uuid<TAB>display" rows for fzf. Columns: age(8L) #(3R) label.
+  # Pure printf — no per-row forks; jq humanized the age and cleaned the label
+  # (glyph strip, or cwd fallback for untitled windows) upstream. `label`
+  # already encodes the window name (e.g. "Implement storage… - claude"), so no
+  # separate window column is needed.
+  local US=$'\x1f' uuid age scount label
+  while IFS="$US" read -r uuid age scount label; do
+    printf '%s\t%-8s %3s  %s\n' "$uuid" "$age" "$scount" "$label"
   done
 }
 
