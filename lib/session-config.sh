@@ -25,7 +25,8 @@ session_config_builtin() {
   "edit_filter_enabled": false,
   "edit_filter_globs": "",
   "editor_on_edits": false,
-  "editor_command": "code -g"
+  "editor_command": "code -g",
+  "suspend_hibernation": false
 }
 JSON
 }

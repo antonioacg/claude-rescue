@@ -56,6 +56,8 @@ done
 REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 # shellcheck source=../lib/common.sh
 . "$REPO/lib/common.sh"
+# shellcheck source=../lib/session-config.sh
+. "$REPO/lib/session-config.sh"
 
 ensure_dirs
 
@@ -1047,6 +1049,24 @@ cmd_hibernate_arm() {
   local _puuid
   _puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
   [ -n "$_puuid" ] || return 0
+
+  # Per-session opt-out: if the session bound to this pane has
+  # suspend_hibernation set (via the `prefix + a` config popup), do NOT arm —
+  # neither soft (Ctrl+Z) nor hard (/exit). Bailing here covers BOTH entry
+  # points, since the pane-focus-out hook and arm-sweep both land in
+  # hibernate-arm. Resolved by the pane's active session_id, the same key the
+  # popup writes under.
+  local _sid _cfg _susp
+  _sid="$(read_active_session "$_puuid" 2>/dev/null || true)"
+  if [ -n "$_sid" ]; then
+    _cfg="$(resolve_session_config "$_sid" 2>/dev/null || true)"
+    [ -n "$_cfg" ] || _cfg='{}'
+    _susp="$(jq -r '.suspend_hibernation // false' <<<"$_cfg" 2>/dev/null || echo false)"
+    if [ "$_susp" = "true" ]; then
+      log_err "hibernate-arm: suspended for session $_sid (pane $pane_id) — not arming"
+      return 0
+    fi
+  fi
 
   local SOFT_DELAY="${CLAUDE_RESCUE_SOFT_DELAY:-3600}"
   local HARD_DELAY="${CLAUDE_RESCUE_HARD_DELAY:-86400}"

@@ -7,6 +7,9 @@
 # arm/resume subcommands directly — same code path the focus hooks trigger).
 #
 # Scenarios:
+#   1s. suspend_hibernation (per-session opt-out from the `prefix + a` popup)
+#       makes hibernate-arm a no-op — no marker, no arm.pid, no Ctrl+Z; blocks
+#       both soft and hard. Scenario 1 is its positive control.
 #   1. Soft hibernation fires on an idle claude pane (capture + Ctrl+Z + marker)
 #   2. Soft resume restores the suspended claude
 #   3. Hard escalation fires after HARD_DELAY (claude exits + clr pre-fill)
@@ -155,6 +158,32 @@ P0=%0    # main:1.1, claude in staging
 P3=%3    # main:3.1, nvim
 P0_UUID="$(pane_uuid_of $P0)"
 [ -z "$P0_UUID" ] && { echo "FATAL: $P0 has no @claude-pane-id" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+echo "[1s] suspend_hibernation opt-out bails hibernate-arm (no soft, no hard)"
+
+# Set the per-session knob the `prefix + a` popup writes, then arm. The arm
+# must bail before scheduling anything — no marker, no arm.pid, claude never
+# Ctrl+Z'd. Scenario 1 (immediately below, same pane) is the positive control:
+# with the flag cleared, the identical arm DOES hibernate.
+SID_S="$(cat "$DATA_DIR/active/$P0_UUID" 2>/dev/null | head -1 | tr -d '\n')"
+assert_nonempty "scenario 1s: P0 has an active session_id" "$SID_S"
+SAN0="${P0//[^A-Za-z0-9]/_}"
+ARMPID0="$CACHE_DIR/hibernated/$SAN0.arm.pid"
+MARKER0="$CACHE_DIR/hibernated/$P0_UUID.json"
+rm -f "$ARMPID0" "$MARKER0"
+mkdir -p "$DATA_DIR/session-config"
+printf '{"suspend_hibernation":true}\n' > "$DATA_DIR/session-config/$SID_S.json"
+
+tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep $((SOFT_DELAY + 4))
+
+assert "scenario 1s: no hibernated marker (arm bailed)" "0" "$([ -f "$MARKER0" ] && echo 1 || echo 0)"
+assert "scenario 1s: no arm.pid scheduled (bailed before the timer)" "0" "$([ -f "$ARMPID0" ] && echo 1 || echo 0)"
+assert "scenario 1s: claude still foreground (never Ctrl+Z'd)" "claude" "$(fg_cmd $P0)"
+
+# Clear the flag so the remaining scenarios (the positive controls) arm normally.
+rm -f "$DATA_DIR/session-config/$SID_S.json"
 
 # ---------------------------------------------------------------------------
 echo "[1] soft hibernation fires on idle claude pane"

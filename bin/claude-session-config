@@ -53,6 +53,10 @@ render_lines() {
 
   v="$(jq -r '.editor_command' <<<"$cfg")"
   printf 'editor_command\t    editor command: %s\n' "$v"
+
+  v="$(jq -r '.suspend_hibernation' <<<"$cfg")"
+  cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
+  printf 'suspend_hibernation\t%s suspend hibernation · never soft/hard-suspend this session\n' "$cb"
 }
 
 toggle_or_edit() {
@@ -80,6 +84,30 @@ toggle_or_edit() {
       local next=true
       [ "$current" = "true" ] && next=false
       set_session_config_value "$sid" "$key" "$next"
+      ;;
+    suspend_hibernation)
+      local next=true
+      [ "$current" = "true" ] && next=false
+      set_session_config_value "$sid" "$key" "$next"
+      # When ENABLING, also stop any hibernation countdown already armed for the
+      # originating pane, so it takes effect now instead of after the in-flight
+      # arm subshell's next stage. Cancel by the exact arm.pid (keyed by the
+      # sanitized pane id, same as cmd_hibernate_arm), and only kill a pid that
+      # is still an arm subshell — never a broad match — to survive pid reuse.
+      if [ "$next" = "true" ]; then
+        local op san apf apid
+        op="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
+        if [ -n "$op" ]; then
+          san="${op//[^A-Za-z0-9]/_}"
+          apf="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+          apid="$(cat "$apf" 2>/dev/null || true)"
+          if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null \
+             && ps -o args= -p "$apid" 2>/dev/null | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
+            kill "$apid" 2>/dev/null || true
+          fi
+          rm -f "$apf"
+        fi
+      fi
       ;;
     *)
       echo "unknown key: $key" >&2
