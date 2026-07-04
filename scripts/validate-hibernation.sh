@@ -615,6 +615,71 @@ for f in "$CACHE_DIR"/hibernated/*.arm.pid; do
 done
 
 # ---------------------------------------------------------------------------
+echo "[10] fork guard + reconcile: a forked pane self-heals to its real sid"
+
+# Models `claude --fork-session -r <parent>`: the fork pane is born with
+# SessionStart(source=resume, .session_id=<parent>) while <parent> is still live
+# in the parent pane. cmd_session_start's guard must decline to stamp it; the
+# fork's real id then self-heals via the user_prompt_submit reconcile.
+P10_A=$P0        # live "parent" pane (has @claude-pane-id)
+P10_B=%2         # "fork" pane — claude uuid kept, active file cleared in scenario 8
+A_UUID="$(pane_uuid_of $P10_A)"
+B_UUID="$(pane_uuid_of $P10_B)"
+[ -z "$B_UUID" ] && { echo "FATAL: $P10_B has no @claude-pane-id" >&2; exit 1; }
+PARENT_SID="10000000-0000-4000-8000-000000000001"
+UNIQ_SID="30000000-0000-4000-8000-000000000003"
+FORK_SID="20000000-0000-4000-8000-000000000002"
+
+mkdir -p "$DATA_DIR/active"
+printf '%s\n' "$PARENT_SID" > "$DATA_DIR/active/$A_UUID"   # parent pane live on parent sid
+rm -f "$DATA_DIR/active/$B_UUID"                           # fork pane starts clean
+
+# Guard triggers: resume whose sid is live in ANOTHER pane → not stamped.
+S10_J1="$DATA_DIR/scenario10-guard.json"
+printf '{"session_id":"%s","cwd":"/tmp","source":"resume","hook_event_name":"SessionStart"}' "$PARENT_SID" > "$S10_J1"
+tmux -L "$SOCK" run-shell -t $P10_B "TMUX_PANE=$P10_B claude-rescue-log session_start < $S10_J1"
+sleep 1
+B_WIN_UUID="$(tmux -L "$SOCK" show-options -wv -t $P10_B @claude-window-id 2>/dev/null)"
+B_LOG="$DATA_DIR/windows/$B_WIN_UUID.jsonl"
+
+assert "scenario 10: guard declined — B active NOT stamped with parent id" "0" \
+  "$([ -f "$DATA_DIR/active/$B_UUID" ] && echo 1 || echo 0)"
+assert "scenario 10: guard declined — no session_start{parent} appended for B" "0" \
+  "$(jq -rc 'select(.kind=="session_start" and .session_id=="'"$PARENT_SID"'" and .pane_uuid=="'"$B_UUID"'")' "$B_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+
+# Guard is collision-scoped, not all-resume: a resume whose sid is NOT live
+# elsewhere is adopted normally (the in-claude /resume path).
+S10_J2="$DATA_DIR/scenario10-resume.json"
+printf '{"session_id":"%s","cwd":"/tmp","source":"resume","hook_event_name":"SessionStart"}' "$UNIQ_SID" > "$S10_J2"
+tmux -L "$SOCK" run-shell -t $P10_B "TMUX_PANE=$P10_B claude-rescue-log session_start < $S10_J2"
+sleep 1
+assert "scenario 10: normal resume (sid not live elsewhere) IS adopted" "$UNIQ_SID" \
+  "$(cat "$DATA_DIR/active/$B_UUID" 2>/dev/null | tr -d '\n')"
+
+# First message on the fork: UserPromptSubmit carries the REAL fork id → heal.
+S10_J3="$DATA_DIR/scenario10-heal.json"
+printf '{"session_id":"%s","cwd":"/tmp","transcript_path":"/tmp/fork.jsonl","hook_event_name":"UserPromptSubmit"}' "$FORK_SID" > "$S10_J3"
+tmux -L "$SOCK" run-shell -t $P10_B "TMUX_PANE=$P10_B claude-rescue-log user_prompt_submit < $S10_J3"
+sleep 1
+assert "scenario 10: reconcile healed B active to fork id" "$FORK_SID" \
+  "$(cat "$DATA_DIR/active/$B_UUID" 2>/dev/null | tr -d '\n')"
+assert "scenario 10: parent pane A active unchanged (no cross-pane bleed)" "$PARENT_SID" \
+  "$(cat "$DATA_DIR/active/$A_UUID" 2>/dev/null | tr -d '\n')"
+assert "scenario 10: reconcile appended session_start{source:reconcile} for fork" "1" \
+  "$(jq -rc 'select(.kind=="session_start" and .source=="reconcile" and .session_id=="'"$FORK_SID"'" and .pane_uuid=="'"$B_UUID"'")' "$B_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+assert "scenario 10: reconcile emitted NO session_end for parent" "0" \
+  "$(jq -rc 'select(.kind=="session_end" and .session_id=="'"$PARENT_SID"'")' "$B_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+
+# Idempotent: re-firing the same fork id is a no-op (early return, no new event).
+EV_BEFORE="$(wc -l < "$B_LOG" | tr -d ' ')"
+tmux -L "$SOCK" run-shell -t $P10_B "TMUX_PANE=$P10_B claude-rescue-log user_prompt_submit < $S10_J3"
+sleep 1
+assert "scenario 10: idempotent re-fire appends no new event" "$EV_BEFORE" \
+  "$(wc -l < "$B_LOG" | tr -d ' ')"
+assert "scenario 10: active still fork after idempotent re-fire" "$FORK_SID" \
+  "$(cat "$DATA_DIR/active/$B_UUID" 2>/dev/null | tr -d '\n')"
+
+# ---------------------------------------------------------------------------
 # Summary
 
 echo ""

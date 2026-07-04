@@ -5,14 +5,18 @@
 # Event subcommands (writer):
 #   session_start              Read JSON from stdin (Claude SessionStart hook).
 #                                Event carries optional `claude_pid` field when
-#                                find_my_claude_pid finds an ancestor claude.
+#                                find_my_claude_pid finds an ancestor claude. A
+#                                fork guard declines to stamp a source=resume id
+#                                that is already live in another pane (see
+#                                sid_live_in_other_pane / reconcile_active_session).
 #   session_end                Read JSON from stdin (Claude SessionEnd hook).
 #                                Event carries optional `claude_pid` (same source).
-#   user_prompt_submit         Mark current pane busy (UserPromptSubmit hook).
-#                                Busy marker body is `{ts, claude_pid?}` JSON.
+#   user_prompt_submit         Mark current pane busy (UserPromptSubmit hook) and
+#                                reconcile the pane's active session id from stdin
+#                                (heals a forked pane to its real id).
 #   pre_tool_use               Refresh busy mtime (PreToolUse hook).
 #   post_tool_use              Refresh busy mtime (PostToolUse hook).
-#   stop                       Clear busy marker (Stop hook).
+#   stop                       Clear busy marker (Stop hook) + reconcile active id.
 #   title <pane_id> <title>    Schedule a debounced title commit.
 #   title-commit <pane_id>     Internal: commit a debounced title if still settled.
 #   pane-died <pane_id>        Final flush before tmux reaps a pane.
@@ -65,6 +69,23 @@ DEBOUNCE_SECONDS="${CLAUDE_RESCUE_TITLE_DEBOUNCE:-5}"
 
 # --- Subcommand handlers ----------------------------------------------------
 
+# True (0) if session id $1 is the active session of some pane OTHER than $2.
+# The fork guard uses this: a SessionStart(source=resume) whose id is already
+# live in another pane is a `--fork-session` adopting the parent's id, not a
+# genuine switch to a distinct session.
+sid_live_in_other_pane() {
+  local sid="$1" self_uuid="$2"
+  [ -n "$sid" ] || return 1
+  local dir="$CLAUDE_RESCUE_DATA_HOME/active" f
+  [ -d "$dir" ] || return 1
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    [ "${f##*/}" = "$self_uuid" ] && continue
+    [ "$(head -1 "$f" 2>/dev/null | tr -d '\n')" = "$sid" ] && return 0
+  done
+  return 1
+}
+
 cmd_session_start() {
   local json
   json="$(cat)"
@@ -94,6 +115,20 @@ cmd_session_start() {
   }
   pane_uuid="$(ensure_pane_uuid "$pane_id")"
 
+  # Fork guard: a `--fork-session` pane starts with SessionStart(source=resume,
+  # .session_id=<parent>) — its own forked id isn't live yet. If that id is
+  # already the active session of ANOTHER pane, recording it here would collide
+  # two live panes on one id (breaking the popup, hibernate-arm, and picker).
+  # Decline to stamp it; the fork's real id self-heals via reconcile_active_session
+  # on its first message. Scoped to source=resume so kill (startup) / clear /
+  # compact and a normal single-pane resume are untouched. A stale hit (dead
+  # sibling pane) is harmless — reconcile re-adopts on first message.
+  local fork_adopt=0
+  if [ "$source" = "resume" ] && sid_live_in_other_pane "$session_id" "$pane_uuid"; then
+    fork_adopt=1
+    log_err "session_start: fork guard — $session_id already live in another pane; not stamping pane $pane_id ($pane_uuid)"
+  fi
+
   # Force-flush any pending title for this pane (so /clear or /compact preserve last task).
   flush_pending_title "$pane_id" "$window_uuid"
 
@@ -114,22 +149,26 @@ cmd_session_start() {
     < <(tmux_pane_info "$pane_id" || echo $'\t\t\t')
   claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
 
-  append_event "$window_uuid" "$(jq -nc \
-    --arg ts "$(now_iso)" --arg sid "$session_id" \
-    --arg puuid "$pane_uuid" \
-    --arg cwd "${cwd:-$pane_cwd}" --arg src "$source" --arg model "$model" \
-    --arg tr "$transcript" --arg sn "$session_name" --arg wn "$window_name" \
-    --arg cpid "${claude_pid:-}" \
-    '{ts:$ts, kind:"session_start", session_id:$sid, pane_uuid:$puuid,
-      cwd:$cwd, source:$src, model:$model, transcript_path:$tr,
-      session_name:$sn, window_name:$wn} +
-     (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
+  # Under the fork guard both the event and the active-file write are skipped, so
+  # the parent id never lands on the fork pane (log/meta stay clean).
+  if [ "$fork_adopt" -eq 0 ]; then
+    append_event "$window_uuid" "$(jq -nc \
+      --arg ts "$(now_iso)" --arg sid "$session_id" \
+      --arg puuid "$pane_uuid" \
+      --arg cwd "${cwd:-$pane_cwd}" --arg src "$source" --arg model "$model" \
+      --arg tr "$transcript" --arg sn "$session_name" --arg wn "$window_name" \
+      --arg cpid "${claude_pid:-}" \
+      '{ts:$ts, kind:"session_start", session_id:$sid, pane_uuid:$puuid,
+        cwd:$cwd, source:$src, model:$model, transcript_path:$tr,
+        session_name:$sn, window_name:$wn} +
+       (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
+  fi
 
   # Update the pane's active session_id. Fires on every source (startup,
   # resume, clear, compact), so an in-claude `/resume` that switches sessions
   # overwrites this with the new sid — claude-rescue-resume reads it next
   # crash-restore in preference to tmux-resurrect's frozen saved `-r <sid>`.
-  write_active_session "$pane_uuid" "$session_id"
+  [ "$fork_adopt" -eq 0 ] && write_active_session "$pane_uuid" "$session_id"
 
   # claude is alive in this pane — any hibernated marker is now stale. This is
   # the cleanup point for hard-mode markers (focus-in is intentionally a no-op
@@ -978,14 +1017,75 @@ is_busy() {
   [ "$((now - mt))" -lt "$freshness" ]
 }
 
-# Shared body for the four busy-tracking claude hooks. Reads (and discards)
-# stdin — claude pipes hook-event JSON there, and not draining can stall the
-# claude side on small writes. Looks up the calling claude's pid so the busy
-# marker file body can be cross-referenced with session_start events for
-# troubleshooting.
+# Reconcile a pane's active session id from the authoritative stdin .session_id.
+#
+# A `--fork-session` pane is born via SessionStart(source=resume, .session_id=
+# <parent>), so cmd_session_start's fork guard declines to stamp the parent id
+# onto it. The fork's REAL id first reaches us HERE, on its own later hooks
+# (UserPromptSubmit onward), where claude stamps the live forked id into every
+# payload. Trust it: rewrite the active file (what the popup and hibernate-arm
+# read, keyed by pane_uuid) and append a synthetic session_start so the picker,
+# rebuild_meta, and latest_open_session_in_pane all track the real id.
+#
+# NEVER emit a session_end for the old id here: rebuild_meta groups by session_id
+# across ALL panes in the window, and the old id is usually still live in the
+# parent pane — ending it would mark the parent's own session closed.
+reconcile_active_session() {
+  local pane_id="$1" pane_uuid="$2" json="$3"
+  local sid
+  sid="$(jq -r '.session_id // empty' <<<"$json" 2>/dev/null || true)"
+  [ -z "$sid" ] && return 0
+
+  local current
+  current="$(read_active_session "$pane_uuid" 2>/dev/null || true)"
+  [ "$sid" = "$current" ] && return 0   # steady state — cheap early return
+
+  # Load-bearing: resolve_pane_session_id (popup) and cmd_hibernate_arm read this.
+  write_active_session "$pane_uuid" "$sid"
+
+  local window_uuid
+  window_uuid="$(tmux_get_window_uuid "$pane_id" 2>/dev/null || true)"
+  [ -z "$window_uuid" ] && return 0     # active healed; no window log to update
+
+  # Mirror cmd_session_start's session_start event. source="reconcile" marks
+  # provenance; kind stays "session_start" so rebuild_meta groups it under $sid.
+  # UserPromptSubmit/Stop payloads carry .session_id/.cwd/.transcript_path but
+  # not .source/.model.
+  local cwd transcript session_name window_index window_name pane_cwd claude_pid
+  cwd="$(jq -r '.cwd // empty' <<<"$json" 2>/dev/null || true)"
+  transcript="$(jq -r '.transcript_path // empty' <<<"$json" 2>/dev/null || true)"
+  IFS=$'\t' read -r session_name window_index window_name pane_cwd \
+    < <(tmux_pane_info "$pane_id" || echo $'\t\t\t')
+  claude_pid="$(find_my_claude_pid 2>/dev/null || true)"
+  append_event "$window_uuid" "$(jq -nc \
+    --arg ts "$(now_iso)" --arg sid "$sid" \
+    --arg puuid "$pane_uuid" \
+    --arg cwd "${cwd:-$pane_cwd}" --arg src "reconcile" --arg model "" \
+    --arg tr "$transcript" --arg sn "$session_name" --arg wn "$window_name" \
+    --arg cpid "${claude_pid:-}" \
+    '{ts:$ts, kind:"session_start", session_id:$sid, pane_uuid:$puuid,
+      cwd:$cwd, source:$src, model:$model, transcript_path:$tr,
+      session_name:$sn, window_name:$wn} +
+     (if $cpid == "" then {} else {claude_pid:($cpid | tonumber)} end)')"
+  rebuild_meta "$window_uuid"
+}
+
+# Shared body for the four busy-tracking claude hooks. Always drains stdin —
+# claude pipes hook-event JSON there, and not draining can stall the claude side
+# on small writes. When $2 ("reconcile") is set, the JSON is captured instead of
+# discarded and handed to reconcile_active_session so a forked pane self-heals to
+# its real session id (see above); only the low-frequency user_prompt_submit/stop
+# hooks pass it, keeping pre/post_tool_use on the zero-jq fast path. Also looks up
+# the calling claude's pid for the busy marker body (troubleshooting cross-ref).
 __busy_hook() {
-  local action="$1"  # "mark" | "clear"
-  cat >/dev/null 2>&1 || true
+  local action="$1"        # "mark" | "clear"
+  local reconcile="${2:-}" # non-empty → capture stdin and reconcile the active sid
+  local json=""
+  if [ -n "$reconcile" ]; then
+    json="$(cat)"
+  else
+    cat >/dev/null 2>&1 || true
+  fi
   local pane_id="${TMUX_PANE:-}"
   [ -z "$pane_id" ] && return 0
   [ -z "${TMUX:-}" ] && return 0
@@ -1000,12 +1100,14 @@ __busy_hook() {
       ;;
     clear) clear_busy "$pane_uuid" ;;
   esac
+  [ -n "$reconcile" ] && reconcile_active_session "$pane_id" "$pane_uuid" "$json"
+  return 0
 }
 
-cmd_user_prompt_submit() { __busy_hook mark ; }
-cmd_pre_tool_use()       { __busy_hook mark ; }   # refreshes mtime mid-run
-cmd_post_tool_use()      { __busy_hook mark ; }   # refreshes mtime mid-run
-cmd_stop()               { __busy_hook clear ; }
+cmd_user_prompt_submit() { __busy_hook mark  reconcile ; }
+cmd_pre_tool_use()       { __busy_hook mark ; }           # refreshes mtime mid-run
+cmd_post_tool_use()      { __busy_hook mark ; }           # refreshes mtime mid-run
+cmd_stop()               { __busy_hook clear reconcile ; }
 
 # --- Hibernation layer (two-stage focus-driven pane suspension) -------------
 #
