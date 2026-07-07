@@ -57,6 +57,16 @@ render_lines() {
   v="$(jq -r '.suspend_hibernation' <<<"$cfg")"
   cb="[ ]"; [ "$v" = "true" ] && cb="[x]"
   printf 'suspend_hibernation\t%s suspend hibernation · never soft/hard-suspend this session\n' "$cb"
+
+  # Action row (not a config key): flips between hibernate/restore based on the
+  # originating pane's current hibernation state.
+  local hstate
+  hstate="$("$REPO/bin/claude-rescue-log" hibernate-state "${CLAUDE_RESCUE_ORIG_PANE:-}" 2>/dev/null || echo none)"
+  if [ "$hstate" = "none" ]; then
+    printf 'hibernate\t >  hibernate now · capture + /exit, free resources · resume from picker\n'
+  else
+    printf 'hibernate\t <  restore now · bring this hibernated session back\n'
+  fi
 }
 
 toggle_or_edit() {
@@ -107,6 +117,20 @@ toggle_or_edit() {
           fi
           rm -f "$apf"
         fi
+      fi
+      ;;
+    hibernate)
+      # Action row, not a config value. Flip on the pane's current state:
+      # not hibernated → force a hard hibernation now; hibernated → restore.
+      # Both delegate to claude-rescue-log, which owns the marker + send-keys.
+      local op state
+      op="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
+      [ -n "$op" ] || return 0
+      state="$("$REPO/bin/claude-rescue-log" hibernate-state "$op" 2>/dev/null || echo none)"
+      if [ "$state" = "none" ]; then
+        "$REPO/bin/claude-rescue-log" hibernate-now "$op" 2>/dev/null || true
+      else
+        "$REPO/bin/claude-rescue-log" restore-now "$op" 2>/dev/null || true
       fi
       ;;
     *)

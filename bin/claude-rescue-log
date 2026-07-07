@@ -1141,7 +1141,11 @@ cmd_stop()               { __busy_hook clear reconcile ; }
 
 cmd_hibernate_arm() {
   # Args: $1 = pane_id, $2 = pane_pid (root of pane's process tree).
-  local pane_id="${1:-}" pane_pid="${2:-}"
+  #       $3 = force mode ("" = normal focus-driven arm; "hard" = on-demand
+  #            from the prefix+a config popup: skip the SOFT/HARD delays, the
+  #            busy-defer, and both active-pane guards, and drive claude
+  #            straight to a hard /exit right now). See cmd_hibernate_now.
+  local pane_id="${1:-}" pane_pid="${2:-}" force="${3:-}"
   [ -n "$pane_id" ] || return 0
   [ -n "$pane_pid" ] || return 0
 
@@ -1158,9 +1162,14 @@ cmd_hibernate_arm() {
   # points, since the pane-focus-out hook and arm-sweep both land in
   # hibernate-arm. Resolved by the pane's active session_id, the same key the
   # popup writes under.
+  #
+  # A forced on-demand hibernation (force=hard) bypasses this guard: the user
+  # explicitly asked for it via the popup, so the "never auto-suspend" opt-out
+  # (which is about focus-driven arming) does not apply. cmd_hibernate_now
+  # additionally clears the suspend_hibernation flag so the two don't disagree.
   local _sid _cfg _susp
   _sid="$(read_active_session "$_puuid" 2>/dev/null || true)"
-  if [ -n "$_sid" ]; then
+  if [ "$force" != "hard" ] && [ -n "$_sid" ]; then
     _cfg="$(resolve_session_config "$_sid" 2>/dev/null || true)"
     [ -n "$_cfg" ] || _cfg='{}'
     _susp="$(jq -r '.suspend_hibernation // false' <<<"$_cfg" 2>/dev/null || echo false)"
@@ -1191,7 +1200,13 @@ cmd_hibernate_arm() {
     if [ -n "$prev_pid" ] && kill -0 "$prev_pid" 2>/dev/null; then
       prev_args="$(ps -o args= -p "$prev_pid" 2>/dev/null)"
       if printf '%s' "$prev_args" | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then
-        return 0
+        # A timer is already live for this pane. Normally we defer to it; a
+        # forced on-demand hibernation takes over — kill it and proceed now.
+        if [ "$force" = "hard" ]; then
+          kill "$prev_pid" 2>/dev/null || true
+        else
+          return 0
+        fi
       fi
     fi
     rm -f "$arm_pid_file"
@@ -1221,27 +1236,33 @@ cmd_hibernate_arm() {
     }
 
     # ===== STAGE 1: SOFT (capture + Ctrl+Z) =====
-    sleep "$SOFT_DELAY"
-    arm_check
-
-    # Busy-aware defer (UserPromptSubmit/Pre|PostToolUse touch the busy file;
-    # Stop clears it). Skips title-spinner regex which depended on the
-    # configured theme's streaming glyph.
+    # Normal path waits out SOFT_DELAY, then defers while busy and bails if the
+    # pane is focused. A forced on-demand hibernation skips all three: no wait,
+    # no busy-defer (the user asked for it even mid-run), and no active-pane
+    # guard (the pane IS focused — the popup was opened on top of it).
     local active pids cur child cmd queue
-    for _ in $(seq 1 "$DEFER_TIMES"); do
-      if is_busy "$_puuid"; then sleep "$DEFER_SECONDS"; arm_check; else break; fi
-    done
+    if [ "$force" != "hard" ]; then
+      sleep "$SOFT_DELAY"
+      arm_check
 
-    if is_busy "$_puuid"; then
-      cmd_hibernated "$pane_id" "skip:busy" "skip" 2>/dev/null || true
-      rm -f "$arm_pid_file"
-      exit 0
-    fi
+      # Busy-aware defer (UserPromptSubmit/Pre|PostToolUse touch the busy file;
+      # Stop clears it). Skips title-spinner regex which depended on the
+      # configured theme's streaming glyph.
+      for _ in $(seq 1 "$DEFER_TIMES"); do
+        if is_busy "$_puuid"; then sleep "$DEFER_SECONDS"; arm_check; else break; fi
+      done
 
-    active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
-    if [ "$active" = "11" ]; then
-      rm -f "$arm_pid_file"
-      exit 0
+      if is_busy "$_puuid"; then
+        cmd_hibernated "$pane_id" "skip:busy" "skip" 2>/dev/null || true
+        rm -f "$arm_pid_file"
+        exit 0
+      fi
+
+      active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
+      if [ "$active" = "11" ]; then
+        rm -f "$arm_pid_file"
+        exit 0
+      fi
     fi
 
     # Walk pane process tree for record-keeping. We don't actually signal
@@ -1316,13 +1337,18 @@ cmd_hibernate_arm() {
     cmd_hibernated "$pane_id" "$pids" "soft" 2>/dev/null || true
 
     # ===== STAGE 2: HARD (fg + /exit, with SIGTERM/SIGKILL fallback) =====
-    local hard_remaining=$((HARD_DELAY - SOFT_DELAY))
-    if [ "$hard_remaining" -le 0 ]; then
-      rm -f "$arm_pid_file"
-      exit 0
+    # A forced hibernation escalates straight through: no HARD_DELAY wait and
+    # no active-pane guard. The marker/mode sanity checks below still run — the
+    # soft stage above just wrote a fresh soft marker, so they pass.
+    if [ "$force" != "hard" ]; then
+      local hard_remaining=$((HARD_DELAY - SOFT_DELAY))
+      if [ "$hard_remaining" -le 0 ]; then
+        rm -f "$arm_pid_file"
+        exit 0
+      fi
+      sleep "$hard_remaining"
+      arm_check
     fi
-    sleep "$hard_remaining"
-    arm_check
 
     # Bail out if the hibernated marker is gone (resume already happened) or
     # already hard, or pane is currently focused.
@@ -1331,10 +1357,12 @@ cmd_hibernate_arm() {
     current_mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
     [ "$current_mode" = "soft" ] || { rm -f "$arm_pid_file"; exit 0; }
 
-    active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
-    if [ "$active" = "11" ]; then
-      rm -f "$arm_pid_file"
-      exit 0
+    if [ "$force" != "hard" ]; then
+      active="$(tmux display-message -p -t "$pane_id" -F '#{window_active}#{pane_active}' 2>/dev/null || echo "00")"
+      if [ "$active" = "11" ]; then
+        rm -f "$arm_pid_file"
+        exit 0
+      fi
     fi
 
     # Wake claude (fg restores tcsetpgrp + SIGCONT). Then send `/exit<Enter>`
@@ -1480,6 +1508,87 @@ cmd_hibernate_resume() {
   esac
 }
 
+# --- On-demand hibernation (prefix + a config popup) ------------------------
+#
+# The automatic layer above is focus-driven. These three entry points let the
+# user drive it by hand from the config popup: a single row that flips between
+# "hibernate now" and "restore" depending on the pane's current state.
+
+# Report a pane's hibernation state as none|soft|hard, so the popup can pick
+# the right label (hibernate vs restore).
+cmd_hibernate_state() {
+  local pane_id="${1:-}"
+  [ -n "$pane_id" ] || { echo none; return 0; }
+  local puuid marker mode
+  puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+  [ -n "$puuid" ] || { echo none; return 0; }
+  marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json"
+  [ -f "$marker" ] || { echo none; return 0; }
+  mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
+  case "$mode" in
+    soft) echo soft ;;
+    hard) echo hard ;;
+    *)    echo none ;;
+  esac
+}
+
+# Force a hard hibernation of a pane right now. Resolves the pane's process-tree
+# root and drives cmd_hibernate_arm in force=hard mode (no delays, no busy /
+# active guards → capture, fg + /exit, pre-fill `clr <sid>`). The arm function
+# backgrounds + disowns the actual work, so this returns immediately.
+cmd_hibernate_now() {
+  local pane_id="${1:-}"
+  [ -n "$pane_id" ] || return 0
+  local pane_pid
+  pane_pid="$(tmux display-message -p -t "$pane_id" -F '#{pane_pid}' 2>/dev/null || true)"
+  [ -n "$pane_pid" ] || return 0
+
+  # Clearing suspend_hibernation keeps the popup honest: forcing hibernation
+  # while "never suspend" is still ticked would be contradictory, and leaving
+  # it set would let the arm-sweep decline to re-arm this pane later. Resolve
+  # the same session id the popup writes under.
+  local puuid sid
+  puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+  if [ -n "$puuid" ]; then
+    sid="$(read_active_session "$puuid" 2>/dev/null || true)"
+    [ -n "$sid" ] && set_session_config_value "$sid" suspend_hibernation false 2>/dev/null || true
+  fi
+
+  cmd_hibernate_arm "$pane_id" "$pane_pid" hard
+}
+
+# Restore a hibernated pane on demand, choosing the mechanism that fits the
+# pane's current shape:
+#   soft (claude Ctrl+Z'd, job suspended) -> `fg` — reuse the focus-in resume.
+#   hard (claude /exited, plain shell)    -> type `clr <sid>` and run it.
+# The hard branch is the "smart about a text shell" part: there is no suspended
+# job to fg, so we issue the resume recipe at the shell prompt instead. C-u
+# first clears any partial line (e.g. the `clr <sid>` the hard stage pre-filled
+# without Enter). The hard marker is left in place — it is the crash-restore
+# insurance, and cmd_session_start clears it once claude comes back up.
+cmd_restore_now() {
+  local pane_id="${1:-}"
+  [ -n "$pane_id" ] || return 0
+  local puuid marker mode
+  puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
+  [ -n "$puuid" ] || return 0
+  marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json"
+  [ -f "$marker" ] || return 0
+  mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
+  case "$mode" in
+    soft)
+      cmd_hibernate_resume "$pane_id"
+      ;;
+    hard)
+      local sid
+      sid="$(jq -r '.session_id // empty' \
+              "$CLAUDE_RESCUE_DATA_HOME/captures/$puuid.json" 2>/dev/null || true)"
+      [ -n "$sid" ] || sid="$(read_active_session "$puuid" 2>/dev/null || true)"
+      [ -n "$sid" ] && send_keys_logged "restore-now-clr" "$pane_id" C-u "clr $sid" Enter
+      ;;
+  esac
+}
+
 # Arm every backgrounded claude pane that isn't already armed. Triggered on
 # client-attached (and session/window changes if wired) so users don't have
 # to physically visit each pane to start its hibernation countdown.
@@ -1585,6 +1694,9 @@ case "$cmd" in
   resurrect-post-restore-all) cmd_resurrect_post_restore_all "$@" ;;
   hibernate-arm)      cmd_hibernate_arm "$@" ;;
   hibernate-resume)   cmd_hibernate_resume "$@" ;;
+  hibernate-now)      cmd_hibernate_now "$@" ;;
+  hibernate-state)    cmd_hibernate_state "$@" ;;
+  restore-now)        cmd_restore_now "$@" ;;
   arm-sweep)          cmd_arm_sweep "$@" ;;
   '')                 log_err "no subcommand"; exit 2 ;;
   *)                  log_err "unknown subcommand: $cmd"; exit 2 ;;

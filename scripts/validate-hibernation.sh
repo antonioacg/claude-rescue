@@ -33,6 +33,11 @@
 #      running claude, no busy marker, no hibernation marker) and cleans up
 #      arm.pid + active file + unsets @claude-pane-id. Catches hook-skipping
 #      exit paths (SIGKILL, hard crashes) that SessionEnd never sees.
+#  11. On-demand hibernate/restore (the `prefix + a` popup row). hibernate-now
+#      forces a hard hibernation immediately (bypassing SOFT/HARD delays and the
+#      busy/active guards) AND clears suspend_hibernation; hibernate-state
+#      reports none→hard; restore-now on a hard pane types `clr <sid>` at the
+#      shell prompt (smart about a text shell) and claude comes back.
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -678,6 +683,101 @@ assert "scenario 10: idempotent re-fire appends no new event" "$EV_BEFORE" \
   "$(wc -l < "$B_LOG" | tr -d ' ')"
 assert "scenario 10: active still fork after idempotent re-fire" "$FORK_SID" \
   "$(cat "$DATA_DIR/active/$B_UUID" 2>/dev/null | tr -d '\n')"
+
+# ---------------------------------------------------------------------------
+echo "[11] on-demand hibernate/restore (prefix + a popup row)"
+
+# Run hibernate-state INSIDE the staging server (so its tmux calls hit -L $SOCK)
+# and capture its stdout via a file — run-shell without -b is synchronous, so
+# the redirect has landed by the time it returns.
+hib_state() {
+  local out="$DATA_DIR/hibstate.out"
+  rm -f "$out"
+  tmux -L "$SOCK" run-shell -t "$1" "claude-rescue-log hibernate-state #{pane_id} > $out 2>/dev/null"
+  cat "$out" 2>/dev/null | tr -d '\n '
+}
+
+# Drive %1 (main:1.2, projectA) — deliberately NOT P0/P2. Those were left with a
+# rewritten/synthetic active session id (scenario 10 stamps PARENT_SID onto P0),
+# so their active file no longer matches the real claude in the pane, which would
+# make the suspend-clear and `clr <sid>` checks below read the wrong session. %1
+# is the one fixture claude pane no earlier scenario mutates, so its active file
+# still reflects reality — like a fresh boot. The popup delegates to these same
+# subcommands: hibernate-state (row label), hibernate-now (force hard suspend),
+# restore-now (bring it back).
+P11=%1
+P11_UUID="$(pane_uuid_of $P11)"
+[ -z "$P11_UUID" ] && { echo "FATAL: $P11 has no @claude-pane-id" >&2; exit 1; }
+P11_SAN="${P11//[^A-Za-z0-9]/_}"
+P11_MARKER="$CACHE_DIR/hibernated/$P11_UUID.json"
+P11_ARM="$CACHE_DIR/hibernated/$P11_SAN.arm.pid"
+
+# Defensive reset to a known live-claude state: scenarios 6/9 ran arm-sweep over
+# every backgrounded claude pane (%1 included) and killed the timers again a few
+# seconds later. That window is shorter than SOFT_DELAY so %1 should still be
+# live, but don't depend on scheduling jitter — cancel any lingering arm timer,
+# and if a stray one did fire, resume + clear the marker before testing.
+if [ -f "$P11_ARM" ]; then
+  P11_AP="$(cat "$P11_ARM" 2>/dev/null)"; [ -n "$P11_AP" ] && kill "$P11_AP" 2>/dev/null || true
+  rm -f "$P11_ARM"
+fi
+if [ -f "$P11_MARKER" ]; then
+  tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log hibernate-resume #{pane_id}'
+  sleep 2
+  rm -f "$P11_MARKER"
+fi
+
+# Precondition: claude is foreground and the pane reports "none".
+assert "scenario 11: pane is a live claude before hibernate-now" "claude" "$(fg_cmd $P11)"
+assert "scenario 11: hibernate-state is 'none' with no marker" "none" "$(hib_state $P11)"
+
+# Seed suspend_hibernation=true on the pane's active session — hibernate-now must
+# clear it (forcing a suspend while "never suspend" is ticked is contradictory).
+SID11="$(cat "$DATA_DIR/active/$P11_UUID" 2>/dev/null | head -1 | tr -d '\n')"
+assert_nonempty "scenario 11: pane has an active session_id" "$SID11"
+mkdir -p "$DATA_DIR/session-config"
+printf '{"suspend_hibernation":true}\n' > "$DATA_DIR/session-config/$SID11.json"
+
+# Force the hard hibernation. Internally: no delays, no busy/active guards —
+# capture, Ctrl+Z, fg, /exit, `clr <sid>` pre-fill. Give the escalation +
+# kill-fallback time to complete.
+tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log hibernate-now #{pane_id}'
+sleep 12
+
+# NB: read the flag with a plain `.suspend_hibernation`, NOT `// empty` — jq's
+# `//` operator treats `false` as absent, so `false // empty` prints nothing and
+# would mask a correctly-cleared flag as "".
+assert "scenario 11: suspend_hibernation cleared by hibernate-now" "false" \
+  "$(jq -r '.suspend_hibernation' "$DATA_DIR/session-config/$SID11.json" 2>/dev/null)"
+assert "scenario 11: marker mode=hard after forced hibernation" "hard" \
+  "$(jq -r '.mode // empty' "$P11_MARKER" 2>/dev/null)"
+assert "scenario 11: hibernate-state reports 'hard'" "hard" "$(hib_state $P11)"
+assert "scenario 11: pane back at zsh (claude /exited)" "zsh" "$(fg_cmd $P11)"
+# Poll for the `clr <sid>` pre-fill — claude's /exit + shell redraw can lag a
+# couple seconds past the marker write under real-claude latency.
+CLR_OK=0
+for _ in $(seq 1 10); do
+  if tmux -L "$SOCK" capture-pane -p -t $P11 | grep -q '❯ clr [0-9a-f]\{8\}-'; then CLR_OK=1; break; fi
+  sleep 1
+done
+assert "scenario 11: 'clr <sid>' pre-filled at prompt" "1" "$CLR_OK"
+
+# Restore on demand. Hard branch is "smart about a text shell": no suspended job
+# to fg, so it types `clr <sid>` at the prompt and runs it → claude --resume.
+tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log restore-now #{pane_id}'
+RESTORED=0
+for _ in $(seq 1 20); do
+  if [ "$(fg_cmd $P11)" = "claude" ]; then RESTORED=1; break; fi
+  sleep 1
+done
+assert "scenario 11: restore-now brought claude back (hard → clr resume)" "1" "$RESTORED"
+sleep 2
+assert "scenario 11: hard marker cleaned up by session_start after restore" "0" \
+  "$([ -f "$P11_MARKER" ] && echo 1 || echo 0)"
+assert "scenario 11: hibernate-state back to 'none' after restore" "none" "$(hib_state $P11)"
+
+# Cleanup.
+rm -f "$DATA_DIR/session-config/$SID11.json"
 
 # ---------------------------------------------------------------------------
 # Summary
