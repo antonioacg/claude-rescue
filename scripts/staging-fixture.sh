@@ -55,19 +55,23 @@ wait_for_cmd() {
   return 1
 }
 
-# Wait for a transcript file to appear under ~/.claude/projects/<encoded>/.
+# True (0) if a fresh transcript exists under ~/.claude/projects/<encoded>/.
 # Encoded cwd = $cwd with BOTH `/` and `.` mapped to `-` (so `.local` and
 # `/local` both become `-local`, hence the `--` you see on dotfile paths).
-wait_for_transcript() {
-  local cwd="$1" enc proj_dir i
+transcript_present() {
+  local cwd="$1" enc proj_dir
   enc="${cwd//\//-}"
   enc="${enc//./-}"
   proj_dir="$HOME/.claude/projects/$enc"
-  for i in $(seq 1 "$TRANSCRIPT_TIMEOUT"); do
-    if [ -d "$proj_dir" ] \
-       && find "$proj_dir" -name '*.jsonl' -mmin -5 -print -quit 2>/dev/null | grep -q .; then
-      return 0
-    fi
+  [ -d "$proj_dir" ] \
+    && find "$proj_dir" -name '*.jsonl' -mmin -5 -print -quit 2>/dev/null | grep -q .
+}
+
+# Poll transcript_present up to $2 seconds (default TRANSCRIPT_TIMEOUT).
+wait_for_transcript() {
+  local cwd="$1" timeout="${2:-$TRANSCRIPT_TIMEOUT}" i
+  for i in $(seq 1 "$timeout"); do
+    transcript_present "$cwd" && return 0
     sleep 1
   done
   return 1
@@ -77,15 +81,25 @@ wait_for_transcript() {
 # has been written. Sending "hi" produces the transcript via the first user
 # message.
 boot_claude_in_pane() {
-  local pane_id="$1" cwd="$2"
+  local pane_id="$1" cwd="$2" elapsed
   echo "  → cl in $pane_id (cwd=$cwd)"
   tmux -L "$SOCK" send-keys -t "$pane_id" "cl" Enter
   wait_for_cmd "$pane_id" claude \
     || die "claude failed to start in $pane_id within ${CLAUDE_READY_TIMEOUT}s"
-  sleep 1
-  tmux -L "$SOCK" send-keys -t "$pane_id" "hi" Enter
-  wait_for_transcript "$cwd" \
-    || die "no transcript appeared for cwd=$cwd within ${TRANSCRIPT_TIMEOUT}s"
+
+  # pane_current_command flips to `claude` the instant the process execs, but
+  # its TUI only starts accepting keystrokes a couple seconds later — "hi" sent
+  # too early is silently dropped, so no user message and no transcript (the
+  # bug that made this fixture flaky, worse with Fable's slower splash render).
+  # Give it a settle beat, then send "hi" and RESEND on a short cadence until
+  # the transcript proves the message landed. C-u first clears any partial line
+  # a dropped-tail attempt may have left. Total wait bounded by TRANSCRIPT_TIMEOUT.
+  sleep "${CLAUDE_INPUT_SETTLE:-3}"
+  for (( elapsed = 0; elapsed < TRANSCRIPT_TIMEOUT; elapsed += 5 )); do
+    tmux -L "$SOCK" send-keys -t "$pane_id" C-u "hi" Enter
+    wait_for_transcript "$cwd" 5 && return 0
+  done
+  die "no transcript appeared for cwd=$cwd within ${TRANSCRIPT_TIMEOUT}s"
 }
 
 # ---------------------------------------------------------------------------
