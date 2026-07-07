@@ -240,10 +240,15 @@ assert_nonempty "scenario 3: hard_ts recorded" "$(jq -r '.hard_ts // empty' "$MA
 # Pick up the latest pids the second arm recorded (might match SOFT_PIDS, might be more if claude spawned children).
 read -r -a HARD_PIDS <<< "$(marker_pids "$P0_UUID" | tr '\n' ' ')"
 assert "scenario 3: all marker pids dead after hard" "1" "$(pids_all_dead "${HARD_PIDS[@]}")"
-# Pane should be back at zsh with `clr <sid>` pre-filled.
+# Pane should be back at zsh with `clr <sid>` pre-filled. Poll for the pre-fill
+# — claude's /exit + shell redraw can lag a couple seconds past the marker flip
+# under real-claude latency, so a single capture races the redraw.
 assert "scenario 3: pane_current_command is zsh" "zsh" "$(fg_cmd $P0)"
-PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t $P0 | tail -5)"
-HAS_CLR="$(printf '%s' "$PANE_CONTENT" | grep -c '^.*❯ clr [0-9a-f]\{8\}-' || true)"
+HAS_CLR=0
+for _ in $(seq 1 10); do
+  if tmux -L "$SOCK" capture-pane -p -t $P0 | grep -q '❯ clr [0-9a-f]\{8\}-'; then HAS_CLR=1; break; fi
+  sleep 1
+done
 assert "scenario 3: 'clr <sid>' pre-filled at shell prompt" "1" "$HAS_CLR"
 
 # ---------------------------------------------------------------------------
@@ -537,6 +542,19 @@ fi
 P2_SAN="${P2//[^A-Za-z0-9]/_}"
 P2_ARM_FILE="$CACHE_DIR/hibernated/$P2_SAN.arm.pid"
 
+# Wait for %2's REAL claude to go idle before touching its state. Scenario 7's
+# negative control sent `fg<Enter>` into a live (never actually suspended)
+# claude — that lands as a chat MESSAGE, so claude starts generating a response
+# whose UserPromptSubmit/Stop hooks fire seconds-to-a-minute later (slow models
+# stretch this). The Stop hook's reconcile rewrites active/<P2_UUID> with the
+# real sid; if that lands after our session_end below, the "active removed"
+# assert fails. Stop/SessionEnd clear the busy marker, so busy-gone == no more
+# in-flight hook writes. Timeout keeps a crashed claude from hanging the suite.
+for _ in $(seq 1 90); do
+  [ -f "$CACHE_DIR/busy/$P2_UUID" ] || break
+  sleep 1
+done
+
 # Clean slate.
 rm -f "$P2_ARM_FILE"
 rm -f "$DATA_DIR/active/$P2_UUID"
@@ -546,6 +564,13 @@ tmux -L "$SOCK" run-shell -t $P2 'claude-rescue-log hibernate-arm #{pane_id} #{p
 sleep 1
 assert "scenario 8: arm.pid created by hibernate-arm" "1" \
   "$([ -f "$P2_ARM_FILE" ] && echo 1 || echo 0)"
+
+# Kill the arm SUBSHELL (but keep its arm.pid file) before firing SessionEnd.
+# Otherwise, under load, the timer can reach SOFT_DELAY and soft-hibernate P2
+# mid-scenario — writing a marker that makes cmd_session_end correctly PRESERVE
+# the active file (marker-present path), which would fail the removal check
+# below. Reaping the leftover arm.pid file is exactly what this scenario asserts.
+S8_AP="$(cat "$P2_ARM_FILE" 2>/dev/null)"; [ -n "$S8_AP" ] && kill "$S8_AP" 2>/dev/null || true
 
 # Seed an active session file (simulates a prior cmd_session_start write).
 mkdir -p "$DATA_DIR/active"
@@ -564,6 +589,13 @@ printf '%s\n' "$SID8" > "$DATA_DIR/active/$P2_UUID"
 # works fine. The test has to mimic that explicitly.
 S8_JSON_FILE="$DATA_DIR/scenario8.json"
 printf '{"session_id":"%s","cwd":"/tmp","hook_event_name":"SessionEnd"}' "$SID8" > "$S8_JSON_FILE"
+# Guarantee the scenario's precondition — NO hibernation marker for this pane —
+# right before firing SessionEnd. cmd_session_end preserves active/ when a marker
+# is present (the hard-hibernate resume path), so any stray marker (e.g. this
+# pane's arm timer having fired under load, or residue from an earlier scenario)
+# would make the "active removed" check below fail. This is exactly the state
+# this scenario means to exercise: a plain, non-hibernated exit.
+rm -f "$CACHE_DIR/hibernated/$P2_UUID.json"
 tmux -L "$SOCK" run-shell -t $P2 "TMUX_PANE=$P2 claude-rescue-log session_end < $S8_JSON_FILE"
 sleep 2
 
@@ -626,9 +658,15 @@ echo "[10] fork guard + reconcile: a forked pane self-heals to its real sid"
 # SessionStart(source=resume, .session_id=<parent>) while <parent> is still live
 # in the parent pane. cmd_session_start's guard must decline to stamp it; the
 # fork's real id then self-heals via the user_prompt_submit reconcile.
-P10_A=$P0        # live "parent" pane (has @claude-pane-id)
+# The "parent" pane's active file only needs to CARRY PARENT_SID — the guard
+# (sid_live_in_other_pane) is purely active-file based and never checks pane
+# liveness. Use a SYNTHETIC parent uuid rather than %0's: %0 is a live claude
+# whose own Stop/UserPromptSubmit reconcile hooks rewrite active/<%0-uuid> back
+# to its real sid, which under load overwrites the PARENT_SID we stamp before B
+# fires — making the guard miss it and skip declining (a test race, not a
+# product bug). A synthetic pane's active file is touched by nobody, so stable.
+A_UUID="aaaaaaaa-0000-4000-8000-00000000000a"
 P10_B=%2         # "fork" pane — claude uuid kept, active file cleared in scenario 8
-A_UUID="$(pane_uuid_of $P10_A)"
 B_UUID="$(pane_uuid_of $P10_B)"
 [ -z "$B_UUID" ] && { echo "FATAL: $P10_B has no @claude-pane-id" >&2; exit 1; }
 PARENT_SID="10000000-0000-4000-8000-000000000001"
