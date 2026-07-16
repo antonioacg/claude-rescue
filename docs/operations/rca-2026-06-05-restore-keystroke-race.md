@@ -511,3 +511,9 @@ auto-paints again, scenario 5 asserts exactly one `post-restore-print` under
 the concurrent double-fire and that stray prompt text is never executed with
 `claude-rescue print` appended (the same-burst `C-u` regression guard), and
 scenario 1 asserts crash-promote panes get no print.
+
+The same discipline was then applied at **hard-hibernation completion**
+(`hibernate-hard-print` in `cmd_hibernate_arm`): claude runs on the alternate
+screen, so `/exit` reverts the pane to pre-claude shell content and the
+session's last screen was not visible until resume. Pinned by
+`validate-hibernation.sh` scenarios 3 and 11.

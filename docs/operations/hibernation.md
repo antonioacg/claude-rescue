@@ -51,11 +51,17 @@ hibernate-resume:         send-keys "fg" Enter → "/exit" Enter
                 delete    (fallback) SIGTERM → SIGKILL
                 marker          │
   mode=hard → no-op             ▼
-                (marker  send-keys "clr <sid>" (no Enter)
+                (marker   marker: mode=hard
                 survives)       │
+  forced soft → no-op           ▼
+  (claude live,        send-keys C-u "claude-rescue print" Enter
+   /exit imminent)     (repaint capture — claude exits to the
+                        PRIMARY screen, so the session's last
+                        screen is otherwise not visible)
+                                │
                                 ▼
-                       marker: mode=hard
-                       (cleared by session_start
+                       send-keys C-u "clr <sid>" (no Enter)
+                       (marker cleared by session_start
                         when claude restarts in pane,
                         or pane_died for orphans)
 ```
@@ -121,7 +127,7 @@ runs only if `/exit` doesn't exit within ~3s.
 | `$DATA/captures/<pane_uuid>.txt` | durable, overwritten on next hibernation | full pane scrollback at suspend time (ANSI preserved) |
 | `$DATA/captures/<pane_uuid>.json` | durable | `{pane_uuid, window_uuid, session_id, pane_id, ts, cwd, pids}` |
 | `$DATA/active/<pane_uuid>` | from cmd_session_start until cmd_session_end / cmd_pane_died / arm-sweep voluntary-exit detection | current claude `session_id` for this pane. `claude-rescue-resume`'s priority-1 lookup (beats tmux-resurrect's frozen saved `-r <sid>`). Rewritten by every cmd_session_start, including in-claude `/resume` |
-| `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{pane_id, pane_uuid, ts, mode, pids[], hard_ts?, hard_source?}` |
+| `$CACHE/hibernated/<pane_uuid>.json` | soft: until focus-in resumes the job. hard: until `session_start` fires in the pane (any claude — resumed via `clr <sid>` or a fresh `cl`) or until `pane_died`. Focus-in is a no-op for hard mode so the marker survives as crash-restore insurance. | `{pane_id, pane_uuid, ts, mode, pids[], forced?, hard_ts?, hard_source?}` — `forced: true` marks an on-demand run's in-flight soft state (claude live, never suspended; /exit imminent), which focus-in must treat as a no-op |
 | `$CACHE/hibernated/_<sanitized_pane_id>.arm.pid` | while timer is running. Reaped by hibernate-resume (soft mode), hibernate-arm self-cleanup (busy / focused / hard-complete), cmd_session_end, cmd_pane_died, cmd_resurrect_restore bulk sweep, and arm-sweep voluntary-exit detection. | the bash subshell pid holding the soft+hard sleeps |
 | `$CACHE/busy/<pane_uuid>` | mtime-based freshness window | `{ts, claude_pid?}` JSON — body is for troubleshooting; the `is_busy()` check reads only the file's `mtime` |
 
@@ -201,7 +207,10 @@ send any prompt so a transcript file is created.
 5'. Don't focus back. Wait an additional `HARD_DELAY - SOFT_DELAY` seconds.
 6'. **Verify:**
    - claude (and uv/python children) gone from `ps`.
-   - Pane content shows claude's "Resume this session with: claude --resume <sid>" message.
+   - Pane content shows the **auto-painted capture** (`# claude-rescue capture`
+     header + the session's last screen) — claude runs on the alternate
+     screen, so without the paint the pane would show only pre-claude shell
+     content plus claude's "Resume this session with: …" hint.
    - Pane shell prompt is **pre-filled** with `clr <sid>` (no Enter pressed).
    - Marker has `mode: "hard"`, `hard_ts` set.
 

@@ -12,7 +12,8 @@
 #       both soft and hard. Scenario 1 is its positive control.
 #   1. Soft hibernation fires on an idle claude pane (capture + Ctrl+Z + marker)
 #   2. Soft resume restores the suspended claude
-#   3. Hard escalation fires after HARD_DELAY (claude exits + clr pre-fill)
+#   3. Hard escalation fires after HARD_DELAY (claude exits + capture painted
+#      at the shell + clr pre-fill)
 #   3b. Hard marker survives focus-in (no-op, no spurious unhibernated event)
 #   3c. Hard marker cleaned up by session_start when claude restarts in pane
 #   4. Fast guard skips panes without @claude-pane-id (nvim)
@@ -34,10 +35,17 @@
 #      arm.pid + active file + unsets @claude-pane-id. Catches hook-skipping
 #      exit paths (SIGKILL, hard crashes) that SessionEnd never sees.
 #  11. On-demand hibernate/restore (the `prefix + a` popup row). hibernate-now
-#      forces a hard hibernation immediately (bypassing SOFT/HARD delays and the
-#      busy/active guards) AND clears suspend_hibernation; hibernate-state
-#      reports none→hard; restore-now on a hard pane types `clr <sid>` at the
-#      shell prompt (smart about a text shell) and claude comes back.
+#      forces a hard hibernation immediately (bypassing SOFT/HARD delays, the
+#      busy/active guards, and the Ctrl+Z/fg dance) AND clears
+#      suspend_hibernation; the pipeline survives a SIGHUP to the arm subshell
+#      (the popup pgroup dies when the user closes it with Esc mid-flight);
+#      capture painted + `clr <sid>` pre-filled; hibernate-state reports
+#      none→hard; restore-now on a hard pane types `clr <sid>` at the shell
+#      prompt (smart about a text shell) and claude comes back.
+#  11b. Focus-in during a forced run's in-flight soft window is a no-op:
+#      the marker carries forced=true while claude is still LIVE in the
+#      foreground, so hibernate-resume must not type `fg` into claude, must
+#      not kill the arm subshell, and must leave the marker alone.
 #
 # Timing: with SOFT_DELAY=8 / HARD_DELAY=16 the script runs in ~90s including
 # fixture boot. Exit 0 on all-pass, non-zero on any failure.
@@ -59,6 +67,11 @@ FAIL=0
 RESULTS=()
 
 # ---------------------------------------------------------------------------
+
+# Timestamp for hand-injected markers (scenarios 7 and 11b). The validator
+# doesn't source lib/common.sh, so define the helper those injections use —
+# without it the markers were silently written with ts:"".
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 assert() {
   local desc="$1" expected="$2" actual="$3"
@@ -250,6 +263,11 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 assert "scenario 3: 'clr <sid>' pre-filled at shell prompt" "1" "$HAS_CLR"
+# The capture is auto-painted at the shell before the pre-fill — claude runs
+# on the alternate screen, so without the print the pane would show only the
+# pre-claude shell content (no peek at what the session was).
+assert "scenario 3: capture auto-painted at the shell (peek without resuming)" "1" \
+  "$(tmux -L "$SOCK" capture-pane -p -t $P0 -S - | grep -q '# claude-rescue capture' && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 echo "[3b] hard marker survives focus-in (hibernate-resume is a no-op for hard mode)"
@@ -776,11 +794,26 @@ assert_nonempty "scenario 11: pane has an active session_id" "$SID11"
 mkdir -p "$DATA_DIR/session-config"
 printf '{"suspend_hibernation":true}\n' > "$DATA_DIR/session-config/$SID11.json"
 
-# Force the hard hibernation. Internally: no delays, no busy/active guards —
-# capture, Ctrl+Z, fg, /exit, `clr <sid>` pre-fill. Give the escalation +
-# kill-fallback time to complete.
+# Force the hard hibernation. Internally: no delays, no busy/active guards, no
+# Ctrl+Z/fg dance — capture, /exit, capture paint + `clr <sid>` pre-fill.
 tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log hibernate-now #{pane_id}'
-sleep 12
+
+# Model the user closing the popup (Esc) mid-flight: tmux HUPs the popup's
+# process group, which used to kill the arm subshell between /exit and the
+# pre-fill (observed 2026-07-16: claude gone, no paint, no clr). The subshell
+# now ignores HUP; every assert below doubles as proof it survived. Read the
+# pid IMMEDIATELY — the forced pipeline runs ~2s end-to-end and removes its
+# own arm.pid on completion, so any pre-read sleep races the cleanup (and a
+# late HUP tests nothing).
+S11_ARM_PID=""
+for _ in $(seq 1 10); do
+  S11_ARM_PID="$(cat "$P11_ARM" 2>/dev/null)"
+  [ -n "$S11_ARM_PID" ] && break
+  sleep 0.1
+done
+assert_nonempty "scenario 11: arm subshell pid readable for HUP test" "$S11_ARM_PID"
+[ -n "$S11_ARM_PID" ] && kill -HUP "$S11_ARM_PID" 2>/dev/null || true
+sleep 8
 
 # NB: read the flag with a plain `.suspend_hibernation`, NOT `// empty` — jq's
 # `//` operator treats `false` as absent, so `false // empty` prints nothing and
@@ -799,6 +832,10 @@ for _ in $(seq 1 10); do
   sleep 1
 done
 assert "scenario 11: 'clr <sid>' pre-filled at prompt" "1" "$CLR_OK"
+# The peek: capture painted at the shell before the pre-fill (claude's alt
+# screen means the pane would otherwise show nothing of the session).
+assert "scenario 11: capture auto-painted after hibernate-now" "1" \
+  "$(tmux -L "$SOCK" capture-pane -p -t $P11 -S - | grep -q '# claude-rescue capture' && echo 1 || echo 0)"
 
 # Restore on demand. Hard branch is "smart about a text shell": no suspended job
 # to fg, so it types `clr <sid>` at the prompt and runs it → claude --resume.
@@ -816,6 +853,45 @@ assert "scenario 11: hibernate-state back to 'none' after restore" "none" "$(hib
 
 # Cleanup.
 rm -f "$DATA_DIR/session-config/$SID11.json"
+
+# ---------------------------------------------------------------------------
+echo "[11b] focus-in during a forced run's in-flight soft window is a no-op"
+
+# %1 has a live claude again (scenario 11 restored it). A forced run writes a
+# mode=soft marker with forced=true while claude is still LIVE in the
+# foreground (no Ctrl+Z on the forced path) — /exit lands a beat later.
+# Focus-in during that window (the popup closing refocuses the pane) must be
+# a full no-op: `fg<Enter>` would be typed INTO claude as a prompt, killing
+# the arm subshell would cancel the hibernation the user explicitly asked
+# for, and deleting the marker would break stage 2's mode=soft sanity check.
+assert "scenario 11b: claude live in pane before forced-window test" "claude" "$(fg_cmd $P11)"
+
+# Fake the in-flight state by hand (scenario 7 pattern): a real arm subshell
+# (freshly armed, sleeping toward soft) plus an injected forced-soft marker.
+tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
+sleep 1
+S11B_ARM_PID="$(cat "$P11_ARM" 2>/dev/null)"
+assert "scenario 11b: arm subshell alive pre-focus-in" "1" \
+  "$([ -n "$S11B_ARM_PID" ] && kill -0 "$S11B_ARM_PID" 2>/dev/null && echo 1 || echo 0)"
+jq -nc --arg ts "$(now_iso)" --arg pid_p "$P11" --arg puuid "$P11_UUID" \
+  '{pane_id:$pid_p, pane_uuid:$puuid, ts:$ts, mode:"soft", forced:true, pids:[]}' \
+  > "$P11_MARKER"
+
+S11B_FG_BEFORE="$(grep -c "hibernate-resume-fg pane=$P11 " "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
+tmux -L "$SOCK" run-shell -t $P11 'claude-rescue-log hibernate-resume #{pane_id}'
+sleep 1
+
+S11B_FG_AFTER="$(grep -c "hibernate-resume-fg pane=$P11 " "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
+assert "scenario 11b: no fg typed into the live claude" "${S11B_FG_BEFORE:-0}" "${S11B_FG_AFTER:-0}"
+assert "scenario 11b: forced-soft marker survives focus-in" "1" \
+  "$([ -f "$P11_MARKER" ] && echo 1 || echo 0)"
+assert "scenario 11b: arm subshell NOT killed (forced pipeline must finish)" "1" \
+  "$(kill -0 "$S11B_ARM_PID" 2>/dev/null && echo 1 || echo 0)"
+assert "scenario 11b: claude still foreground (untouched)" "claude" "$(fg_cmd $P11)"
+
+# Cleanup: kill the fake arm, drop the injected marker.
+[ -n "$S11B_ARM_PID" ] && kill "$S11B_ARM_PID" 2>/dev/null || true
+rm -f "$P11_ARM" "$P11_MARKER"
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -1243,6 +1243,14 @@ cmd_hibernate_arm() {
   (
     exec </dev/null >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/hibernate.err"
 
+    # Survive the spawner's context dying mid-pipeline. The config-popup path
+    # is the observed case (2026-07-16): closing the popup (Esc) while a forced
+    # hibernation was in flight HUP'd the popup's process group — claude had
+    # /exited but the print + `clr <sid>` pre-fill never arrived. The parent's
+    # `trap '' HUP` below runs AFTER the fork and never reaches this subshell;
+    # ignore it here, first thing.
+    trap '' HUP
+
     # Discover our own pid in a way that works on bash 3.2 (no $BASHPID).
     # `exec sh -c 'echo $PPID'` makes sh REPLACE the command-substitution
     # subshell at the same pid, then echo its parent's pid — which is *this*
@@ -1353,18 +1361,34 @@ cmd_hibernate_arm() {
       && mv "$capture_meta.tmp" "$capture_meta"
 
     # === Soft hibernate: send Ctrl+Z. The tty driver issues SIGTSTP to the
-    # foreground process group, the shell takes terminal control back. ===
-    send_keys_logged "hibernate-soft-suspend" "$pane_id" C-z
+    # foreground process group, the shell takes terminal control back.
+    # A forced hibernation skips the suspend: stage 2 runs immediately, so
+    # suspending claude only to fg it back a beat later wastes ~2s and flashes
+    # the pane. The soft marker below is still written either way — stage 2's
+    # mode=soft sanity check is the shared state machine, forced or not. ===
+    if [ "$force" != "hard" ]; then
+      send_keys_logged "hibernate-soft-suspend" "$pane_id" C-z
+    fi
 
+    # `forced` tells cmd_hibernate_resume this soft marker is a forced run's
+    # in-flight state, not a suspended claude: the pane's foreground is still
+    # the LIVE claude until /exit lands a beat later. Focus-in during that
+    # window (the popup closing refocuses the pane) must be a no-op — an
+    # `fg<Enter>` there would be typed INTO claude as a prompt, and killing
+    # the arm subshell would cancel the hibernation the user explicitly asked
+    # for.
+    local _forced=false
+    [ "$force" = "hard" ] && _forced=true
     jq -nc --arg pane "$pane_id" --arg puuid "$_puuid" --arg ts "$(now_iso)" \
-           --arg pids "$pids" --arg mode "soft" \
-      '{pane_id:$pane, pane_uuid:$puuid, ts:$ts, mode:$mode,
+           --arg pids "$pids" --arg mode "soft" --argjson forced "$_forced" \
+      '{pane_id:$pane, pane_uuid:$puuid, ts:$ts, mode:$mode, forced:$forced,
         pids:($pids | gsub("^ +| +$";"") | split(" "))}' \
       > "$hibernated_file"
 
     cmd_hibernated "$pane_id" "$pids" "soft" 2>/dev/null || true
 
-    # ===== STAGE 2: HARD (fg + /exit, with SIGTERM/SIGKILL fallback) =====
+    # ===== STAGE 2: HARD (fg + /exit + print + pre-fill, with SIGTERM/SIGKILL
+    # fallback; forced runs skip the fg — claude was never suspended) =====
     # A forced hibernation escalates straight through: no HARD_DELAY wait and
     # no active-pane guard. The marker/mode sanity checks below still run — the
     # soft stage above just wrote a fresh soft marker, so they pass.
@@ -1393,19 +1417,34 @@ cmd_hibernate_arm() {
       fi
     fi
 
-    # Wake claude (fg restores tcsetpgrp + SIGCONT). Then send `/exit<Enter>`
-    # which is claude's own slash command — fires SessionEnd cleanly, flushes
-    # transcript, claude exits gracefully. Fall back to SIGTERM then SIGKILL
-    # if claude is still alive (e.g. mid-stream and ignoring slash commands).
-    send_keys_logged "hibernate-hard-fg" "$pane_id" "fg" Enter
-    sleep 1
+    # Wake claude (fg restores tcsetpgrp + SIGCONT) — only needed when the
+    # soft stage actually suspended it; a forced run left claude live in the
+    # foreground, so `/exit` goes straight in. `/exit<Enter>` is claude's own
+    # slash command — fires SessionEnd cleanly, flushes transcript, claude
+    # exits gracefully. Fall back to SIGTERM then SIGKILL if claude is still
+    # alive (e.g. mid-stream and ignoring slash commands).
+    if [ "$force" != "hard" ]; then
+      send_keys_logged "hibernate-hard-fg" "$pane_id" "fg" Enter
+      sleep 1
+    fi
     send_keys_logged "hibernate-hard-exit" "$pane_id" "/exit" Enter
-    sleep 3
+
+    # Poll for claude's exit instead of a fixed 3s nap — it usually exits well
+    # under a second; the ~3s ceiling for the mid-stream case is unchanged.
+    local pid _w _alive
+    for _w in $(seq 1 15); do
+      _alive=""
+      for pid in $pids; do
+        kill -0 "$pid" 2>/dev/null && { _alive=1; break; }
+      done
+      [ -n "$_alive" ] || break
+      sleep 0.2
+    done
 
     # Check claude is gone; if not, escalate. Each kill is guarded by
     # kill_only_if_comm — recorded pids might have been recycled to unrelated
     # processes after a long defocus + claude crash + new program reusing pid.
-    local pid still_alive=""
+    local still_alive=""
     for pid in $pids; do
       if kill -0 "$pid" 2>/dev/null; then
         still_alive="$still_alive $pid"
@@ -1436,16 +1475,40 @@ cmd_hibernate_arm() {
        "$hibernated_file" > "$hibernated_file.tmp" \
        && mv "$hibernated_file.tmp" "$hibernated_file"
 
-    # Pre-fill `clr <session_id>` at the now-shell prompt (no Enter — user
-    # hits Enter when ready). The pane already shows the pre-suspend content
-    # (claude exited via /exit which doesn't clear the screen), so no need
-    # to also send `claude-rescue print`. The crash-restore path (post
-    # resurrect-restore) is the one that needs the explicit print since the
-    # pane is reborn empty.
+    # claude runs on the ALTERNATE screen, so on exit the pane reverts to the
+    # pre-claude shell content plus claude's own resume hint — the session's
+    # last screen is NOT visible. (An older assumption here — "/exit doesn't
+    # clear the screen, the pane still shows the pre-suspend content" — no
+    # longer holds.) Wait for the shell to own the foreground again, then
+    # repaint the capture and pre-fill the resume recipe.
+    local shell_cmd=""
+    for _w in $(seq 1 10); do
+      shell_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
+      case "$shell_cmd" in zsh|bash|sh|dash|ksh|fish) break ;; esac
+      sleep 0.2
+    done
+
+    # Repaint the capture — the peek that shows what the session was without
+    # resuming it. Same Enter discipline as the post-restore path (see
+    # cmd_resurrect_restore): C-u + command + Enter travel in ONE atomic
+    # send-keys call, so this Enter can only ever execute the bare read-only
+    # print; gated on the foreground actually being a shell (per the poll
+    # above) so it can never be submitted into anything else as input.
+    case "$shell_cmd" in
+      zsh|bash|sh|dash|ksh|fish)
+        if [ -f "$capture_txt" ]; then
+          send_keys_logged "hibernate-hard-print" "$pane_id" C-u "claude-rescue print" Enter
+          # Let print finish so the pre-fill lands on a fresh prompt line.
+          sleep 1
+        fi
+        ;;
+    esac
+
+    # Pre-fill `clr <session_id>` at the shell prompt (no Enter — user hits
+    # Enter when ready).
     local resume_sid
     resume_sid="$(jq -r '.session_id // empty' "$capture_meta" 2>/dev/null)"
     if [ -n "$resume_sid" ]; then
-      sleep 1
       # C-u first, mirroring the post-restore pre-fill: clears any stray text
       # the shell may have on the line before typing the resume recipe. No cwd
       # anchor here — absent a restore the pane keeps its launch dir, so a bare
@@ -1492,17 +1555,26 @@ cmd_hibernate_resume() {
   #   - soft (marker mode=soft): claude is suspended, the subshell is sleeping
   #     toward hard escalation. Cancel it; we're about to fg<Enter> the job.
   #   - hard (marker mode=hard): claude is already gone. The subshell is in its
-  #     short post-/exit cleanup window — sending `clr <sid>` to the prompt,
-  #     emitting the hibernated event, removing its own arm.pid. Killing it now
-  #     drops the `clr <sid>` pre-fill (the user sees a bare prompt). Leave it.
+  #     short post-/exit cleanup window — painting the capture and sending
+  #     `clr <sid>` to the prompt, emitting the hibernated event, removing its
+  #     own arm.pid. Killing it now drops the print + `clr <sid>` pre-fill
+  #     (the user sees a bare prompt). Leave it.
+  #   - forced soft (marker mode=soft, forced=true): a forced hibernation's
+  #     in-flight state — claude is NOT suspended, it is live in the foreground
+  #     until the /exit a beat later. Treat exactly like hard: no arm kill (it
+  #     would cancel what the user explicitly asked for), no fg (it would be
+  #     typed INTO claude as a prompt).
   local hibernated_file=""
-  local mode=""
+  local mode="" forced=""
   if [ -n "$pane_uuid" ]; then
     hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
-    [ -f "$hibernated_file" ] && mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+    if [ -f "$hibernated_file" ]; then
+      mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+      forced="$(jq -r '.forced // false' "$hibernated_file" 2>/dev/null)"
+    fi
   fi
 
-  if [ "$mode" != "hard" ] && [ -f "$arm_pid_file" ]; then
+  if [ "$mode" != "hard" ] && [ "$forced" != "true" ] && [ -f "$arm_pid_file" ]; then
     local arm_pid
     arm_pid="$(cat "$arm_pid_file" 2>/dev/null || true)"
     if [ -n "$arm_pid" ] && kill -0 "$arm_pid" 2>/dev/null; then
@@ -1523,6 +1595,9 @@ cmd_hibernate_resume() {
 
   case "$mode" in
     soft)
+      # Forced in-flight soft: claude is live, not suspended — no-op, the
+      # forced pipeline finishes on its own (see the phase table above).
+      [ "$forced" = "true" ] && return 0
       send_keys_logged "hibernate-resume-fg" "$pane_id" "fg" Enter
       rm -f "$hibernated_file"
       cmd_unhibernated "$pane_id" "$mode" 2>/dev/null || true
@@ -1562,7 +1637,8 @@ cmd_hibernate_state() {
 
 # Force a hard hibernation of a pane right now. Resolves the pane's process-tree
 # root and drives cmd_hibernate_arm in force=hard mode (no delays, no busy /
-# active guards → capture, fg + /exit, pre-fill `clr <sid>`). The arm function
+# active guards, no Ctrl+Z/fg dance → capture, /exit, print + pre-fill
+# `clr <sid>`). The arm function
 # backgrounds + disowns the actual work, so this returns immediately.
 cmd_hibernate_now() {
   local pane_id="${1:-}"

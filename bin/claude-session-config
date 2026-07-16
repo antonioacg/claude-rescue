@@ -128,7 +128,18 @@ toggle_or_edit() {
       [ -n "$op" ] || return 0
       state="$("$REPO/bin/claude-rescue-log" hibernate-state "$op" 2>/dev/null || echo none)"
       if [ "$state" = "none" ]; then
-        "$REPO/bin/claude-rescue-log" hibernate-now "$op" 2>/dev/null || true
+        # Detach from the popup's process group: the hibernation pipeline runs
+        # a few seconds past this return, and closing the popup (Esc) HUPs the
+        # popup pgroup — an inline invocation died mid-pipeline (claude /exited
+        # but no capture paint, no `clr <sid>` pre-fill; observed 2026-07-16).
+        # run-shell -b parents the work on the tmux server, exactly like the
+        # focus-out hook path, so popup lifetime no longer matters. The env
+        # trio is forwarded explicitly — run-shell uses the server's env, not
+        # the popup's.
+        tmux run-shell -b "$(printf 'CLAUDE_RESCUE_CONFIG_HOME=%q CLAUDE_RESCUE_DATA_HOME=%q CLAUDE_RESCUE_CACHE_HOME=%q %q hibernate-now %q' \
+          "$CLAUDE_RESCUE_CONFIG_HOME" "$CLAUDE_RESCUE_DATA_HOME" "$CLAUDE_RESCUE_CACHE_HOME" \
+          "$REPO/bin/claude-rescue-log" "$op")" 2>/dev/null \
+          || "$REPO/bin/claude-rescue-log" hibernate-now "$op" 2>/dev/null || true
       else
         "$REPO/bin/claude-rescue-log" restore-now "$op" 2>/dev/null || true
       fi
