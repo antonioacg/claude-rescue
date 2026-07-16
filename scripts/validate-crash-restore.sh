@@ -112,6 +112,20 @@ force_restore() {
   tmux -L "$SOCK" run-shell '~/.config/tmux/plugins/tmux-resurrect/scripts/restore.sh' >/dev/null 2>&1
 }
 
+wait_idle() {
+  # Wait for the pane's claude to go idle (busy marker cleared by the Stop
+  # hook) before arming hibernation. With DEFER_TIMES=0, an arm firing while
+  # the fixture claude is still answering skips (skip:busy) and the scenario's
+  # marker asserts then fail on nothing having hibernated — the slow-model
+  # flake class from 8243a8b, seen here in scenario 5 on 2026-07-16.
+  local uuid="$1"
+  for _ in $(seq 1 30); do
+    [ -f "$CACHE_DIR/busy/$uuid" ] || return 0
+    sleep 1
+  done
+  return 0
+}
+
 bring_up_fresh() {
   echo "  [setup] kill + wipe + fresh setup + fixture..."
   kill_server
@@ -142,6 +156,7 @@ assert_nonempty "scenario 1: SAVED_SID extracted from pre-crash event log" "$SAV
 
 # Soft hibernate (no resume) — claude remains in T, save will capture
 # pane_current_command=zsh (foreground) but the full command stays claude.
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((SOFT_DELAY + 4))
 
@@ -222,6 +237,7 @@ SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
 assert_nonempty "scenario 2: SAVED_SID extracted from pre-crash event log" "$SAVED_SID"
 
 # Soft → wait for hard escalation. Pane should end at shell with `clr <sid>` pre-filled.
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((HARD_DELAY + 8))
 
@@ -279,6 +295,7 @@ ORIGINAL_SID="$(jq -rs --arg p "$P0_UUID" '
 assert_nonempty "scenario 3: ORIGINAL_SID extracted from pre-hibernation event log" "$ORIGINAL_SID"
 
 # 1. Hard-hibernate the existing claude session.
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((HARD_DELAY + 8))
 assert "scenario 3: post-hard marker mode=hard" "hard" \
@@ -330,6 +347,7 @@ else
 fi
 
 # 4. Hard-hibernate the NEW session.
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((HARD_DELAY + 8))
 assert "scenario 3: marker for NEW session mode=hard" "hard" \
@@ -430,6 +448,7 @@ SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
 assert_nonempty "scenario 5: SAVED_SID extracted" "$SAVED_SID"
 
 # Hard-hibernate → pane ends at zsh with a genuine (non-crash-promote) marker.
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((HARD_DELAY + 8))
 assert "scenario 5: marker mode=hard" "hard" \
@@ -509,6 +528,7 @@ SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
 ' "$DATA_DIR/windows/"*.jsonl 2>/dev/null)"
 assert_nonempty "scenario 6: SAVED_SID extracted" "$SAVED_SID"
 
+wait_idle "$P0_UUID"
 tmux -L "$SOCK" run-shell -t $P0 'claude-rescue-log hibernate-arm #{pane_id} #{pane_pid}'
 sleep $((HARD_DELAY + 8))
 assert "scenario 6: marker mode=hard" "hard" \
