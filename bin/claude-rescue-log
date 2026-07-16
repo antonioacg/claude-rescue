@@ -854,11 +854,13 @@ cmd_resurrect_restore() {
   # pane_uuids are harmless (the wrapper only queries by live pane_uuid).
 
   # === Post-restore UX: for each pane with a genuine hard-hibernation marker,
-  # pre-fill `cd <launch-cwd> && clr <sid>` (no Enter — the user reviews and
-  # presses Enter to resume) so a crashed-then-restored session is one
-  # keystroke from coming back in the RIGHT directory. `clr -r <sid>` resolves
-  # the transcript against the cwd it launches in; restore can drop a pane back
-  # in $HOME, so we anchor the cwd explicitly.
+  # repaint the hibernation capture (`claude-rescue print` — the pane is reborn
+  # blank, and the peek lets the user see what the session was without
+  # resuming it), then pre-fill `cd <launch-cwd> && clr <sid>` (no Enter — the
+  # user reviews and presses Enter to resume) so a crashed-then-restored
+  # session is one keystroke from coming back in the RIGHT directory.
+  # `clr -r <sid>` resolves the transcript against the cwd it launches in;
+  # restore can drop a pane back in $HOME, so we anchor the cwd explicitly.
   #
   # IDEMPOTENT BY CONSTRUCTION. This hook (pre-restore-pane-processes) fires
   # once per tmux-resurrect restore.sh invocation, but a real boot can trigger
@@ -870,11 +872,16 @@ cmd_resurrect_restore() {
   # garble — the 2026-06-05 incident
   # (docs/operations/rca-2026-06-05-restore-keystroke-race.md).
   #
-  # We send NO Enter-terminated keystroke: the auto `claude-rescue print` that
-  # used to run here was the half that turned a duplicate pre-fill into an
-  # executed command. The capture stays on disk; `claude-rescue print` is the
-  # user's to run. Each pre-fill leads with C-u to wipe any raced/leftover
-  # readline input (resurrect's own restore keystrokes, a half-typed command).
+  # Enter discipline: the original auto `claude-rescue print` was dropped after
+  # the incident because its Enter travelled in a SEPARATE burst from the C-u —
+  # a twin pass's Enter could land on a buffer holding the first pass's
+  # un-terminated pre-fill and execute the concatenation. It is re-introduced
+  # below under a hard invariant: ANY Enter-terminated injection must carry its
+  # own leading C-u in the SAME send-keys call (tmux processes each send-keys
+  # atomically, so nothing can interleave between the wipe and the Enter). Under
+  # that rule the only thing an Enter can ever execute is the bare, read-only
+  # `claude-rescue print`. The pre-fill itself still never carries Enter and
+  # still leads with C-u to wipe any raced/leftover readline input.
   #
   # crash-promote markers (soft-hibernated panes resurrect is auto-resuming via
   # the @resurrect-processes wrapper) are skipped: their pane is racing through
@@ -900,7 +907,7 @@ cmd_resurrect_restore() {
     fi
 
     local pane_id pane_uuid hib_marker mode hard_source sid cap_meta
-    local claim row launch_cwd prefill
+    local claim row launch_cwd prefill cur_cmd
     while IFS=$'\t' read -r pane_id pane_uuid; do
       [ -n "$pane_uuid" ] || continue
       hib_marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
@@ -951,6 +958,27 @@ cmd_resurrect_restore() {
               | awk -v FS=$'\x1f' -v s="$sid" '$1==s {print; exit}')"
       [ -n "$row" ] && launch_cwd="$(printf '%s' "$row" | awk -v FS=$'\x1f' '{print $6}')"
       [ -z "$launch_cwd" ] && launch_cwd="$(jq -r '.cwd // empty' "$cap_meta" 2>/dev/null)"
+
+      # Repaint the capture so the reborn (blank) pane shows what the session
+      # looked like — the peek that lets the user decide whether to resume
+      # WITHOUT resuming. Safe under the Enter discipline above: C-u + command
+      # + Enter travel in ONE atomic send-keys call, so no matter how a twin
+      # pass interleaves, this Enter can only execute the bare read-only print
+      # (worst unguarded case: the capture paints twice — cosmetic). Also gated
+      # on the live foreground being a shell: if the user manually resumed
+      # inside our 5s grace, the Enter would otherwise submit the text into
+      # claude as a prompt. (Intent gating above decides WHO gets keys; this
+      # last-moment state check only shrinks the blast radius of the one
+      # Enter we send.)
+      cur_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
+      case "$cur_cmd" in
+        zsh|bash|sh|dash|ksh|fish)
+          send_keys_logged "post-restore-print" "$pane_id" C-u "claude-rescue print" Enter
+          # Let print finish so the pre-fill lands on a fresh prompt line
+          # rather than echoing into the paint.
+          sleep 1
+          ;;
+      esac
 
       # Build the pre-fill. %q-quote the cwd: it is typed into a shell, so a dir
       # with a space or shell metachar would otherwise produce a broken `cd`.

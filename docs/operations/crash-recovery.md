@@ -40,8 +40,16 @@ pane processes, otherwise `claude-rescue-resume` would not see
      gate on **intent** stored in the marker, not on current state). Marker
      cleanup is then handled by `cmd_session_start` when the wrapper-launched
      claude fires its SessionStart hook;
-   - otherwise (timer-driven hard) — `tmux send-keys "claude-rescue print" Enter`
-     then `tmux send-keys "clr <session_id>"` (no Enter — pre-filled at the prompt).
+   - otherwise (timer-driven hard) — one atomic
+     `send-keys C-u "claude-rescue print" Enter` (repaints the hibernation
+     capture; the C-u travels in the same burst as the Enter, so the Enter
+     can only ever execute the bare read-only print — never a concatenation
+     with leftover input; see the
+     [2026-06-05 RCA](rca-2026-06-05-restore-keystroke-race.md)), then
+     `send-keys C-u "cd <launch-cwd> && clr <session_id>"` (no Enter —
+     pre-filled at the prompt). Both sit behind a per-pane, per-server-PID
+     idempotency claim; the print is additionally skipped unless the pane's
+     live foreground is a shell.
      The marker is **NOT** deleted here: `clr <sid>` on the prompt is live
      readline input that tmux-resurrect doesn't capture, so a second crash
      before the user presses Enter would lose the recipe. Marker survives

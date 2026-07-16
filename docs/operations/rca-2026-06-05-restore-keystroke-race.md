@@ -475,3 +475,39 @@ suite):
   force the wrong cwd. After restore it asserts the `@resurrect-processes`
   wrapper cd-rescued the pane back to `proj-a`, resumed the *same* session
   (`-r <sid>` + active-file unchanged), and logged the `cwd-rescue`.
+
+---
+
+## Addendum — 2026-07-16: auto-print re-introduced (Enter-safe by construction)
+
+Fix 4 chose "drop the auto-print entirely" over its alternative ("run print on
+a guaranteed-fresh line"). That traded away real UX: a restored
+hard-hibernated pane came back blank, so peeking at what a session was about
+required actually resuming it. The auto-print is back, implemented as the
+alternative fix 4 offered, under a hard invariant:
+
+**Any Enter-terminated injection must carry its own leading `C-u` in the same
+atomic `send-keys` call.** tmux processes each `send-keys` atomically, so no
+interleaving twin can put text between the wipe and the Enter — the only thing
+an Enter can ever execute is the bare, read-only `claude-rescue print`. The
+2026-06-05 garble required the Enter to land on a buffer holding *another
+burst's* un-terminated pre-fill; that is now impossible by construction, not
+by scheduling.
+
+Defense in depth on top of the invariant (each layer alone prevents the
+incident):
+
+1. the print sits **inside the existing per-pane, per-server-PID `mkdir`
+   claim**, so it fires once per restore epoch — and an unguarded double-fire
+   would only paint the capture twice (cosmetic, nothing executable);
+2. it is **skipped unless the pane's live foreground is a shell**, so the one
+   Enter we send can never be submitted into a claude the user manually
+   resumed inside the subshell's 5 s grace (intent gating still decides *who*
+   gets keys; this state check only shrinks the blast radius of the Enter);
+3. the pre-fill still never carries Enter and still leads with its own `C-u`.
+
+Pinned by `validate-crash-restore.sh`: scenario 2 asserts the capture header
+auto-paints again, scenario 5 asserts exactly one `post-restore-print` under
+the concurrent double-fire and that stray prompt text is never executed with
+`claude-rescue print` appended (the same-burst `C-u` regression guard), and
+scenario 1 asserts crash-promote panes get no print.

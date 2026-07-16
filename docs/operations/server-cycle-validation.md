@@ -101,7 +101,10 @@ a crash.
       (transcript continues, same session_id, prompt + history intact)
 - [ ] **Hibernated claude pane**: verify via `tmux -L test capture-pane
       -p -t <pane>` (the rendered visible buffer, not the byte stream).
-      The bottom of the pane should show `❯ cd <launch-cwd> && clr <sid>`
+      The pane should show the auto-painted hibernation capture (the
+      `# claude-rescue capture` header + snapshot — the peek that lets you
+      read the pane without resuming it), and
+      the bottom of the pane should show `❯ cd <launch-cwd> && clr <sid>`
       and the tmux cursor (`tmux display-message -p '#{cursor_x},#{cursor_y}'`)
       should be on that line, past the end of the command. That confirms
       Enter will actually run the resume command **in the right directory**.
@@ -116,9 +119,11 @@ a crash.
 - [ ] **Idempotent under double-fire**: a real crash can fire restore
       twice (continuum's own auto-restore + the `restore-wrapper.sh` boot
       path), so the post-restore hook can run concurrently with a twin.
-      Confirm each hibernated pane has **exactly one** clean pre-fill — no
-      garbled concatenation (`clr <sid>claude-rescue …`), no executed
-      command, pane still at the shell. Cross-check `send-keys.log`: one
+      Confirm each hibernated pane has **exactly one** clean pre-fill and
+      **one** painted capture — no garbled concatenation
+      (`clr <sid>claude-rescue …`), no executed command other than the bare
+      `claude-rescue print`, pane still at the shell. Cross-check
+      `send-keys.log`: one `post-restore-print` and one
       `post-restore-clr` per pane, and
       `ls $CLAUDE_RESCUE_CACHE_HOME/post-restore-claims/` shows one claim
       dir per handled pane (named `<server-pid>__<pane_uuid>`).

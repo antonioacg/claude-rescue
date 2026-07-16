@@ -12,9 +12,9 @@
 #        - marker cleaned up by session_start when wrapper-launched claude boots
 #   2. Hard → save (cmd=zsh) → kill -9 → restore:
 #        - restored pane comes back as zsh (no claude)
-#        - `clr <sid>` pre-filled at the shell prompt (no auto `claude-rescue
-#          print` — that Enter-terminated step was dropped; capture header must
-#          NOT auto-paint)
+#        - capture auto-painted (`claude-rescue print` — Enter-safe: its C-u
+#          travels in the same atomic send-keys burst as the Enter) and
+#          `clr <sid>` pre-filled at the shell prompt
 #        - marker SURVIVES (cleaned up only when user presses Enter and claude
 #          actually restarts — protects against a second crash before resume)
 #   3. Hard → focus-in → fresh `cl` → hard again → crash → restore:
@@ -200,6 +200,11 @@ if [ -n "$RESTORED_P0" ]; then
     RESULTS+=("PASS  scenario 1: post-restore-keys correctly skipped crash-promote pane")
     PASS=$((PASS + 1))
   fi
+  # The auto-print must skip crash-promote panes too — an Enter-terminated
+  # keystroke into the shell → claude-rescue-resume → claude pipeline would
+  # corrupt the resume (or submit text into the resumed claude).
+  S1_PRINT_COUNT="$(grep -c "post-restore-print" "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
+  assert "scenario 1: no post-restore-print sent to crash-promote pane" "0" "${S1_PRINT_COUNT:-0}"
 fi
 
 # ===========================================================================
@@ -238,18 +243,13 @@ if [ -n "$RESTORED_P0" ]; then
   RESTORED_CMD="$(tmux -L "$SOCK" display-message -p -t "$RESTORED_P0" '#{pane_current_command}' 2>/dev/null)"
   assert "scenario 2: restored pane is zsh (not auto-resumed)" "zsh" "$RESTORED_CMD"
 
-  # The post-restore-keys subshell pre-fills `clr <SAVED_SID>` at the prompt
-  # (no Enter, so it's in the line buffer), now anchored with `cd <cwd> &&`.
-  # No auto `claude-rescue print` runs anymore (it was the dangerous, Enter-
-  # terminated half), so the capture header should NOT be auto-painted.
+  # The post-restore-keys subshell repaints the capture (`claude-rescue print`
+  # executed on a C-u-cleaned line, Enter in the same atomic burst) and then
+  # pre-fills `clr <SAVED_SID>` at the prompt (no Enter, so it's in the line
+  # buffer), anchored with `cd <cwd> &&`.
   PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t "$RESTORED_P0" -S - 2>/dev/null)"
-  if printf '%s' "$PANE_CONTENT" | grep -q "# claude-rescue capture"; then
-    RESULTS+=("FAIL  scenario 2: auto-print should be gone (capture header auto-painted)")
-    FAIL=$((FAIL + 1))
-  else
-    RESULTS+=("PASS  scenario 2: no auto-print (capture header not auto-painted)")
-    PASS=$((PASS + 1))
-  fi
+  assert_contains "scenario 2: capture auto-painted (header visible)" \
+    "# claude-rescue capture" "$PANE_CONTENT"
   assert_contains "scenario 2: 'clr <saved_sid>' pre-filled at prompt" \
     "clr $SAVED_SID" "$PANE_CONTENT"
 fi
@@ -460,6 +460,9 @@ sleep 9   # each subshell: 5s sleep + send-keys
 # `clr <sid>` is logged as `clr\ <sid>`; the uuid itself is unquoted.
 CLR_COUNT="$(grep -c "post-restore-clr.*$SAVED_SID" "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
 assert "scenario 5: exactly one post-restore-clr (idempotent under double-fire)" "1" "${CLR_COUNT:-0}"
+# The re-introduced auto-print sits inside the same claim: exactly one send.
+PRINT_COUNT="$(grep -c "post-restore-print" "$DATA_DIR/send-keys.log" 2>/dev/null || true)"
+assert "scenario 5: exactly one post-restore-print (idempotent under double-fire)" "1" "${PRINT_COUNT:-0}"
 # Direct proof the guard claimed the pane exactly once.
 CLAIM_COUNT="$(find "$CACHE_DIR/post-restore-claims" -mindepth 1 -maxdepth 1 -type d -name "*__$P0_UUID" 2>/dev/null | wc -l | tr -d ' ')"
 assert "scenario 5: exactly one idempotency claim dir for the pane" "1" "${CLAIM_COUNT:-0}"
@@ -476,6 +479,16 @@ if printf '%s' "$PANE_CONTENT" | grep -q "garbage-leftover-xyz.*clr $SAVED_SID";
 else
   RESULTS+=("PASS  scenario 5: stray prompt text cleared before pre-fill (C-u)"); PASS=$((PASS + 1))
 fi
+# The print burst's Enter must never execute stray text prepended to it — the
+# same-burst C-u is what guarantees that. A regression that moves the C-u to
+# its own send-keys call re-opens exactly this: `garbage-leftover-xyzclaude-rescue print` executed.
+if printf '%s' "$PANE_CONTENT" | grep -q "garbage-leftover-xyzclaude-rescue"; then
+  RESULTS+=("FAIL  scenario 5: stray text executed with print appended (C-u not in print burst)"); FAIL=$((FAIL + 1))
+else
+  RESULTS+=("PASS  scenario 5: print ran on a C-u-cleaned line (no stray concatenation)"); PASS=$((PASS + 1))
+fi
+assert_contains "scenario 5: capture auto-painted exactly-once path (header visible)" \
+  "# claude-rescue capture" "$PANE_CONTENT"
 if printf '%s' "$PANE_CONTENT" | grep -qE "clr ${SAVED_SID}[A-Za-z]"; then
   RESULTS+=("FAIL  scenario 5: garbled concatenation after sid (double-fire leaked)"); FAIL=$((FAIL + 1))
 else
