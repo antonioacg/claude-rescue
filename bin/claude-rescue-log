@@ -173,10 +173,10 @@ cmd_session_start() {
   # claude is alive in this pane — any hibernated marker is now stale. This is
   # the cleanup point for hard-mode markers (focus-in is intentionally a no-op
   # so the marker survives as crash-restore insurance until claude is back).
-  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  local hibernated_file; hibernated_file="$(hibernated_marker_path "$pane_uuid")"
   if [ -f "$hibernated_file" ]; then
     local stale_mode
-    stale_mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+    stale_mode="$(hibernated_marker_field "$pane_uuid" mode)"
     rm -f "$hibernated_file"
     cmd_unhibernated "$pane_id" "${stale_mode:-hard}" 2>/dev/null || true
   fi
@@ -232,7 +232,7 @@ cmd_session_end() {
   pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
   local san="${pane_id//[^A-Za-z0-9]/_}"
   rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
-  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+  local hibernated_file; hibernated_file="$(hibernated_marker_path "$pane_uuid")"
   if [ -f "$hibernated_file" ]; then
     log_err "session_end: preserving active/$pane_uuid (hibernation marker present, sid resume path)"
   else
@@ -392,7 +392,7 @@ cmd_pane_died() {
   # Pane is gone — any hibernated marker for it is orphaned. Best-effort
   # cleanup (only if we resolved a pane_uuid above).
   if [ -n "$pane_uuid" ]; then
-    rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+    rm -f "$(hibernated_marker_path "$pane_uuid")"
     clear_active_session "$pane_uuid"
   fi
   local san="${pane_id//[^A-Za-z0-9]/_}"
@@ -910,9 +910,9 @@ cmd_resurrect_restore() {
     local claim row launch_cwd prefill cur_cmd
     while IFS=$'\t' read -r pane_id pane_uuid; do
       [ -n "$pane_uuid" ] || continue
-      hib_marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+      hib_marker="$(hibernated_marker_path "$pane_uuid")"
       [ -f "$hib_marker" ] || continue
-      mode="$(jq -r '.mode // empty' "$hib_marker" 2>/dev/null)"
+      mode="$(hibernated_marker_field "$pane_uuid" mode)"
       [ "$mode" = "hard" ] || continue
 
       # Discriminate by INTENT, not by current state. A crash-promoted marker
@@ -922,7 +922,7 @@ cmd_resurrect_restore() {
       # report any of those depending on timing. Sending keys into that pipeline
       # corrupts the resume. Skip; marker will be cleaned up by cmd_session_start
       # when the wrapper-launched claude fires its SessionStart hook.
-      hard_source="$(jq -r '.hard_source // empty' "$hib_marker" 2>/dev/null)"
+      hard_source="$(hibernated_marker_field "$pane_uuid" hard_source)"
       if [ "$hard_source" = "crash-promote" ]; then
         continue
       fi
@@ -971,14 +971,12 @@ cmd_resurrect_restore() {
       # last-moment state check only shrinks the blast radius of the one
       # Enter we send.)
       cur_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
-      case "$cur_cmd" in
-        zsh|bash|sh|dash|ksh|fish)
-          send_keys_logged "post-restore-print" "$pane_id" C-u "claude-rescue print" Enter
-          # Let print finish so the pre-fill lands on a fresh prompt line
-          # rather than echoing into the paint.
-          sleep 1
-          ;;
-      esac
+      if is_shell_cmd "$cur_cmd"; then
+        send_shell_enter_burst "post-restore-print" "$pane_id" "claude-rescue print"
+        # Let print finish so the pre-fill lands on a fresh prompt line
+        # rather than echoing into the paint.
+        sleep 1
+      fi
 
       # Build the pre-fill. %q-quote the cwd: it is typed into a shell, so a dir
       # with a space or shell metachar would otherwise produce a broken `cd`.
@@ -1215,7 +1213,7 @@ cmd_hibernate_arm() {
 
   local san="${pane_id//[^A-Za-z0-9]/_}"
   local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
-  local hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$_puuid.json"
+  local hibernated_file; hibernated_file="$(hibernated_marker_path "$_puuid")"
 
   # If a timer is already running for this pane, leave it. "Running" means:
   # pid alive AND its argv shows it's actually an arm subshell — defends
@@ -1276,7 +1274,7 @@ cmd_hibernate_arm() {
     # pane is focused. A forced on-demand hibernation skips all three: no wait,
     # no busy-defer (the user asked for it even mid-run), and no active-pane
     # guard (the pane IS focused — the popup was opened on top of it).
-    local active pids cur child cmd queue
+    local active pids
     if [ "$force" != "hard" ]; then
       sleep "$SOFT_DELAY"
       arm_check
@@ -1304,17 +1302,7 @@ cmd_hibernate_arm() {
     # Walk pane process tree for record-keeping. We don't actually signal
     # individual PIDs anymore (Ctrl+Z via terminal handles the whole pgid),
     # but we record what claude PIDs were live at hibernation time.
-    pids=""
-    queue=("$pane_pid")
-    while [ ${#queue[@]} -gt 0 ]; do
-      cur="${queue[0]}"; queue=("${queue[@]:1}")
-      for child in $(pgrep -P "$cur" 2>/dev/null); do
-        queue+=("$child")
-        cmd="$(ps -o comm= -p "$child" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
-        [ "$cmd" = "$TARGET_COMM" ] && pids="$pids $child"
-      done
-    done
-    pids="$(printf '%s\n' $pids | sort -u | tr '\n' ' ')"
+    pids="$(subtree_pids "$pane_pid" "$TARGET_COMM" | sort -u | tr '\n' ' ')"
 
     if [ -z "${pids// /}" ]; then
       rm -f "$arm_pid_file"
@@ -1406,7 +1394,7 @@ cmd_hibernate_arm() {
     # already hard, or pane is currently focused.
     [ -f "$hibernated_file" ] || { rm -f "$arm_pid_file"; exit 0; }
     local current_mode
-    current_mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
+    current_mode="$(hibernated_marker_field "$_puuid" mode)"
     [ "$current_mode" = "soft" ] || { rm -f "$arm_pid_file"; exit 0; }
 
     if [ "$force" != "hard" ]; then
@@ -1484,7 +1472,7 @@ cmd_hibernate_arm() {
     local shell_cmd=""
     for _w in $(seq 1 10); do
       shell_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
-      case "$shell_cmd" in zsh|bash|sh|dash|ksh|fish) break ;; esac
+      is_shell_cmd "$shell_cmd" && break
       sleep 0.2
     done
 
@@ -1494,15 +1482,11 @@ cmd_hibernate_arm() {
     # send-keys call, so this Enter can only ever execute the bare read-only
     # print; gated on the foreground actually being a shell (per the poll
     # above) so it can never be submitted into anything else as input.
-    case "$shell_cmd" in
-      zsh|bash|sh|dash|ksh|fish)
-        if [ -f "$capture_txt" ]; then
-          send_keys_logged "hibernate-hard-print" "$pane_id" C-u "claude-rescue print" Enter
-          # Let print finish so the pre-fill lands on a fresh prompt line.
-          sleep 1
-        fi
-        ;;
-    esac
+    if is_shell_cmd "$shell_cmd" && [ -f "$capture_txt" ]; then
+      send_shell_enter_burst "hibernate-hard-print" "$pane_id" "claude-rescue print"
+      # Let print finish so the pre-fill lands on a fresh prompt line.
+      sleep 1
+    fi
 
     # Pre-fill `clr <session_id>` at the shell prompt (no Enter — user hits
     # Enter when ready).
@@ -1567,10 +1551,10 @@ cmd_hibernate_resume() {
   local hibernated_file=""
   local mode="" forced=""
   if [ -n "$pane_uuid" ]; then
-    hibernated_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$pane_uuid.json"
+    hibernated_file="$(hibernated_marker_path "$pane_uuid")"
     if [ -f "$hibernated_file" ]; then
-      mode="$(jq -r '.mode // empty' "$hibernated_file" 2>/dev/null)"
-      forced="$(jq -r '.forced // false' "$hibernated_file" 2>/dev/null)"
+      mode="$(hibernated_marker_field "$pane_uuid" mode)"
+      forced="$(hibernated_marker_field "$pane_uuid" forced false)"
     fi
   fi
 
@@ -1625,9 +1609,9 @@ cmd_hibernate_state() {
   local puuid marker mode
   puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
   [ -n "$puuid" ] || { echo none; return 0; }
-  marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json"
+  marker="$(hibernated_marker_path "$puuid")"
   [ -f "$marker" ] || { echo none; return 0; }
-  mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
+  mode="$(hibernated_marker_field "$puuid" mode)"
   case "$mode" in
     soft) echo soft ;;
     hard) echo hard ;;
@@ -1676,9 +1660,9 @@ cmd_restore_now() {
   local puuid marker mode
   puuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
   [ -n "$puuid" ] || return 0
-  marker="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json"
+  marker="$(hibernated_marker_path "$puuid")"
   [ -f "$marker" ] || return 0
-  mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
+  mode="$(hibernated_marker_field "$puuid" mode)"
   case "$mode" in
     soft)
       cmd_hibernate_resume "$pane_id"
@@ -1688,7 +1672,7 @@ cmd_restore_now() {
       sid="$(jq -r '.session_id // empty' \
               "$CLAUDE_RESCUE_DATA_HOME/captures/$puuid.json" 2>/dev/null || true)"
       [ -n "$sid" ] || sid="$(read_active_session "$puuid" 2>/dev/null || true)"
-      [ -n "$sid" ] && send_keys_logged "restore-now-clr" "$pane_id" C-u "clr $sid" Enter
+      [ -n "$sid" ] && send_shell_enter_burst "restore-now-clr" "$pane_id" "clr $sid"
       ;;
   esac
 }
@@ -1741,7 +1725,7 @@ cmd_arm_sweep() {
     if [ "$cur_cmd" != "claude" ] \
        && ! pgrep -P "$pane_pid" -x claude >/dev/null 2>&1 \
        && ! is_busy "$puuid" \
-       && [ ! -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$puuid.json" ]; then
+       && [ ! -f "$(hibernated_marker_path "$puuid")" ]; then
       san="${pane_id//[^A-Za-z0-9]/_}"
       rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
       clear_active_session "$puuid"

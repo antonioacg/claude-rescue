@@ -54,15 +54,7 @@ __rescue_log() {
     __pane_cur_cmd="$(tmux display-message -p -t "$TMUX_PANE" -F '#{pane_current_command}' 2>/dev/null || echo '<unknown>')"
     __pane_pid="$(tmux display-message -p -t "$TMUX_PANE" -F '#{pane_pid}' 2>/dev/null || echo '')"
     if [ -n "$__pane_pid" ]; then
-      __q=("$__pane_pid")
-      while [ "${#__q[@]}" -gt 0 ]; do
-        __cur="${__q[0]}"; __q=("${__q[@]:1}")
-        for __ch in $(pgrep -P "$__cur" 2>/dev/null); do
-          __q+=("$__ch")
-          __cmd="$(ps -o comm= -p "$__ch" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
-          [ "$__cmd" = "claude" ] && __claudes=$((__claudes + 1))
-        done
-      done
+      __claudes="$(subtree_pids "$__pane_pid" claude | wc -l | tr -d ' ')"
     fi
   fi
   printf '[%s] invoked pid=%s ppid=%s pane=%s pane_cur_cmd=%s claudes_in_subtree=%s argc=%s argv=' \

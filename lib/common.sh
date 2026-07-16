@@ -124,6 +124,56 @@ log_debug() {
     >> "$dir/$ns-$day.log" 2>/dev/null || true
 }
 
+# Membership test for "is this pane_current_command an interactive shell we
+# can safely type at?" — the single authority for the shell list. Gates any
+# keystroke injection that would EXECUTE (Enter-terminated): typing at a shell
+# prompt is recoverable, typing into claude (or anything else) submits input
+# to it.
+is_shell_cmd() {
+  case "${1:-}" in
+    zsh|bash|sh|dash|ksh|fish) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# All pids under a process tree whose comm (basename, exact) matches $2.
+# BFS via pgrep -P from $1; echoes matching pids one per line, BFS order.
+# The single implementation of the pane-subtree walk (previously restated in
+# send_keys_logged, cmd_hibernate_arm, and the resume wrapper's tracer).
+subtree_pids() {
+  local root="${1:-}" want="${2:-claude}"
+  [ -n "$root" ] || return 0
+  local queue=("$root") cur child cmd
+  while [ ${#queue[@]} -gt 0 ]; do
+    cur="${queue[0]}"; queue=("${queue[@]:1}")
+    for child in $(pgrep -P "$cur" 2>/dev/null); do
+      queue+=("$child")
+      cmd="$(ps -o comm= -p "$child" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
+      if [ "$cmd" = "$want" ]; then echo "$child"; fi
+    done
+  done
+  return 0
+}
+
+# --- Hibernation marker access ----------------------------------------------
+# $CACHE/hibernated/<pane_uuid>.json is the single source of truth for a
+# pane's hibernation state ({mode, forced?, hard_source?, hard_ts?, pids[]}).
+# These are the sanctioned way to locate and read it — the path template and
+# the jq defaulting used to be restated at every call site.
+hibernated_marker_path() {
+  printf '%s/hibernated/%s.json' "$CLAUDE_RESCUE_CACHE_HOME" "${1:-}"
+}
+
+# Args: $1 pane_uuid, $2 field name (e.g. mode, forced), $3 default (optional,
+# ""). Missing file, missing field, or jq failure all yield the default.
+hibernated_marker_field() {
+  local f
+  f="$(hibernated_marker_path "${1:-}")"
+  if [ ! -f "$f" ]; then printf '%s' "${3:-}"; return 0; fi
+  jq -r --arg d "${3:-}" ".${2:?field required} // \$d" "$f" 2>/dev/null \
+    || printf '%s' "${3:-}"
+}
+
 # Logged wrapper around `tmux send-keys` for every internal injection we
 # do. Behavior is unchanged from a bare send-keys (still best-effort, never
 # blocks); the wrapper exists so we can post-incident reconstruct who typed
@@ -152,18 +202,9 @@ send_keys_logged() {
   cur_cmd="$(tmux display-message -p -t "$pane" -F '#{pane_current_command}' 2>/dev/null || echo '<unknown>')"
   pane_pid="$(tmux display-message -p -t "$pane" -F '#{pane_pid}' 2>/dev/null || echo '')"
   if [ -n "$pane_pid" ]; then
-    # Walk the process subtree under the pane's shell. If `claude` is alive
-    # in there, our send-keys will land in claude's input — that is the
-    # leak signature we want surfaced.
-    local queue=("$pane_pid") cur child cmd
-    while [ ${#queue[@]} -gt 0 ]; do
-      cur="${queue[0]}"; queue=("${queue[@]:1}")
-      for child in $(pgrep -P "$cur" 2>/dev/null); do
-        queue+=("$child")
-        cmd="$(ps -o comm= -p "$child" 2>/dev/null | sed 's|.*/||' | tr -d ' ')"
-        [ "$cmd" = "claude" ] && claudes_in_subtree=$((claudes_in_subtree + 1))
-      done
-    done
+    # If `claude` is alive under the pane's shell, our send-keys will land in
+    # claude's input — that is the leak signature we want surfaced.
+    claudes_in_subtree="$(subtree_pids "$pane_pid" claude | wc -l | tr -d ' ')"
   fi
   local arg
   for arg in "$@"; do keys_q+=" $(printf '%q' "$arg")"; done
@@ -171,6 +212,18 @@ send_keys_logged() {
     "$(now_iso)" "$reason" "$pane" "$cur_cmd" "$claudes_in_subtree" "${keys_q# }" \
     >> "$CLAUDE_RESCUE_DATA_HOME/send-keys.log" 2>/dev/null || true
   tmux send-keys -t "$pane" "$@" 2>/dev/null || true
+}
+
+# Send an Enter-TERMINATED command line to a pane under the 2026-06-05 RCA
+# discipline (docs/operations/rca-2026-06-05-restore-keystroke-race.md): the
+# leading C-u travels in the SAME atomic send-keys call as the Enter, so no
+# concurrent injection can leave text in front of the command — the only thing
+# this Enter can ever execute is exactly $3. This helper is the seam that
+# enforces the invariant; never send `<text> Enter` at a shell prompt through
+# raw send_keys_logged. Callers gate on is_shell_cmd first.
+# Args: $1 reason, $2 pane_id, $3 command line to execute.
+send_shell_enter_burst() {
+  send_keys_logged "$1" "$2" C-u "$3" Enter
 }
 
 # Authority check for an in-flight hibernate-arm subshell.
