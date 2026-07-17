@@ -260,12 +260,26 @@ cmd_session_end() {
   rebuild_meta "$window_uuid"
 }
 
+# Title debounce/dedup cache paths — keyed by the SANITIZED pane id (title
+# events arrive with only the live pane_id in hand; no uuid is guaranteed
+# yet). pane_ids RECYCLE across server generations, so this state is
+# epoch-guarded: swept wholesale by cmd_resurrect_restore (new server = new
+# epoch) and per-pane by cmd_pane_died. Without the sweep, a recycled %N
+# inherits the dead pane's title-last dedup memory and its first title event
+# gets silently dropped (same bug family as the watcher's ef7f744).
+title_cand_path() {
+  printf '%s/tmp/title-%s.json' "$CLAUDE_RESCUE_CACHE_HOME" "${1//[^A-Za-z0-9]/_}"
+}
+title_last_path() {
+  printf '%s/tmp/title-last-%s.txt' "$CLAUDE_RESCUE_CACHE_HOME" "${1//[^A-Za-z0-9]/_}"
+}
+
 cmd_title() {
   local pane_id="$1" title="$2"
   [ -z "$pane_id" ] && return 0
   [ -z "$title" ] && return 0
 
-  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
+  local cand; cand="$(title_cand_path "$pane_id")"
   jq -nc --arg t "$title" --arg ts "$(now_iso)" '{title:$t, ts:$ts}' > "$cand"
 
   # Schedule a debounced commit. Multiple sleeps may stack; only the one whose
@@ -277,8 +291,9 @@ cmd_title() {
 
 cmd_title_commit() {
   local pane_id="$1"
-  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
-  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  local cand last
+  cand="$(title_cand_path "$pane_id")"
+  last="$(title_last_path "$pane_id")"
   [ -f "$cand" ] || return 0
 
   local title cand_ts now elapsed
@@ -320,7 +335,7 @@ cmd_title_now() {
   [ -z "$pane_id" ] && return 0
   [ -z "$title" ] && return 0
 
-  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  local last; last="$(title_last_path "$pane_id")"
   if [ -f "$last" ] && [ "$(cat "$last" 2>/dev/null)" = "$title" ]; then
     return 0
   fi
@@ -395,6 +410,10 @@ cmd_pane_died() {
     clear_active_session "$pane_uuid"
   fi
   rm -f "$(arm_pid_path "$pane_id")"
+  # Title cache is pane_id-keyed; reap it with the pane so a future pane
+  # recycling this id doesn't inherit the dedup memory (and orphans don't
+  # accumulate — flush_pending_title above already committed any candidate).
+  rm -f "$(title_cand_path "$pane_id")" "$(title_last_path "$pane_id")"
 
   rebuild_meta "$window_uuid"
 }
@@ -463,8 +482,9 @@ latest_open_session_in_pane() {
 
 flush_pending_title() {
   local pane_id="$1" window_uuid="$2"
-  local cand="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-${pane_id//[^A-Za-z0-9]/_}.json"
-  local last="$CLAUDE_RESCUE_CACHE_HOME/tmp/title-last-${pane_id//[^A-Za-z0-9]/_}.txt"
+  local cand last
+  cand="$(title_cand_path "$pane_id")"
+  last="$(title_last_path "$pane_id")"
   [ -f "$cand" ] || return 0
   local title
   title="$(jq -r '.title' "$cand")"
@@ -840,6 +860,11 @@ cmd_resurrect_restore() {
   done
   # Stale arm pid files refer to processes from the dead server.
   rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid
+  # Title debounce/dedup cache is pane_id-keyed and pane_ids recycle across
+  # server generations: a surviving title-last would silently dedup away the
+  # first title of an unrelated new pane that reuses the id. New epoch —
+  # drop it all (worst case: one duplicate title event per pane).
+  rm -f "$CLAUDE_RESCUE_CACHE_HOME"/tmp/title-*
 
   # Preserve active/<pane_uuid> files across kill-server: they carry the
   # truthful "which session is loaded" set by SessionStart hooks (including

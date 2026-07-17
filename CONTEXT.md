@@ -13,6 +13,12 @@ or a file, add it here.
 - **Active session file** — `$DATA/active/<pane_uuid>`: which claude
   session id the pane currently holds open. Written by every SessionStart
   (including in-claude `/resume`); the resume wrapper's priority-1 lookup.
+- **Epoch** — one tmux server generation. Pane ids (`%N`) RECYCLE across
+  epochs; pane UUIDs don't. Any state keyed by pane id must be
+  epoch-guarded: swept on resurrect-restore (arm.pids, title cache),
+  scoped by server PID (post-restore claims, watcher state), or re-verified
+  live before acting (`arm_still_authoritative`). State that must survive
+  epochs is keyed by pane UUID instead (markers, captures, active files).
 
 ## Hibernation
 

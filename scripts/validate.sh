@@ -354,12 +354,16 @@ rm -f "$HOME_DIR/cache/hibernated/$S11_PUUID.json"
 # isolation is structural — each server's resurrect-dir holds its own
 # snapshots, so the prev-lookup never crosses servers.
 #
-# Test that:
-#  (a) first save in a fresh resurrect-dir emits no title event (no prev)
-#  (b) second save with a changed title emits exactly one title event
-#  (c) third save with an unchanged title emits zero new title events
-#  (d) a snapshot in a sibling resurrect-dir does NOT influence the diff
-echo "[scenario 12] resurrect-save snapshot-diff"
+# The snapshot-diff title/pane-died inference was RETIRED in 4e99ce9: the
+# 1Hz watcher (cmd_title_now / cmd_pane_died) owns those events now, and
+# cmd_resurrect_save deliberately emits nothing (a diff here would duplicate
+# the watcher events). This scenario pins the retirement — a regression
+# that re-adds emission would double every title event.
+#
+# Test that saves — first, changed-title, unchanged-title, and with a
+# sibling resurrect-dir present — emit ZERO title events, while the sidecar
+# (resurrect-save remaining job) is still written.
+echo "[scenario 12] resurrect-save emits no title events (diff retired; sidecar still written)"
 
 # Set up a fresh pane with @claude-* options; previous scenarios may have
 # killed off $PA's window. The diff resolves uuids via the sidecar, which
@@ -404,10 +408,10 @@ tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE
 sleep 1
 S12_AFTER2=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 S12_DELTA2=$((S12_AFTER2 - S12_AFTER1))
-assert "scenario 12b: changed title emits exactly one event" "1" "$S12_DELTA2"
-# Verify the emitted title is the new one.
-S12_LAST_TITLE=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | tail -1 | jq -r '.title')
-assert "scenario 12b: emitted title is the new value" "beta" "$S12_LAST_TITLE"
+assert "scenario 12b: changed title emits NO event (diff retired; watcher owns titles)" "0" "$S12_DELTA2"
+# The sidecar is resurrect-save remaining job — assert it landed.
+assert "scenario 12b: sidecar written alongside the save" "1" \
+  "$([ -f "${S12_T2%.txt}.claude-userops.tsv" ] && echo 1 || echo 0)"
 
 # (c) Third save with unchanged title — no new event.
 sleep 1
@@ -417,7 +421,7 @@ tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE
 sleep 1
 S12_AFTER3=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 S12_DELTA3=$((S12_AFTER3 - S12_AFTER2))
-assert "scenario 12c: unchanged title emits no new event" "0" "$S12_DELTA3"
+assert "scenario 12c: further saves emit no title events" "0" "$S12_DELTA3"
 
 # (d) A sibling resurrect-dir's snapshot does not become the prev for this dir.
 S12_OTHER="$HOME_DIR/resurrect-scenario12-other"
@@ -433,7 +437,7 @@ tmux -L "$SOCK" run-shell "CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE
 sleep 1
 S12_AFTER4=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 S12_DELTA4=$((S12_AFTER4 - S12_AFTER3))
-assert "scenario 12d: sibling resurrect-dir snapshots don't pollute prev-lookup" "0" "$S12_DELTA4"
+assert "scenario 12d: sibling resurrect-dir present — still no title events" "0" "$S12_DELTA4"
 
 # ---------------------------------------------------------------------------
 # Snapshot-race lock: continuum's status-bar-interval save can fire DURING
