@@ -708,7 +708,6 @@ print_capture() {
   # Survives reboots, SIGCONT, and pane death; overwritten only by a subsequent
   # hibernation of the same pane.
   local arg="${1:-}"
-  local captures_dir="$CLAUDE_RESCUE_DATA_HOME/captures"
   local pane_uuid="" txt="" meta=""
 
   if [ -z "$arg" ]; then
@@ -734,7 +733,7 @@ print_capture() {
       return 1
     fi
   else
-    if [ -f "$captures_dir/$arg.txt" ]; then
+    if [ -f "$(capture_txt_path "$arg")" ]; then
       pane_uuid="$arg"
     else
       shopt -s nullglob
@@ -759,8 +758,8 @@ print_capture() {
     fi
   fi
 
-  txt="$captures_dir/$pane_uuid.txt"
-  meta="$captures_dir/$pane_uuid.json"
+  txt="$(capture_txt_path "$pane_uuid")"
+  meta="$(capture_meta_path "$pane_uuid")"
   if [ ! -f "$txt" ]; then
     echo "claude-rescue print: no capture on disk for pane_uuid $pane_uuid" >&2
     echo "  (this pane has no hibernation snapshot yet)" >&2

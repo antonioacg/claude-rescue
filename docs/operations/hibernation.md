@@ -45,7 +45,7 @@ focus-out
 focus-in              wait CLAUDE_RESCUE_HARD_DELAY total
    │                            │
    ▼                            ▼
-hibernate-resume:         send-keys "fg" Enter → "/exit" Enter
+hibernate-resume:      send-keys C-u "fg" Enter → C-u "/exit" Enter
   read marker                   │
   mode=soft → fg<CR>            ▼
                 delete    (fallback) SIGTERM → SIGKILL

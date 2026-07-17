@@ -174,6 +174,30 @@ hibernated_marker_field() {
     || printf '%s' "${3:-}"
 }
 
+# --- Capture access -----------------------------------------------------------
+# The hibernation-time pane snapshot: $DATA/captures/<pane_uuid>.txt (ANSI
+# scrollback) + .json (meta: session_id, cwd — LAST-ACTIVE, not launch —
+# pids, ts). Same access rule as the hibernation marker: locate and read
+# through these, not restated path templates.
+capture_txt_path() {
+  printf '%s/captures/%s.txt' "$CLAUDE_RESCUE_DATA_HOME" "${1:-}"
+}
+
+capture_meta_path() {
+  printf '%s/captures/%s.json' "$CLAUDE_RESCUE_DATA_HOME" "${1:-}"
+}
+
+# Args: $1 pane_uuid, $2 field name (e.g. session_id, cwd), $3 default
+# (optional, ""). Missing file, missing field, or jq failure all yield the
+# default.
+capture_meta_field() {
+  local f
+  f="$(capture_meta_path "${1:-}")"
+  if [ ! -f "$f" ]; then printf '%s' "${3:-}"; return 0; fi
+  jq -r --arg d "${3:-}" ".${2:?field required} // \$d" "$f" 2>/dev/null \
+    || printf '%s' "${3:-}"
+}
+
 # Logged wrapper around `tmux send-keys` for every internal injection we
 # do. Behavior is unchanged from a bare send-keys (still best-effort, never
 # blocks); the wrapper exists so we can post-incident reconstruct who typed
@@ -214,15 +238,20 @@ send_keys_logged() {
   tmux send-keys -t "$pane" "$@" 2>/dev/null || true
 }
 
-# Send an Enter-TERMINATED command line to a pane under the 2026-06-05 RCA
-# discipline (docs/operations/rca-2026-06-05-restore-keystroke-race.md): the
-# leading C-u travels in the SAME atomic send-keys call as the Enter, so no
-# concurrent injection can leave text in front of the command — the only thing
-# this Enter can ever execute is exactly $3. This helper is the seam that
-# enforces the invariant; never send `<text> Enter` at a shell prompt through
-# raw send_keys_logged. Callers gate on is_shell_cmd first.
-# Args: $1 reason, $2 pane_id, $3 command line to execute.
-send_shell_enter_burst() {
+# Send an Enter-TERMINATED line to a pane under the 2026-06-05 RCA discipline
+# (docs/operations/rca-2026-06-05-restore-keystroke-race.md): the leading C-u
+# travels in the SAME atomic send-keys call as the Enter, so no concurrent
+# injection can leave text in front of the line — the only thing this Enter
+# can ever submit is exactly $3. Applies to BOTH targets we inject into:
+#   - a shell prompt (gate on is_shell_cmd first): C-u wipes stray readline
+#     input, Enter executes only the intended command;
+#   - claude's input box (fg-resume, /exit): C-u clears any draft the user
+#     left, so the slash command / message lands clean instead of appended
+#     to leftover text.
+# This helper is the seam that enforces the invariant; never send
+# `<text> Enter` through raw send_keys_logged.
+# Args: $1 reason, $2 pane_id, $3 line to submit.
+send_enter_burst() {
   send_keys_logged "$1" "$2" C-u "$3" Enter
 }
 

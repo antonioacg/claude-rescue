@@ -236,9 +236,7 @@ fi
 # $DATA/captures/<pane_uuid>.json. If absent (pane was never hibernated,
 # or capture isn't current), fall back to find-sessions's reported cwd.
 session_cwd=""
-if [ -n "$pane_uuid" ] && [ -f "$__rescue_log_dir/captures/$pane_uuid.json" ]; then
-  session_cwd="$(jq -r '.cwd // empty' "$__rescue_log_dir/captures/$pane_uuid.json" 2>/dev/null || true)"
-fi
+[ -n "$pane_uuid" ] && session_cwd="$(capture_meta_field "$pane_uuid" cwd)"
 [ -z "$session_cwd" ] && session_cwd="${found_cwd:-}"
 cwd_match="unknown"
 if [ -n "$session_cwd" ]; then

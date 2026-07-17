@@ -43,7 +43,9 @@ or a file, add it here.
 
 - **Capture** — the pane-scrollback snapshot taken at hibernation time:
   `$DATA/captures/<pane_uuid>.txt` (ANSI content) + `.json` (meta:
-  session_id, cwd — *last-active*, not launch — pids, ts).
+  session_id, cwd — *last-active*, not launch — pids, ts). Access via
+  `capture_txt_path` / `capture_meta_path` / `capture_meta_field`
+  (lib/common.sh), same rule as the hibernation marker.
 - **Paint / the peek** — replaying the capture into a pane at the shell
   (`claude-rescue print`) so the user can see what the session was without
   resuming it. Needed because claude runs on the terminal's alternate
@@ -59,9 +61,12 @@ or a file, add it here.
 - **Enter discipline** — the invariant from the 2026-06-05 RCA
   (docs/operations/rca-2026-06-05-restore-keystroke-race.md): any
   Enter-terminated injection carries its own leading C-u in the SAME atomic
-  `send-keys` call, so the Enter can only ever execute exactly the intended
-  command. Enforced by `send_shell_enter_burst` (lib/common.sh) — never send
-  `<text> Enter` at a shell prompt through raw `send_keys_logged`.
+  `send-keys` call, so the Enter can only ever submit exactly the intended
+  line. Applies to both targets we inject into — a shell prompt (C-u wipes
+  stray readline input) and claude's input box (C-u clears a leftover draft
+  so `/exit` or `fg` lands clean). Enforced by `send_enter_burst`
+  (lib/common.sh) — never send `<text> Enter` through raw
+  `send_keys_logged`.
 - **Shell gate** — only inject executing keystrokes when the pane's
   foreground is an interactive shell. Single authority: `is_shell_cmd`
   (lib/common.sh).
