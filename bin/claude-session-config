@@ -105,11 +105,10 @@ toggle_or_edit() {
       # sanitized pane id, same as cmd_hibernate_arm), and only kill a pid that
       # is still an arm subshell — never a broad match — to survive pid reuse.
       if [ "$next" = "true" ]; then
-        local op san apf apid
+        local op apf apid
         op="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
         if [ -n "$op" ]; then
-          san="${op//[^A-Za-z0-9]/_}"
-          apf="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+          apf="$(arm_pid_path "$op")"
           apid="$(cat "$apf" 2>/dev/null || true)"
           if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null \
              && ps -o args= -p "$apid" 2>/dev/null | grep -qE "claude-rescue-log (hibernate-arm|arm-sweep)"; then

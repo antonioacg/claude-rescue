@@ -230,8 +230,7 @@ cmd_session_end() {
   # lookups for prior history also need the durable pane identity.
   local pane_uuid
   pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
-  local san="${pane_id//[^A-Za-z0-9]/_}"
-  rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  rm -f "$(arm_pid_path "$pane_id")"
   local hibernated_file; hibernated_file="$(hibernated_marker_path "$pane_uuid")"
   if [ -f "$hibernated_file" ]; then
     log_err "session_end: preserving active/$pane_uuid (hibernation marker present, sid resume path)"
@@ -395,8 +394,7 @@ cmd_pane_died() {
     rm -f "$(hibernated_marker_path "$pane_uuid")"
     clear_active_session "$pane_uuid"
   fi
-  local san="${pane_id//[^A-Za-z0-9]/_}"
-  rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  rm -f "$(arm_pid_path "$pane_id")"
 
   rebuild_meta "$window_uuid"
 }
@@ -1210,8 +1208,7 @@ cmd_hibernate_arm() {
   local DEFER_SECONDS="${CLAUDE_RESCUE_HIBERNATE_DEFER_SECONDS:-60}"
   local TARGET_COMM="${CLAUDE_RESCUE_TARGET_COMM:-claude}"
 
-  local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  local arm_pid_file; arm_pid_file="$(arm_pid_path "$pane_id")"
   local hibernated_file; hibernated_file="$(hibernated_marker_path "$_puuid")"
 
   # If a timer is already running for this pane, leave it. "Running" means:
@@ -1530,8 +1527,7 @@ cmd_hibernate_resume() {
   local pane_uuid
   pane_uuid="$(tmux_get_pane_uuid "$pane_id" 2>/dev/null || true)"
 
-  local san="${pane_id//[^A-Za-z0-9]/_}"
-  local arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+  local arm_pid_file; arm_pid_file="$(arm_pid_path "$pane_id")"
 
   # Read the hibernation mode (if any) BEFORE deciding whether to kill the arm
   # subshell. The arm subshell's role changes by phase:
@@ -1691,7 +1687,7 @@ cmd_restore_now() {
 # we know the client is engaging with the server, we arm all eligible
 # backgrounded panes idempotently (per-pane arm.pid check skips already-armed).
 cmd_arm_sweep() {
-  local pane_id win_act pane_act puuid pane_pid cur_cmd san arm_pid_file
+  local pane_id win_act pane_act puuid pane_pid cur_cmd arm_pid_file
   while IFS=$'\t' read -r pane_id win_act pane_act puuid pane_pid cur_cmd; do
     [ -n "$pane_id" ] || continue
     # Fast guard: pane never ran claude → no work.
@@ -1730,8 +1726,7 @@ cmd_arm_sweep() {
        && ! pgrep -P "$pane_pid" -x claude >/dev/null 2>&1 \
        && ! is_busy "$puuid" \
        && [ ! -f "$(hibernated_marker_path "$puuid")" ]; then
-      san="${pane_id//[^A-Za-z0-9]/_}"
-      rm -f "$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+      rm -f "$(arm_pid_path "$pane_id")"
       clear_active_session "$puuid"
       tmux_unset_pane_uuid "$pane_id"
       continue
@@ -1739,8 +1734,7 @@ cmd_arm_sweep() {
 
     # Currently focused (active pane in an active window): leave it alone.
     [ "$win_act$pane_act" = "11" ] && continue
-    san="${pane_id//[^A-Za-z0-9]/_}"
-    arm_pid_file="$CLAUDE_RESCUE_CACHE_HOME/hibernated/$san.arm.pid"
+    arm_pid_file="$(arm_pid_path "$pane_id")"
     # Already armed (file present AND the recorded pid is alive AND is a real
     # hibernate-arm subshell): don't reset the timer.
     if [ -f "$arm_pid_file" ]; then

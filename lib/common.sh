@@ -164,6 +164,15 @@ hibernated_marker_path() {
   printf '%s/hibernated/%s.json' "$CLAUDE_RESCUE_CACHE_HOME" "${1:-}"
 }
 
+# Path of the arm-timer pid file for a pane. Keyed by the SANITIZED tmux
+# pane id, not pane_uuid — the arm timer must be addressable for panes that
+# have a claude identity but whose marker files are uuid-keyed, and the two
+# lifecycles differ. The sanitize pattern lives only here.
+# Args: $1 = raw tmux pane id (e.g. %43).
+arm_pid_path() {
+  printf '%s/hibernated/%s.arm.pid' "$CLAUDE_RESCUE_CACHE_HOME" "${1//[^A-Za-z0-9]/_}"
+}
+
 # Args: $1 pane_uuid, $2 field name (e.g. mode, forced), $3 default (optional,
 # ""). Missing file, missing field, or jq failure all yield the default.
 hibernated_marker_field() {

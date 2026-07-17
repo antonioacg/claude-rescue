@@ -382,7 +382,16 @@ action_resume_here() {
     echo "no originating pane to send to" >&2
     return 1
   fi
-  send_keys_logged "picker-resume-here" "$target" " $(resume_command "$sid" "$cwd")" Enter
+  # Shell gate: the target is whatever pane the picker was opened from. If
+  # its foreground isn't a shell (say, a claude already running there), the
+  # resume command would be submitted INTO that program as input.
+  local cur_cmd
+  cur_cmd="$(tmux display-message -p -t "$target" -F '#{pane_current_command}' 2>/dev/null || echo '')"
+  if ! is_shell_cmd "$cur_cmd"; then
+    tmux display-message "claude-rescue: pane $target is running '$cur_cmd' — not typing a resume into it (use resume-in-new-window)" 2>/dev/null || true
+    return 1
+  fi
+  send_enter_burst "picker-resume-here" "$target" " $(resume_command "$sid" "$cwd")"
 }
 
 action_resume_new_window() {
@@ -393,7 +402,7 @@ action_resume_new_window() {
   # prompt afterwards.
   local pane
   pane="$(tmux new-window -c "$cwd" -P -F '#{pane_id}')"
-  send_keys_logged "picker-resume-new-window" "$pane" " $(resume_command "$sid" "$cwd")" Enter
+  send_enter_burst "picker-resume-new-window" "$pane" " $(resume_command "$sid" "$cwd")"
 }
 
 action_resume_new_session() {
@@ -402,7 +411,7 @@ action_resume_new_session() {
   sname="claude-$(printf '%s' "$sid" | cut -c1-8)"
   tmux new-session -d -s "$sname" -c "$cwd"
   pane="$(tmux display-message -p -t "$sname" '#{pane_id}')"
-  send_keys_logged "picker-resume-new-session" "$pane" " $(resume_command "$sid" "$cwd")" Enter
+  send_enter_burst "picker-resume-new-session" "$pane" " $(resume_command "$sid" "$cwd")"
   tmux switch-client -t "$sname" 2>/dev/null || true
 }
 
