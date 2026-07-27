@@ -216,7 +216,8 @@ assert "scenario 1: capture .txt written" "1" "$([ -f "$DATA_DIR/captures/$P0_UU
 assert "scenario 1: capture .json sidecar written" "1" "$([ -f "$DATA_DIR/captures/$P0_UUID.json" ] && echo 1 || echo 0)"
 CAP_CWD="$(jq -r '.cwd // empty' "$DATA_DIR/captures/$P0_UUID.json" 2>/dev/null)"
 assert "scenario 1: capture cwd matches pane cwd" "$STAGING_DIR" "$CAP_CWD"
-assert_nonempty "scenario 1: capture session_id non-empty" "$(jq -r '.session_id // empty' "$DATA_DIR/captures/$P0_UUID.json" 2>/dev/null)"
+CAP_SID="$(jq -r '.session_id // empty' "$DATA_DIR/captures/$P0_UUID.json" 2>/dev/null)"
+assert_nonempty "scenario 1: capture session_id non-empty" "$CAP_SID"
 
 # Foreground process is the shell (claude Ctrl+Z'd to background).
 assert "scenario 1: pane_current_command is zsh (claude no longer foreground)" "zsh" "$(fg_cmd $P0)"
@@ -268,6 +269,8 @@ assert "scenario 3: 'clr <sid>' pre-filled at shell prompt" "1" "$HAS_CLR"
 # pre-claude shell content (no peek at what the session was).
 assert "scenario 3: capture auto-painted at the shell (peek without resuming)" "1" \
   "$(tmux -L "$SOCK" capture-pane -p -t $P0 -S - | grep -q '# claude-rescue capture' && echo 1 || echo 0)"
+assert "scenario 3: capture header prints Claude session id" "1" \
+  "$(tmux -L "$SOCK" capture-pane -p -t $P0 -S - | grep -Fq "#   claude session id: $CAP_SID" && echo 1 || echo 0)"
 
 # ---------------------------------------------------------------------------
 echo "[3b] hard marker survives focus-in (hibernate-resume is a no-op for hard mode)"

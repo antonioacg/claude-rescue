@@ -785,7 +785,7 @@ print_capture() {
       echo "# claude-rescue capture"
       echo "#   pane_uuid : $pane_uuid"
       [ -n "$m_ts" ]  && echo "#   captured  : $m_ts"
-      [ -n "$m_sid" ] && echo "#   session   : $m_sid"
+      [ -n "$m_sid" ] && echo "#   claude session id: $m_sid"
       [ -n "$m_cwd" ] && echo "#   cwd       : $m_cwd"
       [ -n "$m_pids" ] && echo "#   stopped pids: $m_pids"
       echo "# ---"
