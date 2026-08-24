@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive import spool_archive_checkpoint
-from .capture import spool_capture
+from .capture import spool_capture, spool_capture_release
 from .core import Event, OwnerUnavailable, Publisher, StateClient, StateOwner, StatePaths
 
 
@@ -193,11 +193,19 @@ def _capture_ingest(args: argparse.Namespace, paths: StatePaths) -> int:
 
 
 def _capture_release(args: argparse.Namespace, paths: StatePaths) -> int:
-    _print(
-        StateClient(paths, timeout=args.timeout).capture_release(
+    try:
+        response = StateClient(paths, timeout=args.timeout).capture_release(
             server=args.server, epoch=args.epoch, pane_spec=args.pane_spec
         )
-    )
+    except (OwnerUnavailable, RuntimeError):
+        spooled = spool_capture_release(
+            paths.capture_spool,
+            server=args.server,
+            epoch=args.epoch,
+            pane_spec=args.pane_spec,
+        )
+        response = {"ok": True, "status": "spooled", "path": str(spooled)}
+    _print(response)
     return 0
 
 
@@ -252,7 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     archive_import = commands.add_parser(
         "archive-import", help="index the existing archive without changing files"
     )
-    archive_import.add_argument("--timeout", type=float, default=120.0)
+    archive_import.add_argument("--timeout", type=float, default=600.0)
 
     archive_maintain = commands.add_parser(
         "archive-maintain", help="run one bounded indexed-retention batch"

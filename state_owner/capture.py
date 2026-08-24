@@ -10,7 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .storage import atomic_copy, atomic_write, link_or_copy, open_database, sha256_file
+from .storage import (
+    atomic_copy,
+    atomic_write,
+    fsync_directory,
+    link_or_copy,
+    open_database,
+    sha256_file,
+)
 
 
 @dataclass(frozen=True)
@@ -127,6 +134,23 @@ class CaptureIndex:
         if pane_uuid == "-":
             pane_uuid = None
         observed_at = _now() if observed_at is None else observed_at
+
+        with self._lock:
+            latest = self._connection.execute(
+                """
+                SELECT epoch, observed_at FROM capture_current
+                WHERE server = ?
+                ORDER BY observed_at DESC LIMIT 1
+                """,
+                (server,),
+            ).fetchone()
+        if (
+            latest is not None
+            and latest["epoch"] != epoch
+            and observed_at < latest["observed_at"]
+        ):
+            return {"status": "stale", "capture_hash": None}
+
         capture_hash = sha256_file(source)
 
         with self._lock, self._connection:
@@ -206,21 +230,35 @@ class CaptureIndex:
         result = {"committed": 0, "invalid": 0}
         if not spool_dir.is_dir():
             return result
-        entries = [entry for entry in sorted(spool_dir.iterdir()) if entry.is_dir()]
+        entries = [
+            entry
+            for entry in spool_dir.iterdir()
+            if entry.is_dir() and not entry.name.endswith(".invalid")
+        ]
+        entries.sort(key=_capture_spool_order)
         for entry in entries[:limit]:
             manifest_path = entry / "manifest.json"
-            capture_path = entry / "capture.txt"
             try:
                 manifest = json.loads(manifest_path.read_text())
-                self.ingest(
-                    capture_path,
-                    server=manifest["server"],
-                    epoch=manifest["epoch"],
-                    pane_spec=manifest["pane_spec"],
-                    pane_uuid=manifest.get("pane_uuid"),
-                    reason=manifest["reason"],
-                    observed_at=manifest["observed_at"],
-                )
+                operation = manifest.get("operation", "ingest")
+                if operation == "ingest":
+                    self.ingest(
+                        entry / "capture.txt",
+                        server=manifest["server"],
+                        epoch=manifest["epoch"],
+                        pane_spec=manifest["pane_spec"],
+                        pane_uuid=manifest.get("pane_uuid"),
+                        reason=manifest["reason"],
+                        observed_at=manifest["observed_at"],
+                    )
+                elif operation == "release":
+                    self.release_current(
+                        server=manifest["server"],
+                        epoch=manifest["epoch"],
+                        pane_spec=manifest["pane_spec"],
+                    )
+                else:
+                    raise ValueError(f"unknown Capture spool operation: {operation}")
             except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
                 invalid = entry.with_name(f"{entry.name}.invalid")
                 if invalid.exists():
@@ -380,6 +418,7 @@ def spool_capture(
     try:
         link_or_copy(source, temporary / "capture.txt")
         manifest = {
+            "operation": "ingest",
             "server": server,
             "epoch": epoch,
             "pane_spec": pane_spec,
@@ -389,10 +428,58 @@ def spool_capture(
         }
         atomic_write(temporary / "manifest.json", json.dumps(manifest, sort_keys=True).encode())
         os.replace(temporary, destination)
+        fsync_directory(spool_dir)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
     return destination
+
+
+def spool_capture_release(
+    spool_dir: Path,
+    *,
+    server: str,
+    epoch: str,
+    pane_spec: str,
+    observed_at: int | None = None,
+) -> Path:
+    if not server or not epoch or not pane_spec:
+        raise ValueError("server, epoch, and pane_spec are required")
+    observed_at = _now() if observed_at is None else observed_at
+    spool_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(spool_dir, 0o700)
+    identity = uuid.uuid4().hex
+    destination = spool_dir / identity
+    temporary = spool_dir / f".{identity}.tmp"
+    temporary.mkdir()
+    try:
+        manifest = {
+            "operation": "release",
+            "server": server,
+            "epoch": epoch,
+            "pane_spec": pane_spec,
+            "observed_at": observed_at,
+        }
+        atomic_write(temporary / "manifest.json", json.dumps(manifest, sort_keys=True).encode())
+        os.replace(temporary, destination)
+        fsync_directory(spool_dir)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+    return destination
+
+
+def _capture_spool_order(entry: Path) -> tuple[int, int, str]:
+    try:
+        modified_ns = entry.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 0
+    try:
+        manifest = json.loads((entry / "manifest.json").read_text())
+        observed_at = int(manifest.get("observed_at", 0))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        observed_at = modified_ns // 1_000_000_000
+    return observed_at, modified_ns, entry.name
 
 
 def _now() -> int:

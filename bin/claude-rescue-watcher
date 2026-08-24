@@ -32,6 +32,7 @@
 #   CLAUDE_RESCUE_WATCHER_LINES              (default 2000)  per-pane -S -N cap
 #   CLAUDE_RESCUE_WATCHER_QUEUE_PER_TICK     (default 8)     captures per tick
 #   CLAUDE_RESCUE_WATCHER_PACE_MS            (default 50)    between captures
+#   CLAUDE_RESCUE_OWNER_CHECK_S               (default 60)    owner repair cadence
 #   CLAUDE_RESCUE_TITLE_FORMATTER            optional; overrides window-label.sh
 #                                            Called as `$F <wn> <cmd> <title> <host>`
 #
@@ -91,7 +92,9 @@ BACKGROUND_FLOOR_S="${CLAUDE_RESCUE_WATCHER_BACKGROUND_FLOOR_S:-300}"
 LINES="${CLAUDE_RESCUE_WATCHER_LINES:-2000}"
 QUEUE_PER_TICK="${CLAUDE_RESCUE_WATCHER_QUEUE_PER_TICK:-8}"
 PACE_MS="${CLAUDE_RESCUE_WATCHER_PACE_MS:-50}"
+OWNER_CHECK_S="${CLAUDE_RESCUE_OWNER_CHECK_S:-60}"
 PACE_S="$(awk -v ms="$PACE_MS" 'BEGIN{printf "%.3f", ms/1000}')"
+OWNER_CHECK_TICKS=0
 HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
 
 # window-label.sh is the default cleaned-title formatter; CLAUDE_RESCUE_TITLE_FORMATTER
@@ -183,7 +186,7 @@ capture_pane() {
   fi
 
   case "$owner_result" in
-    unchanged)
+    unchanged|stale)
       rm -f "$tmpfile"
       : > "$touch_file"
       return 1
@@ -240,6 +243,17 @@ enqueue_capture() {
 
 while :; do
   tmux info >/dev/null 2>&1 || exit 0
+
+  # Repair a crashed State Owner without waiting for another tmux client attach.
+  # The check is cheap while healthy and `ensure` is itself lock-gated.
+  if [ "$OWNER_CHECK_TICKS" -le 0 ]; then
+    if command -v claude-rescue-state >/dev/null 2>&1; then
+      claude-rescue-state ensure >/dev/null 2>&1 || true
+    fi
+    OWNER_CHECK_TICKS="$OWNER_CHECK_S"
+  else
+    OWNER_CHECK_TICKS=$((OWNER_CHECK_TICKS - 1))
+  fi
 
   # Server-restart detection: tmux's pane_id is per-server-lifetime (%0 in
   # the old server is unrelated to %0 in the new one), so a .state from

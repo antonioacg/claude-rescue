@@ -542,9 +542,21 @@ __rescue_md5() {
 # prevents a recycled pid from keeping a stale lock alive indefinitely.
 __rescue_archive_lock_owner_live() {
   local lock_dir="$1"
-  local owner args
+  local owner args mtime now grace
   owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
-  [ -n "$owner" ] || return 1
+  if [ -z "$owner" ]; then
+    # mkdir publishes the claim before the winner can write its pid. Treat that
+    # short publication window as live; only recover a pid-less directory once
+    # it is old enough to be a genuine crash remnant.
+    grace="${CLAUDE_RESCUE_ARCHIVE_LOCK_GRACE:-30}"
+    mtime="$(stat -f '%m' "$lock_dir" 2>/dev/null || stat -c '%Y' "$lock_dir" 2>/dev/null || echo 0)"
+    now="$(date +%s)"
+    case "$mtime:$grace" in
+      *[!0-9:]*|:*) return 1 ;;
+    esac
+    [ "$((now - mtime))" -lt "$grace" ]
+    return
+  fi
   kill -0 "$owner" 2>/dev/null || return 1
   args="$(ps -o command= -p "$owner" 2>/dev/null || true)"
   case "$args" in

@@ -12,7 +12,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from state_owner import Event, EventStore, Publisher, StateClient, StateOwner, StatePaths, spool_event
+from state_owner import (
+    Event,
+    EventStore,
+    Publisher,
+    StateClient,
+    StateOwner,
+    StatePaths,
+    drain_spool,
+    spool_event,
+)
 
 
 class OwnerHarness:
@@ -74,6 +83,34 @@ class EventStoreTests(unittest.TestCase):
             store.append(Event.create(source="test", kind="first"))
             store.append(Event.create(source="test", kind="second"))
             self.assertEqual(["first", "second"], [event["kind"] for event in store.events()])
+            store.close()
+
+    def test_spooled_events_replay_in_occurrence_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = EventStore(root / "state.db")
+            spool = root / "spool"
+            spool_event(
+                spool,
+                Event.create(
+                    source="test",
+                    kind="older",
+                    event_id="z-older",
+                    occurred_at="2026-08-24T10:00:00Z",
+                ),
+            )
+            spool_event(
+                spool,
+                Event.create(
+                    source="test",
+                    kind="newer",
+                    event_id="a-newer",
+                    occurred_at="2026-08-24T11:00:00Z",
+                ),
+            )
+
+            drain_spool(store, spool)
+            self.assertEqual(["older", "newer"], [event["kind"] for event in store.events()])
             store.close()
 
 

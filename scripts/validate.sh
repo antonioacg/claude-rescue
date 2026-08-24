@@ -782,7 +782,31 @@ CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
 [ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_STALE_LOCK=present || S16_STALE_LOCK=absent
 assert "scenario 16g: stale maintenance lock is recovered" "absent" "$S16_STALE_LOCK"
 
-# (h) Concurrent save hooks share one maintenance owner. The archive may grow
+# (h) A lock claimant publishes mkdir before its pid file. Contenders must
+# preserve that fresh pid-less directory rather than stealing the live claim;
+# the same shape becomes recoverable after the grace period.
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+mkdir -p "$S16_ARCHIVE_DIR/.prune-lock"
+S16_STATE_8="$S16_RD/tmux_resurrect_20260521T000008.txt"
+cp "$S16_STATE_1" "$S16_STATE_8"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_8" >/dev/null 2>&1 || true
+[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_FRESH_PIDLESS=present || S16_FRESH_PIDLESS=absent
+assert "scenario 16h: fresh pid-less lock is not stolen" "present" "$S16_FRESH_PIDLESS"
+
+touch -t 202001010000 "$S16_ARCHIVE_DIR/.prune-lock"
+S16_STATE_9="$S16_RD/tmux_resurrect_20260521T000009.txt"
+cp "$S16_STATE_1" "$S16_STATE_9"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_9" >/dev/null 2>&1 || true
+[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_OLD_PIDLESS=present || S16_OLD_PIDLESS=absent
+assert "scenario 16h: old pid-less lock is recovered" "absent" "$S16_OLD_PIDLESS"
+
+# (i) Concurrent save hooks share one maintenance owner. The archive may grow
 # by contenders that ingest after the winning prune, but it stays bounded by
 # keep + (contenders - 1) and leaves no lock behind.
 S16_I=0
@@ -808,9 +832,9 @@ done
 for S16_PID in "${S16_PIDS[@]}"; do wait "$S16_PID" || true; done
 S16_CONCURRENT_COUNT=$(find "$S16_SAVES" -maxdepth 1 -name 'tmux_resurrect_*.txt' | wc -l | tr -d ' ')
 [ "$S16_CONCURRENT_COUNT" -le 9 ] && S16_CONCURRENT_BOUNDED=yes || S16_CONCURRENT_BOUNDED=no
-assert "scenario 16h: concurrent maintenance remains bounded" "yes" "$S16_CONCURRENT_BOUNDED"
+assert "scenario 16i: concurrent maintenance remains bounded" "yes" "$S16_CONCURRENT_BOUNDED"
 [ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_LIVE_LOCK=present || S16_LIVE_LOCK=absent
-assert "scenario 16h: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
+assert "scenario 16i: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
 
 rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
 unset CLAUDE_RESCUE_LEGACY_ARCHIVE

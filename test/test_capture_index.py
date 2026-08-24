@@ -6,7 +6,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from state_owner.capture import CaptureIndex, CapturePolicy, spool_capture
+from state_owner.capture import CaptureIndex, CapturePolicy, spool_capture, spool_capture_release
 
 
 class CaptureIndexTests(unittest.TestCase):
@@ -62,6 +62,16 @@ class CaptureIndexTests(unittest.TestCase):
         self.assertEqual(1, self.index.status()["capture_current"])
         self.assertEqual(1, self.index.status()["capture_blobs"])
 
+    def test_delayed_old_epoch_cannot_replace_new_current_capture(self) -> None:
+        first = self.ingest(content="new", epoch="2", observed_at=200)
+        stale = self.ingest(content="old", epoch="1", observed_at=100)
+        unchanged = self.ingest(content="new", epoch="2", observed_at=201)
+
+        self.assertEqual("first", first["status"])
+        self.assertEqual("stale", stale["status"])
+        self.assertEqual("unchanged", unchanged["status"])
+        self.assertEqual(1, self.index.status()["capture_current"])
+
     def test_release_and_retention_delete_unreferenced_blobs_in_batches(self) -> None:
         self.index.close()
         self.index = CaptureIndex(
@@ -92,6 +102,72 @@ class CaptureIndexTests(unittest.TestCase):
         self.assertEqual(1, second["deleted_capture_blobs"])
         self.assertEqual(0, self.index.status()["capture_references"])
         self.assertEqual(0, self.index.status()["capture_blobs"])
+
+    def test_invalid_spool_is_quarantined_once(self) -> None:
+        spool = self.root / "state" / "capture-spool"
+        entry = spool / "broken"
+        entry.mkdir(parents=True)
+        (entry / "manifest.json").write_text("not json")
+
+        self.assertEqual({"committed": 0, "invalid": 1}, self.index.drain_spool(spool))
+        self.assertEqual({"committed": 0, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertTrue((spool / "broken.invalid").is_dir())
+
+    def test_spooled_captures_replay_in_observation_order(self) -> None:
+        spool = self.root / "state" / "capture-spool"
+        self.capture.write_text("old")
+        spool_capture(
+            spool,
+            self.capture,
+            server="default",
+            epoch="1",
+            pane_spec="work:1.0",
+            pane_uuid="pane-uuid",
+            reason="title",
+            observed_at=100,
+        )
+        self.capture.write_text("new")
+        spool_capture(
+            spool,
+            self.capture,
+            server="default",
+            epoch="2",
+            pane_spec="work:1.0",
+            pane_uuid="pane-uuid",
+            reason="title",
+            observed_at=200,
+        )
+
+        self.assertEqual({"committed": 2, "invalid": 0}, self.index.drain_spool(spool))
+        unchanged = self.ingest(content="new", epoch="2", observed_at=201)
+        self.assertEqual("unchanged", unchanged["status"])
+
+    def test_spooled_release_survives_owner_outage_and_replays(self) -> None:
+        self.ingest(content="current", observed_at=100)
+        spool = self.root / "state" / "capture-spool"
+        entry = spool_capture_release(
+            spool,
+            server="default",
+            epoch="1",
+            pane_spec="work:1.0",
+            observed_at=101,
+        )
+
+        result = self.index.drain_spool(spool)
+        self.assertEqual({"committed": 1, "invalid": 0}, result)
+        self.assertFalse(entry.exists())
+        self.assertEqual(0, self.index.status()["capture_current"])
+
+        duplicate = spool_capture_release(
+            spool,
+            server="default",
+            epoch="1",
+            pane_spec="work:1.0",
+            observed_at=102,
+        )
+        self.assertEqual({"committed": 1, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertFalse(duplicate.exists())
+        self.assertEqual(0, self.index.status()["capture_current"])
 
     def test_spooled_capture_survives_source_removal_and_replays(self) -> None:
         self.capture.write_text("offline")

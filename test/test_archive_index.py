@@ -57,6 +57,39 @@ class ArchiveIndexTests(unittest.TestCase):
         self.assertEqual(1, self.index.status()["archive_blobs"])
         self.assertEqual(2, self.index.status()["archive_saves"])
 
+    def test_same_timestamp_from_different_servers_keeps_both_checkpoints(self) -> None:
+        now = 2_000_000_000
+        states = []
+        for server, content in (("server-a", "state-a"), ("server-b", "state-b")):
+            directory = self.root / server
+            directory.mkdir()
+            state = directory / "tmux_resurrect_20330518T033320.txt"
+            state.write_text(content)
+            states.append(self.index.ingest(state, now=now))
+
+        self.assertNotEqual(states[0]["save_name"], states[1]["save_name"])
+        self.assertEqual(2, self.index.status()["archive_saves"])
+        archived = {
+            (self.archive / "saves" / f"{result['save_name']}.txt").read_text()
+            for result in states
+        }
+        self.assertEqual({"state-a", "state-b"}, archived)
+
+    def test_retention_keeps_each_servers_checkpoint_in_shared_bucket(self) -> None:
+        now = 2_000_000_000
+        timestamp = now - 120
+        stamp = datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y%m%dT%H%M%S")
+        for server in ("server-a", "server-b"):
+            directory = self.root / server
+            directory.mkdir()
+            state = directory / f"tmux_resurrect_{stamp}.txt"
+            state.write_text(server)
+            self.index.ingest(state, now=now)
+
+        maintained = self.index.maintain(now=now)
+        self.assertEqual(0, maintained["deleted_saves"])
+        self.assertEqual(2, self.index.status()["archive_saves"])
+
     def test_tiered_retention_keeps_one_checkpoint_per_older_bucket(self) -> None:
         now = 2_000_000_000
         offsets = [10, 20, 120, 130, 1200, 1250, 5000, 5100, 8000]
@@ -107,6 +140,20 @@ class ArchiveIndexTests(unittest.TestCase):
         self.assertEqual(1, self.index.status()["archive_saves"])
         self.assertEqual(1, self.index.status()["archive_blobs"])
         self.assertEqual(b"legacy", blob.read_bytes())
+
+    def test_spool_namespaces_same_timestamp_by_server(self) -> None:
+        spool = self.root / "state" / "archive-spool"
+        entries = []
+        for server, content in (("server-a", "state-a"), ("server-b", "state-b")):
+            directory = self.root / server
+            directory.mkdir()
+            state = directory / "tmux_resurrect_20330518T033320.txt"
+            state.write_text(content)
+            entries.append(spool_archive_checkpoint(spool, state))
+
+        self.assertNotEqual(entries[0].parent, entries[1].parent)
+        self.assertEqual({"committed": 2, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertEqual(2, self.index.status()["archive_saves"])
 
     def test_spooled_checkpoint_replays_after_owner_recovery(self) -> None:
         now = 2_000_000_000

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -9,8 +10,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
-from .storage import atomic_copy, atomic_write, link_or_copy, open_database, sha256_file
+from .storage import (
+    atomic_copy,
+    atomic_write,
+    fsync_directory,
+    link_or_copy,
+    open_database,
+    sha256_file,
+)
 
 
 @dataclass(frozen=True)
@@ -103,13 +112,17 @@ class ArchiveIndex:
                 """
             )
 
-    def ingest(self, state_file: Path, *, now: int | None = None) -> dict[str, Any]:
+    def ingest(
+        self, state_file: Path, *, server: str | None = None, now: int | None = None
+    ) -> dict[str, Any]:
         state_file = state_file.resolve()
         if not state_file.is_file():
             raise ValueError(f"checkpoint does not exist: {state_file}")
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
-        save_name = state_file.stem
-        captured_at = _timestamp_from_name(save_name, fallback=int(state_file.stat().st_mtime))
+        source_name = state_file.stem
+        server = server or state_file.parent.name or "default"
+        save_name = _archive_key(server, source_name)
+        captured_at = _timestamp_from_name(source_name, fallback=int(state_file.stat().st_mtime))
 
         archived_state = self.saves_dir / f"{save_name}.txt"
         link_or_copy(state_file, archived_state)
@@ -161,13 +174,17 @@ class ArchiveIndex:
                     now,
                 ),
             )
-        return {"save_name": save_name, "capture_hash": capture_hash}
+        return {"server": server, "save_name": save_name, "capture_hash": capture_hash}
 
     def drain_spool(self, spool_dir: Path, *, limit: int = 20) -> dict[str, int]:
         result = {"committed": 0, "invalid": 0}
         if not spool_dir.is_dir():
             return result
-        entries = [entry for entry in sorted(spool_dir.iterdir()) if entry.is_dir()]
+        entries = [
+            entry
+            for entry in sorted(spool_dir.iterdir())
+            if entry.is_dir() and not entry.name.endswith(".invalid")
+        ]
         for entry in entries[:limit]:
             states = list(entry.glob("tmux_resurrect_*.txt"))
             if len(states) != 1:
@@ -178,8 +195,15 @@ class ArchiveIndex:
                 result["invalid"] += 1
                 continue
             try:
-                self.ingest(states[0])
-            except (OSError, ValueError):
+                manifest_path = entry / "manifest.json"
+                manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+                server = manifest.get("server")
+                if server is None and entry.name.startswith("tmux_resurrect_"):
+                    server = "legacy"
+                if server is not None and (not isinstance(server, str) or not server):
+                    raise ValueError("archive spool server must be a non-empty string")
+                self.ingest(states[0], server=server)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
                 invalid = entry.with_name(f"{entry.name}.invalid")
                 if invalid.exists():
                     shutil.rmtree(invalid)
@@ -289,20 +313,31 @@ class ArchiveIndex:
         with self._lock:
             return self._connection.execute(
                 """
-                WITH classified AS (
+                WITH scoped AS (
+                    SELECT save_name, captured_at,
+                        CASE
+                            WHEN instr(save_name, '__') > 0
+                                THEN substr(save_name, 1, instr(save_name, '__') - 1)
+                            ELSE 'legacy'
+                        END AS server_key
+                    FROM archive_saves
+                ), classified AS (
                     SELECT save_name, captured_at,
                         CASE
                             WHEN captured_at >= :fine_cutoff THEN 'fine:' || save_name
                             WHEN captured_at >= :medium_cutoff
-                                THEN 'medium:' || CAST(captured_at / :medium_bucket AS INTEGER)
+                                THEN 'medium:' || server_key || ':' ||
+                                     CAST(captured_at / :medium_bucket AS INTEGER)
                             WHEN captured_at >= :coarse_cutoff
-                                THEN 'coarse:' || CAST(captured_at / :coarse_bucket AS INTEGER)
+                                THEN 'coarse:' || server_key || ':' ||
+                                     CAST(captured_at / :coarse_bucket AS INTEGER)
                             WHEN captured_at >= :archive_cutoff
-                                THEN 'archive:' || CAST(captured_at / :archive_bucket AS INTEGER)
+                                THEN 'archive:' || server_key || ':' ||
+                                     CAST(captured_at / :archive_bucket AS INTEGER)
                             ELSE 'expired'
                         END AS bucket,
                         CASE WHEN captured_at < :archive_cutoff THEN 1 ELSE 0 END AS expired
-                    FROM archive_saves
+                    FROM scoped
                 ), ranked AS (
                     SELECT save_name, captured_at, expired,
                            ROW_NUMBER() OVER (
@@ -347,12 +382,13 @@ def spool_archive_checkpoint(spool_dir: Path, state_file: Path) -> Path:
         raise ValueError(f"checkpoint does not exist: {state_file}")
     spool_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(spool_dir, 0o700)
-    destination = spool_dir / state_file.stem
+    server = state_file.parent.name or "default"
+    destination = spool_dir / _archive_key(server, state_file.stem)
     destination_state = destination / state_file.name
     if destination_state.is_file():
         return destination_state
 
-    temporary = spool_dir / f".{state_file.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    temporary = spool_dir / f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     temporary.mkdir()
     try:
         link_or_copy(state_file, temporary / state_file.name)
@@ -362,8 +398,13 @@ def spool_archive_checkpoint(spool_dir: Path, state_file: Path) -> Path:
         pane_contents = state_file.parent / "pane_contents.tar.gz"
         if pane_contents.is_file():
             link_or_copy(pane_contents, temporary / pane_contents.name)
+        atomic_write(
+            temporary / "manifest.json",
+            json.dumps({"server": server}, separators=(",", ":"), sort_keys=True).encode(),
+        )
         try:
             os.replace(temporary, destination)
+            fsync_directory(spool_dir)
         except OSError:
             if not destination_state.is_file():
                 raise
@@ -373,11 +414,17 @@ def spool_archive_checkpoint(spool_dir: Path, state_file: Path) -> Path:
     return destination_state
 
 
+def _archive_key(server: str, checkpoint_name: str) -> str:
+    server_key = quote(server, safe=".-").replace("_", "%5F")
+    return f"{server_key}__{checkpoint_name}"
+
+
 def _timestamp_from_name(name: str, *, fallback: int) -> int:
     prefix = "tmux_resurrect_"
-    if not name.startswith(prefix):
+    position = name.rfind(prefix)
+    if position < 0:
         return fallback
-    raw = name[len(prefix) :]
+    raw = name[position + len(prefix) :]
     try:
         parsed = datetime.strptime(raw, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:

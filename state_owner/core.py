@@ -325,12 +325,29 @@ def spool_event(path: Path, event: Event) -> Path:
     return destination
 
 
+def _event_spool_order(item: Path) -> tuple[int, float, int, str]:
+    try:
+        modified_ns = item.stat().st_mtime_ns
+    except OSError:
+        modified_ns = 0
+    try:
+        event = Event.from_mapping(json.loads(item.read_text()))
+        parsed = datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return 0, parsed.timestamp(), modified_ns, item.name
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return 1, modified_ns / 1_000_000_000, modified_ns, item.name
+
+
 def drain_spool(store: EventStore, path: Path, *, limit: int = 1000) -> dict[str, int]:
     result = {"committed": 0, "duplicates": 0, "invalid": 0}
     if not path.is_dir():
         return result
 
-    for item in sorted(path.glob("*.json"))[:limit]:
+    items = list(path.glob("*.json"))
+    items.sort(key=_event_spool_order)
+    for item in items[:limit]:
         try:
             event = Event.from_mapping(json.loads(item.read_text()))
             _, inserted = store.append(event)
@@ -529,11 +546,19 @@ class StateOwner:
             sequence, inserted = self.store.append(Event.from_mapping(value))
             return {"ok": True, "sequence": sequence, "inserted": inserted}
         if operation == "status":
+            event_spooled = (
+                len(list(self.paths.spool.glob("*.json"))) if self.paths.spool.is_dir() else 0
+            )
+            archive_spooled = _spool_directory_count(self.paths.archive_spool)
+            capture_spooled = _spool_directory_count(self.paths.capture_spool)
             return {
                 "ok": True,
                 "pid": os.getpid(),
                 "socket": str(self.paths.socket),
-                "spooled": len(list(self.paths.spool.glob("*.json"))) if self.paths.spool.is_dir() else 0,
+                "spooled": event_spooled,
+                "event_spooled": event_spooled,
+                "archive_spooled": archive_spooled,
+                "capture_spooled": capture_spooled,
                 **self.store.status(),
                 **self.archive.status(),
                 **self.captures.status(),
@@ -614,6 +639,16 @@ class StateOwner:
             self._lock_file = None
         self._stop = None
         self._closed = True
+
+
+def _spool_directory_count(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    return sum(
+        1
+        for entry in path.iterdir()
+        if entry.is_dir() and not entry.name.endswith(".invalid")
+    )
 
 
 def _read_message(connection: socket.socket) -> dict[str, Any]:
