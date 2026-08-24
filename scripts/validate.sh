@@ -690,6 +690,81 @@ CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
 [ -f "$S16_BLOBS/$HASH_A.tar.gz" ] && S16_BLOB_A_AFTER=present || S16_BLOB_A_AFTER=absent
 assert "scenario 16e: aged blob GC'd past --blob-days" "absent" "$S16_BLOB_A_AFTER"
 
+# (f) High-cardinality maintenance batches stat calls. The old `{} \;` form
+# launched one process per snapshot; this probe wraps stat and counts actual
+# invocations while pruning hundreds of files.
+S16_FAKEBIN="$HOME_DIR/scenario16-bin"
+S16_STAT_COUNT="$HOME_DIR/scenario16-stat-count"
+mkdir -p "$S16_FAKEBIN"
+cat > "$S16_FAKEBIN/stat" <<'EOF'
+#!/bin/sh
+printf '1\n' >> "$S16_STAT_COUNT"
+exec /usr/bin/stat "$@"
+EOF
+chmod +x "$S16_FAKEBIN/stat"
+: > "$S16_STAT_COUNT"
+S16_I=0
+while [ "$S16_I" -lt 300 ]; do
+  printf -v S16_N '%06d' "$S16_I"
+  : > "$S16_SAVES/tmux_resurrect_20260520T$S16_N.txt"
+  S16_I=$((S16_I + 1))
+done
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+S16_STATE_6="$S16_RD/tmux_resurrect_20260521T000006.txt"
+cp "$S16_STATE_1" "$S16_STATE_6"
+PATH="$S16_FAKEBIN:$PATH" S16_STAT_COUNT="$S16_STAT_COUNT" \
+  CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_6" >/dev/null 2>&1 || true
+S16_STAT_CALLS=$(wc -l < "$S16_STAT_COUNT" | tr -d ' ')
+[ "$S16_STAT_CALLS" -le 10 ] && S16_BATCHED=yes || S16_BATCHED=no
+assert "scenario 16f: high-cardinality prune batches stat processes" "yes" "$S16_BATCHED"
+
+# (g) A dead owner cannot wedge maintenance forever. The recovery claim removes
+# the stale lock before acquiring it for this save.
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+mkdir -p "$S16_ARCHIVE_DIR/.prune-lock"
+printf '999999\n' > "$S16_ARCHIVE_DIR/.prune-lock/pid"
+S16_STATE_7="$S16_RD/tmux_resurrect_20260521T000007.txt"
+cp "$S16_STATE_1" "$S16_STATE_7"
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_7" >/dev/null 2>&1 || true
+[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_STALE_LOCK=present || S16_STALE_LOCK=absent
+assert "scenario 16g: stale maintenance lock is recovered" "absent" "$S16_STALE_LOCK"
+
+# (h) Concurrent save hooks share one maintenance owner. The archive may grow
+# by contenders that ingest after the winning prune, but it stays bounded by
+# keep + (contenders - 1) and leaves no lock behind.
+S16_I=0
+while [ "$S16_I" -lt 20 ]; do
+  printf -v S16_N '%06d' "$S16_I"
+  : > "$S16_SAVES/tmux_resurrect_20260519T$S16_N.txt"
+  S16_I=$((S16_I + 1))
+done
+rm -f "$S16_ARCHIVE_DIR/.last-prune"
+S16_PIDS=()
+S16_I=1
+while [ "$S16_I" -le 8 ]; do
+  printf -v S16_N '%06d' "$S16_I"
+  S16_STATE_N="$S16_RD/tmux_resurrect_20260521T1$S16_N.txt"
+  cp "$S16_STATE_1" "$S16_STATE_N"
+  CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+    CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
+    CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
+    "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_N" >/dev/null 2>&1 &
+  S16_PIDS+=("$!")
+  S16_I=$((S16_I + 1))
+done
+for S16_PID in "${S16_PIDS[@]}"; do wait "$S16_PID" || true; done
+S16_CONCURRENT_COUNT=$(find "$S16_SAVES" -maxdepth 1 -name 'tmux_resurrect_*.txt' | wc -l | tr -d ' ')
+[ "$S16_CONCURRENT_COUNT" -le 9 ] && S16_CONCURRENT_BOUNDED=yes || S16_CONCURRENT_BOUNDED=no
+assert "scenario 16h: concurrent maintenance remains bounded" "yes" "$S16_CONCURRENT_BOUNDED"
+[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_LIVE_LOCK=present || S16_LIVE_LOCK=absent
+assert "scenario 16h: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
+
 rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
 
 # ---------------------------------------------------------------------------
@@ -722,26 +797,28 @@ assert "install.sh dry-run accounts for all binaries" "$EXPECTED_BINS" "$DR"
 # making the runbook's own validate gate unreachable. Falling back to
 # live configs when there's no chezmoi (unmanaged machines).
 echo "[tmux-conf] source-file directives don't rely on tilde expansion"
-shopt -s globstar nullglob
 TMUX_SCAN_PATHS=()
 CHEZMOI_SRC="$HOME/.local/share/chezmoi"
 if [ -d "$CHEZMOI_SRC" ]; then
   [ -f "$CHEZMOI_SRC/dot_tmux.conf" ]      && TMUX_SCAN_PATHS+=("$CHEZMOI_SRC/dot_tmux.conf")
   [ -f "$CHEZMOI_SRC/dot_tmux.conf.tmpl" ] && TMUX_SCAN_PATHS+=("$CHEZMOI_SRC/dot_tmux.conf.tmpl")
   if [ -d "$CHEZMOI_SRC/dot_config/tmux" ]; then
-    TMUX_SCAN_PATHS+=(
-      "$CHEZMOI_SRC"/dot_config/tmux/**/*.conf
-      "$CHEZMOI_SRC"/dot_config/tmux/**/*.tmux
-      "$CHEZMOI_SRC"/dot_config/tmux/**/*.conf.tmpl
-      "$CHEZMOI_SRC"/dot_config/tmux/**/*.tmux.tmpl
-    )
+    while IFS= read -r -d '' f; do
+      TMUX_SCAN_PATHS+=("$f")
+    done < <(find "$CHEZMOI_SRC/dot_config/tmux" -type f \
+      \( -name '*.conf' -o -name '*.tmux' -o -name '*.conf.tmpl' -o -name '*.tmux.tmpl' \) \
+      -print0)
   fi
 else
   # Unmanaged machine — scan whatever's live.
   [ -f "$HOME/.tmux.conf" ] && TMUX_SCAN_PATHS+=("$HOME/.tmux.conf")
-  [ -d "$HOME/.config/tmux" ] && TMUX_SCAN_PATHS+=( "$HOME"/.config/tmux/**/*.conf "$HOME"/.config/tmux/**/*.tmux )
+  if [ -d "$HOME/.config/tmux" ]; then
+    while IFS= read -r -d '' f; do
+      TMUX_SCAN_PATHS+=("$f")
+    done < <(find "$HOME/.config/tmux" -type f \
+      \( -name '*.conf' -o -name '*.tmux' \) -print0)
+  fi
 fi
-shopt -u globstar nullglob
 
 # Match: source-file [-q] then optional quote then literal ~ — covers
 # single-quoted, double-quoted, and bare tilde paths. All three are

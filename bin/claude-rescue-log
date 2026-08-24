@@ -537,6 +537,84 @@ __rescue_md5() {
   fi
 }
 
+# True when the process recorded in a maintenance lock is still the
+# claude-rescue save invocation that created it. Checking argv as well as pid
+# prevents a recycled pid from keeping a stale lock alive indefinitely.
+__rescue_archive_lock_owner_live() {
+  local lock_dir="$1"
+  local owner args
+  owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+  [ -n "$owner" ] || return 1
+  kill -0 "$owner" 2>/dev/null || return 1
+  args="$(ps -o command= -p "$owner" 2>/dev/null || true)"
+  case "$args" in
+    *"claude-rescue-log resurrect-save"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Acquire the archive-maintenance lock. mkdir is the atomic claim; a separate
+# recovery claim serializes stale-owner cleanup so two save hooks can never
+# remove and replace each other's live lock.
+__rescue_archive_lock() {
+  local lock_dir="$1"
+  local recover_dir="${lock_dir}.recover"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    return 0
+  fi
+
+  __rescue_archive_lock_owner_live "$lock_dir" && return 1
+  mkdir "$recover_dir" 2>/dev/null || return 1
+
+  # Re-check after winning the recovery claim: another invocation may have
+  # replaced the stale lock while we were contending for it.
+  if ! __rescue_archive_lock_owner_live "$lock_dir"; then
+    rm -rf "$lock_dir"
+  fi
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lock_dir/pid"
+    rmdir "$recover_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  rmdir "$recover_dir" 2>/dev/null || true
+  return 1
+}
+
+# Run archive, hot-tier, and debug retention under one single-owner claim.
+# The due check intentionally happens after lock acquisition: every contender
+# re-reads the marker written by the winner instead of acting on stale state.
+__rescue_archive_maintain() {
+  local archive_dir="$1" saves_dir="$2" blobs_dir="$3"
+  local keep="$4" blob_days="$5" resurrect_dir="$6"
+  local prune_interval_s="$7"
+  local prune_marker="$archive_dir/.last-prune"
+  local lock_dir="$archive_dir/.prune-lock"
+
+  __rescue_archive_lock "$lock_dir" || return 0
+  (
+    trap 'rm -rf "$lock_dir"' EXIT
+    trap 'exit 1' HUP INT TERM
+
+    local now last_prune=0 marker_tmp
+    now="$(date +%s)"
+    [ -f "$prune_marker" ] && last_prune="$(cat "$prune_marker" 2>/dev/null || echo 0)"
+    [ "$((now - last_prune))" -ge "$prune_interval_s" ] || exit 0
+
+    __rescue_archive_prune "$saves_dir" "$blobs_dir" "$keep" "$blob_days"
+    __rescue_hot_prune "$resurrect_dir"
+    __rescue_debug_prune
+
+    marker_tmp="${prune_marker}.tmp.$$"
+    printf '%s' "$now" > "$marker_tmp" 2>/dev/null \
+      && mv -f "$marker_tmp" "$prune_marker" 2>/dev/null \
+      || rm -f "$marker_tmp"
+  )
+}
+
 # Archive a just-completed save into the long-term archive tier.
 #
 # Design (see chat thread 2026-05-21):
@@ -598,22 +676,13 @@ __rescue_archive_save() {
     fi
   fi
 
-  # 3. Throttled prune + blob GC. The marker file holds the unix ts of the
-  # last prune. Skip if we're inside the interval.
-  # Also runs the hot-tier prune (resurrect_dir itself) on the same cadence —
-  # tmux-resurrect's own rotation breaks past ~6k files ("argument list too
-  # long" in its `ls -t … | tail` chain), so without this the snapshot dir
-  # grows unboundedly until manual cleanup.
-  local prune_marker="$archive_dir/.last-prune"
-  local now last_prune=0
-  now="$(date +%s)"
-  [ -f "$prune_marker" ] && last_prune="$(cat "$prune_marker" 2>/dev/null || echo 0)"
-  if [ "$((now - last_prune))" -ge "$prune_interval_s" ]; then
-    __rescue_archive_prune "$saves_dir" "$blobs_dir" "$keep" "$blob_days"
-    __rescue_hot_prune "$resurrect_dir"
-    __rescue_debug_prune
-    printf '%s' "$now" > "$prune_marker" 2>/dev/null || true
-  fi
+  # 3. Throttled prune + blob GC. Archive ingestion can overlap because its
+  # writes are content-addressed/hardlinked, but maintenance has one owner.
+  # The winner re-checks .last-prune under the lock; contenders return without
+  # scanning. Also runs hot-tier and debug-log retention on the same cadence.
+  __rescue_archive_maintain \
+    "$archive_dir" "$saves_dir" "$blobs_dir" "$keep" "$blob_days" \
+    "$resurrect_dir" "$prune_interval_s"
 }
 
 # Drop debug log files (lib/common.sh's log_debug helper writes here) older
@@ -658,7 +727,7 @@ __rescue_archive_prune() {
     local del_count=$((total - keep))
     local del_list; del_list="$(mktemp)"
     find "$saves_dir" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f \
-      -exec stat -f '%m %N' {} \; 2>/dev/null \
+      -exec stat -f '%m %N' {} + 2>/dev/null \
       | sort -n \
       | head -n "$del_count" \
       | awk '{$1=""; sub(/^ /,""); print}' \

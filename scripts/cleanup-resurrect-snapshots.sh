@@ -54,13 +54,13 @@ if [ -L "$RESURRECT_DIR/last" ]; then
   LAST_TARGET="$(readlink "$RESURRECT_DIR/last")"
 fi
 
-# Newest-first list of all snapshot .txt files. find + stat avoids any
-# shell glob expansion (which would blow up at scale).
+# Newest-first list of all snapshot .txt files. find batches paths into each
+# stat invocation, so file count does not become process count.
 TMPLIST="$(mktemp -t cleanup-resurrect-snapshots.XXXXXX)"
 trap 'rm -f "$TMPLIST"' EXIT
 
 find "$RESURRECT_DIR" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f \
-  -exec stat -f '%m %N' {} \; \
+  -exec stat -f '%m %N' {} + \
   | sort -rn \
   | awk '{$1=""; sub(/^ /,""); print}' \
   > "$TMPLIST"
