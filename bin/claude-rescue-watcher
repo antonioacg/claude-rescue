@@ -109,7 +109,14 @@ if [ -f "$PIDFILE" ]; then
   fi
 fi
 echo "$$" > "$PIDFILE"
-trap 'rm -f "$PIDFILE"' EXIT INT TERM
+cleanup_watcher() {
+  rm -f "$PIDFILE"
+  [ -n "${current:-}" ] && rm -f "$current"
+  [ -n "${queue:-}" ] && rm -f "$queue"
+  [ -n "${emit_seen:-}" ] && rm -f "$emit_seen"
+}
+trap cleanup_watcher EXIT
+trap 'exit 0' HUP INT TERM
 
 # Compute the cleaned/display title for a pane. Lazy: caller only invokes this
 # when raw inputs differ from the previous tick, so we don't fork per pane per
@@ -252,7 +259,6 @@ while :; do
   current="$(mktemp)"
   queue="$(mktemp)"            # one line per queued pane: pane_id\tspec\twas_floor_only
   emit_seen="$(mktemp)"        # pane_ids that emitted any event this tick
-  trap 'rm -f "$current" "$queue" "$emit_seen" "$PIDFILE"' EXIT INT TERM
 
   # Per-tick state snapshot. Fields: 1=pane_id 2=spec 3=uuid 4=cleaned_title
   # 5=unseen 6=active 7=raw_key.
@@ -368,7 +374,7 @@ while :; do
 
   mv -f "$current" "$STATE_FILE"
   rm -f "$queue" "$emit_seen"
-  trap 'rm -f "$PIDFILE"' EXIT INT TERM
+  current=""; queue=""; emit_seen=""
 
   sleep 1
 done

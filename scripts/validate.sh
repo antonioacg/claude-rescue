@@ -20,6 +20,13 @@ FAIL=0
 RESULTS=()
 
 cleanup() {
+  CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+    "$REPO/bin/claude-rescue-state" stop >/dev/null 2>&1 || true
+  watcher_pid_file="$HOME_DIR/watcher-$SOCK.pid"
+  if [ -f "$watcher_pid_file" ]; then
+    watcher_pid="$(cat "$watcher_pid_file" 2>/dev/null || true)"
+    [ -n "$watcher_pid" ] && kill -TERM "$watcher_pid" 2>/dev/null || true
+  fi
   tmux -L "$SOCK" kill-server 2>/dev/null || true
   rm -rf "$HOME_DIR"
 }
@@ -59,6 +66,17 @@ tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_CACHE_HOME "$HOME_DIR/cache"
 tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_REPO "$REPO"
 tmux -L "$SOCK" set-environment -g PATH "$REPO/bin:$PATH"
 
+STATE_OWNER_READY=no
+for _ in $(seq 1 30); do
+  if CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+    "$REPO/bin/claude-rescue-state" status >/dev/null 2>&1; then
+    STATE_OWNER_READY=yes
+    break
+  fi
+  sleep 0.1
+done
+assert "tmux config starts the State Owner" "yes" "$STATE_OWNER_READY"
+
 P0=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
 
 emit_session_start() {
@@ -74,11 +92,18 @@ emit_session_start() {
 wait_for_shell() {
   local pane="$1" marker="$HOME_DIR/.ready.${pane//[^a-zA-Z0-9]/_}"
   rm -f "$marker"
-  tmux -L "$SOCK" send-keys -t "$pane" "touch '$marker'" Enter
-  local i
-  for i in $(seq 1 50); do
-    [ -f "$marker" ] && { rm -f "$marker"; return 0; }
-    sleep 0.2
+  local i j
+  for i in $(seq 1 20); do
+    # Startup work can make an early send-keys disappear before zsh begins
+    # reading input. Retry an idempotent probe at a low cadence. Send literal
+    # text separately so tmux never tries to parse any part as a key name.
+    tmux -L "$SOCK" send-keys -t "$pane" C-u
+    tmux -L "$SOCK" send-keys -l -t "$pane" "touch '$marker'"
+    tmux -L "$SOCK" send-keys -t "$pane" Enter
+    for j in $(seq 1 10); do
+      [ -f "$marker" ] && { rm -f "$marker"; return 0; }
+      sleep 0.1
+    done
   done
   echo "wait_for_shell: pane $pane never became interactive" >&2
   return 1
@@ -766,6 +791,36 @@ assert "scenario 16h: concurrent maintenance remains bounded" "yes" "$S16_CONCUR
 assert "scenario 16h: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
 
 rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
+
+# ---------------------------------------------------------------------------
+echo "[state-owner] durable event journal, spooling, and single-writer lifecycle"
+S17_OUTPUT="$HOME_DIR/state-owner-tests.log"
+if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
+  -s "$REPO/test" -p 'test_state_owner.py' >"$S17_OUTPUT" 2>&1; then
+  S17_RESULT=pass
+else
+  S17_RESULT=fail
+  cat "$S17_OUTPUT" >&2
+fi
+assert "state owner unit suite" "pass" "$S17_RESULT"
+
+# The watcher used to trap TERM by removing its pid file without exiting,
+# leaving an orphan that could attach to a later server reusing the socket.
+S17_WATCHER_PID_FILE="$HOME_DIR/watcher-$SOCK.pid"
+S17_WATCHER_PID="$(cat "$S17_WATCHER_PID_FILE" 2>/dev/null || true)"
+if [ -n "$S17_WATCHER_PID" ] && kill -0 "$S17_WATCHER_PID" 2>/dev/null; then
+  kill -TERM "$S17_WATCHER_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$S17_WATCHER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+if [ -n "$S17_WATCHER_PID" ] && kill -0 "$S17_WATCHER_PID" 2>/dev/null; then
+  S17_WATCHER_STOPPED=no
+else
+  S17_WATCHER_STOPPED=yes
+fi
+assert "watcher exits on TERM" "yes" "$S17_WATCHER_STOPPED"
 
 # ---------------------------------------------------------------------------
 echo "[picker] data subcommands return well-formed TSV/JSON"

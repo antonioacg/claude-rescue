@@ -20,6 +20,21 @@ or a file, add it here.
   live before acting (`arm_still_authoritative`). State that must survive
   epochs is keyed by pane UUID instead (markers, captures, active files).
 
+## State ownership
+
+- **State Owner** — the single-writer process behind
+  `claude-rescue-state`. It serializes durable History Events into SQLite
+  and exposes a local Unix-socket Interface for publishing and queries.
+  Shell hooks never open the database directly.
+- **History Event** — an immutable, idempotent state transition committed
+  by the State Owner. Each carries an event id, source, kind, occurrence
+  time, optional Epoch / Pane UUID / session id, and a JSON payload. Commit
+  sequence, not wall-clock time, defines durable ordering.
+- **Outage spool** — `$DATA/state/spool/`: atomically-written History Events
+  waiting for the State Owner. The publisher writes here when the socket is
+  unavailable; replay is at-least-once and event-id deduplication makes it
+  effectively exactly-once in the journal.
+
 ## Hibernation
 
 - **Hibernation** — freeing resources held by an idle claude pane. Two
