@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import sqlite3
@@ -10,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .storage import atomic_copy, atomic_write, link_or_copy, open_database, sha256_file
 
 
 @dataclass(frozen=True)
@@ -59,15 +60,11 @@ class ArchiveIndex:
         self.saves_dir = archive_dir / "saves"
         self.blobs_dir = archive_dir / "blobs"
         self.policy = policy or ArchivePolicy.from_environment()
-        database.parent.mkdir(parents=True, exist_ok=True)
         self.saves_dir.mkdir(parents=True, exist_ok=True)
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(database, timeout=5, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self._connection = open_database(database)
         self._lock = threading.Lock()
         with self._connection:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS archive_saves (
@@ -115,23 +112,23 @@ class ArchiveIndex:
         captured_at = _timestamp_from_name(save_name, fallback=int(state_file.stat().st_mtime))
 
         archived_state = self.saves_dir / f"{save_name}.txt"
-        _link_or_copy(state_file, archived_state)
+        link_or_copy(state_file, archived_state)
 
         source_sidecar = state_file.with_suffix(".claude-userops.tsv")
         archived_sidecar: Path | None = None
         if source_sidecar.is_file():
             archived_sidecar = self.saves_dir / f"{save_name}.claude-userops.tsv"
-            _link_or_copy(source_sidecar, archived_sidecar)
+            link_or_copy(source_sidecar, archived_sidecar)
 
         capture_hash: str | None = None
         pane_contents = state_file.parent / "pane_contents.tar.gz"
         if pane_contents.is_file():
-            capture_hash = _sha256(pane_contents)
+            capture_hash = sha256_file(pane_contents)
             blob = self.blobs_dir / f"{capture_hash}.tar.gz"
             if not blob.exists():
-                _atomic_copy(pane_contents, blob)
+                atomic_copy(pane_contents, blob)
             hash_file = self.saves_dir / f"{save_name}.pane_contents.hash"
-            _atomic_write(hash_file, f"{capture_hash}\n".encode())
+            atomic_write(hash_file, f"{capture_hash}\n".encode())
             with self._lock, self._connection:
                 self._connection.execute(
                     """
@@ -357,13 +354,13 @@ def spool_archive_checkpoint(spool_dir: Path, state_file: Path) -> Path:
     temporary = spool_dir / f".{state_file.stem}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     temporary.mkdir()
     try:
-        _link_or_copy(state_file, temporary / state_file.name)
+        link_or_copy(state_file, temporary / state_file.name)
         sidecar = state_file.with_suffix(".claude-userops.tsv")
         if sidecar.is_file():
-            _link_or_copy(sidecar, temporary / sidecar.name)
+            link_or_copy(sidecar, temporary / sidecar.name)
         pane_contents = state_file.parent / "pane_contents.tar.gz"
         if pane_contents.is_file():
-            _link_or_copy(pane_contents, temporary / pane_contents.name)
+            link_or_copy(pane_contents, temporary / pane_contents.name)
         try:
             os.replace(temporary, destination)
         except OSError:
@@ -385,49 +382,6 @@ def _timestamp_from_name(name: str, *, fallback: int) -> int:
     except ValueError:
         return fallback
     return int(parsed.timestamp())
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _link_or_copy(source: Path, destination: Path) -> None:
-    if destination.exists():
-        return
-    try:
-        os.link(source, destination)
-    except OSError:
-        _atomic_copy(source, destination)
-
-
-def _atomic_copy(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_write(destination: Path, content: bytes) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.parent / f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _save_artifacts(saves_dir: Path, save_name: str) -> tuple[Path, Path, Path]:

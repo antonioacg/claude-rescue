@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
-import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .storage import atomic_copy, atomic_write, link_or_copy, open_database, sha256_file
 
 
 @dataclass(frozen=True)
@@ -52,14 +52,10 @@ class CaptureIndex:
     def __init__(self, database: Path, data_home: Path, policy: CapturePolicy | None = None):
         self.blobs_dir = data_home / "captures" / "blobs"
         self.policy = policy or CapturePolicy.from_environment()
-        database.parent.mkdir(parents=True, exist_ok=True)
         self.blobs_dir.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(database, timeout=5, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self._connection = open_database(database)
         self._lock = threading.Lock()
         with self._connection:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS capture_blobs (
@@ -131,7 +127,7 @@ class CaptureIndex:
         if pane_uuid == "-":
             pane_uuid = None
         observed_at = _now() if observed_at is None else observed_at
-        capture_hash = _sha256(source)
+        capture_hash = sha256_file(source)
 
         with self._lock, self._connection:
             # A tmux pane spec can be recycled after a server restart. Once the
@@ -154,7 +150,7 @@ class CaptureIndex:
         if changed:
             blob = self.blobs_dir / f"{capture_hash}.txt"
             if not blob.exists():
-                _atomic_copy(source, blob)
+                atomic_copy(source, blob)
             with self._lock, self._connection:
                 self._connection.execute(
                     """
@@ -381,7 +377,7 @@ def spool_capture(
     temporary = spool_dir / f".{identity}.tmp"
     temporary.mkdir()
     try:
-        _link_or_copy(source, temporary / "capture.txt")
+        link_or_copy(source, temporary / "capture.txt")
         manifest = {
             "server": server,
             "epoch": epoch,
@@ -390,7 +386,7 @@ def spool_capture(
             "reason": reason,
             "observed_at": observed_at,
         }
-        _atomic_write(temporary / "manifest.json", json.dumps(manifest, sort_keys=True).encode())
+        atomic_write(temporary / "manifest.json", json.dumps(manifest, sort_keys=True).encode())
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
@@ -400,42 +396,3 @@ def spool_capture(
 
 def _now() -> int:
     return int(datetime.now(timezone.utc).timestamp())
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _link_or_copy(source: Path, destination: Path) -> None:
-    try:
-        os.link(source, destination)
-    except OSError:
-        _atomic_copy(source, destination)
-
-
-def _atomic_copy(source: Path, destination: Path) -> None:
-    temporary = destination.parent / f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
-            outgoing.flush()
-            os.fsync(outgoing.fileno())
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def _atomic_write(destination: Path, content: bytes) -> None:
-    temporary = destination.parent / f".{destination.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)

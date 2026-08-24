@@ -6,7 +6,6 @@ import json
 import os
 import re
 import socket
-import sqlite3
 import tempfile
 import threading
 import uuid
@@ -17,6 +16,7 @@ from typing import Any, Mapping
 
 from .archive import ArchiveIndex
 from .capture import CaptureIndex
+from .storage import atomic_write, open_database
 
 SCHEMA_VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -180,14 +180,9 @@ class Event:
 
 class EventStore:
     def __init__(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
+        self._connection = open_database(path)
         self._lock = threading.Lock()
         with self._connection:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._connection.execute("PRAGMA foreign_keys=ON")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS events (
@@ -318,31 +313,14 @@ class EventStore:
             self._connection.close()
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def spool_event(path: Path, event: Event) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     destination = path / f"{event.event_id}.json"
     if destination.exists():
         return destination
 
-    temporary = path / f".{event.event_id}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     encoded = json.dumps(event.to_mapping(), separators=(",", ":"), sort_keys=True).encode() + b"\n"
-    try:
-        with temporary.open("xb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-        _fsync_directory(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    atomic_write(destination, encoded)
     return destination
 
 
