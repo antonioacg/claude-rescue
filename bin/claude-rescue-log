@@ -804,7 +804,8 @@ cmd_resurrect_save() {
   # retention. Its client durably spools the checkpoint if the owner is down.
   # Keep the legacy path only for installations that have not linked the new
   # command yet; once present, no save hook writes archive state directly.
-  if command -v claude-rescue-state >/dev/null 2>&1; then
+  if [ "${CLAUDE_RESCUE_LEGACY_ARCHIVE:-0}" != "1" ] \
+     && command -v claude-rescue-state >/dev/null 2>&1; then
     if ! claude-rescue-state archive-ingest "$state_file" \
       >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/rescue-log.err"; then
       log_err "resurrect-save: State Owner failed to ingest $state_file"

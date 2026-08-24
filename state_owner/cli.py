@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive import spool_archive_checkpoint
+from .capture import spool_capture
 from .core import Event, OwnerUnavailable, Publisher, StateClient, StateOwner, StatePaths
 
 
@@ -142,15 +143,61 @@ def _archive_import(args: argparse.Namespace, paths: StatePaths) -> int:
 
 def _archive_maintain(args: argparse.Namespace, paths: StatePaths) -> int:
     client = StateClient(paths, timeout=args.timeout)
-    totals = {"deleted_saves": 0, "deleted_blobs": 0, "batches": 0}
+    keys = (
+        "deleted_saves",
+        "deleted_blobs",
+        "deleted_capture_refs",
+        "deleted_capture_blobs",
+    )
+    totals = {key: 0 for key in keys}
+    totals["batches"] = 0
     while True:
         response = client.archive_maintain()
-        totals["deleted_saves"] += response["deleted_saves"]
-        totals["deleted_blobs"] += response["deleted_blobs"]
+        for key in keys:
+            totals[key] += response[key]
         totals["batches"] += 1
-        if not args.all or not (response["deleted_saves"] or response["deleted_blobs"]):
+        if not args.all or not any(response[key] for key in keys):
             break
     _print({"ok": True, **totals})
+    return 0
+
+
+def _capture_ingest(args: argparse.Namespace, paths: StatePaths) -> int:
+    try:
+        response = StateClient(paths, timeout=args.timeout).capture_ingest(
+            args.capture_file,
+            server=args.server,
+            epoch=args.epoch,
+            pane_spec=args.pane_spec,
+            pane_uuid=args.pane_uuid,
+            reason=args.reason,
+        )
+        status = response["status"]
+    except (OwnerUnavailable, RuntimeError):
+        spool_capture(
+            paths.capture_spool,
+            args.capture_file,
+            server=args.server,
+            epoch=args.epoch,
+            pane_spec=args.pane_spec,
+            pane_uuid=args.pane_uuid,
+            reason=args.reason,
+        )
+        response = {"ok": True, "status": "spooled"}
+        status = "spooled"
+    if args.result_only:
+        print(status)
+    else:
+        _print(response)
+    return 0
+
+
+def _capture_release(args: argparse.Namespace, paths: StatePaths) -> int:
+    _print(
+        StateClient(paths, timeout=args.timeout).capture_release(
+            server=args.server, epoch=args.epoch, pane_spec=args.pane_spec
+        )
+    )
     return 0
 
 
@@ -213,6 +260,26 @@ def build_parser() -> argparse.ArgumentParser:
     archive_maintain.add_argument("--all", action="store_true", help="run batches until no victims remain")
     archive_maintain.add_argument("--timeout", type=float, default=30.0)
 
+    capture_ingest = commands.add_parser(
+        "capture-ingest", help="hash and index one pane Capture"
+    )
+    capture_ingest.add_argument("capture_file", type=Path)
+    capture_ingest.add_argument("--server", required=True)
+    capture_ingest.add_argument("--epoch", required=True)
+    capture_ingest.add_argument("--pane-spec", required=True)
+    capture_ingest.add_argument("--pane-uuid")
+    capture_ingest.add_argument("--reason", required=True)
+    capture_ingest.add_argument("--result-only", action="store_true")
+    capture_ingest.add_argument("--timeout", type=float, default=5.0)
+
+    capture_release = commands.add_parser(
+        "capture-release", help="release a dead pane's current Capture"
+    )
+    capture_release.add_argument("--server", required=True)
+    capture_release.add_argument("--epoch", required=True)
+    capture_release.add_argument("--pane-spec", required=True)
+    capture_release.add_argument("--timeout", type=float, default=1.0)
+
     stop = commands.add_parser("stop", help="stop the running State Owner")
     stop.add_argument("--timeout", type=float, default=0.25)
     return parser
@@ -241,6 +308,10 @@ def main(argv: list[str] | None = None) -> int:
             return _archive_import(args, paths)
         if args.command == "archive-maintain":
             return _archive_maintain(args, paths)
+        if args.command == "capture-ingest":
+            return _capture_ingest(args, paths)
+        if args.command == "capture-release":
+            return _capture_release(args, paths)
         if args.command == "stop":
             return _stop(args, paths)
     except (OwnerUnavailable, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:

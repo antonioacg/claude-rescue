@@ -22,9 +22,9 @@
 #     visible (pane_active=1)       — VISIBLE_FLOOR_S    (default 5s)
 #     backgrounded                  — BACKGROUND_FLOOR_S (default 300s)
 #
-# Hash dedup: each capture's md5 is compared to .hash-<spec>. Identical →
-# skip the disk rewrite (existing pane-<spec> is still correct), only bump
-# .touch-<spec> so the floor advances.
+# Capture dedup: the State Owner hashes each candidate in-process. Identical
+# content advances .touch-<spec> without rewriting pane-<spec>; changed content
+# becomes a content-addressed Capture Blob plus the current compatibility file.
 #
 # Env knobs:
 #   CLAUDE_RESCUE_WATCHER_VISIBLE_FLOOR_S    (default 5)
@@ -153,14 +153,17 @@ prev_fields() {
   awk -F'\t' -v id="$pane_id" '$1==id{printf "%s\t%s\t%s\t%s", $4, $5, $6, $7; exit}' "$STATE_FILE"
 }
 
-# Capture one pane. Always touches .touch-<spec> (floor signal). Hash-checks
-# the new content against .hash-<spec>. Returns:
-#   0  content changed vs prior capture (prev hash existed and differed)
-#   1  content unchanged (prev hash existed and matched); pane-<spec> untouched
-#   2  capture failed (tmux call errored)
-#   3  first capture (no prev hash to compare); pane-<spec> created
+# Capture one pane. The State Owner hashes and indexes the temporary file,
+# returning whether content changed. The compatibility pane-<spec> file remains
+# for tmux-resurrect while save/restore is still adapted through that plugin.
+# Returns:
+#   0  content changed vs prior Capture
+#   1  content unchanged; pane-<spec> untouched
+#   2  capture failed
+#   3  first Capture for this pane in this Epoch
+#   4  State Owner unavailable; Capture spooled for replay
 capture_pane() {
-  local pane_id="$1" spec="$2"
+  local pane_id="$1" spec="$2" pane_uuid="$3" reason="$4" epoch="$5"
   local target="$OUTDIR/pane-$spec"
   local hash_file="$OUTDIR/.hash-$spec"
   local touch_file="$OUTDIR/.touch-$spec"
@@ -171,20 +174,50 @@ capture_pane() {
     return 2
   fi
 
-  : > "$touch_file"
+  local owner_result=""
+  if command -v claude-rescue-state >/dev/null 2>&1; then
+    owner_result="$(claude-rescue-state capture-ingest "$tmpfile" \
+      --server "$SERVER_NAME" --epoch "$epoch" --pane-spec "$spec" \
+      --pane-uuid "$pane_uuid" --reason "$reason" --result-only \
+      2>/dev/null || true)"
+  fi
 
+  case "$owner_result" in
+    unchanged)
+      rm -f "$tmpfile"
+      : > "$touch_file"
+      return 1
+      ;;
+    first)
+      mv -f "$tmpfile" "$target"
+      : > "$touch_file"
+      return 3
+      ;;
+    changed)
+      mv -f "$tmpfile" "$target"
+      : > "$touch_file"
+      return 0
+      ;;
+    spooled)
+      mv -f "$tmpfile" "$target"
+      : > "$touch_file"
+      return 4
+      ;;
+  esac
+
+  # Compatibility fallback for installations that have not linked the State
+  # Owner command yet. This disappears with the tmux-resurrect Adapter.
   local new_hash; new_hash="$(md5_of "$tmpfile")"
   local prev_hash; prev_hash="$(cat "$hash_file" 2>/dev/null || echo "")"
   if [ -n "$new_hash" ] && [ "$new_hash" = "$prev_hash" ]; then
     rm -f "$tmpfile"
+    : > "$touch_file"
     return 1
   fi
 
   mv -f "$tmpfile" "$target"
+  : > "$touch_file"
   [ -n "$new_hash" ] && printf '%s' "$new_hash" > "$hash_file"
-
-  # First capture (no prev hash) vs. real content change — caller needs to
-  # know to avoid false-positive "floor-caught" events on cold start.
   [ -z "$prev_hash" ] && return 3
   return 0
 }
@@ -197,6 +230,12 @@ floor_exceeded() {
   local mtime; mtime="$(stat -f '%m' "$touch_file" 2>/dev/null || echo 0)"
   local now; now="$(date +%s)"
   [ "$((now - mtime))" -ge "$floor" ]
+}
+
+enqueue_capture() {
+  local pane_id="$1" spec="$2" pane_uuid="$3" reason="$4" floor_only="$5"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$pane_id" "$spec" "$pane_uuid" "$reason" "$floor_only" >> "$queue"
 }
 
 while :; do
@@ -257,7 +296,7 @@ while :; do
   visible_pids=" $(tmux list-panes -aF '#{?pane_active,#{?window_active,#{?session_attached,#{pane_id} ,},},}' 2>/dev/null | tr -d '\n') "
 
   current="$(mktemp)"
-  queue="$(mktemp)"            # one line per queued pane: pane_id\tspec\twas_floor_only
+  queue="$(mktemp)"            # pane_id\tspec\tuuid\treason\twas_floor_only
   emit_seen="$(mktemp)"        # pane_ids that emitted any event this tick
 
   # Per-tick state snapshot. Fields: 1=pane_id 2=spec 3=uuid 4=cleaned_title
@@ -310,21 +349,21 @@ while :; do
         claude-rescue-log pane-created "$pane_id" 2>/dev/null &
         echo "$pane_id" >> "$emit_seen"
       fi
-      printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"
+      enqueue_capture "$pane_id" "$spec" "$uuid" created 0
       queued=1
     else
       if [ "$cleaned" != "$prev_cleaned" ] && [ -n "$cleaned" ]; then
         claude-rescue-log title-now "$pane_id" "$cleaned" 2>/dev/null &
         echo "$pane_id" >> "$emit_seen"
-        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+        [ "$queued" = 0 ] && { enqueue_capture "$pane_id" "$spec" "$uuid" title 0; queued=1; }
       fi
       if [ "$unseen" != "$prev_unseen" ]; then
         echo "$pane_id" >> "$emit_seen"
-        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+        [ "$queued" = 0 ] && { enqueue_capture "$pane_id" "$spec" "$uuid" activity 0; queued=1; }
       fi
       if [ "$active" != "$prev_active" ]; then
         # Active flip — no separate event log, but refresh the capture.
-        [ "$queued" = 0 ] && { printf '%s\t%s\t0\n' "$pane_id" "$spec" >> "$queue"; queued=1; }
+        [ "$queued" = 0 ] && { enqueue_capture "$pane_id" "$spec" "$uuid" visibility 0; queued=1; }
       fi
     fi
 
@@ -335,7 +374,7 @@ while :; do
         *)              floor="$BACKGROUND_FLOOR_S" ;;
       esac
       if floor_exceeded "$spec" "$floor"; then
-        printf '%s\t%s\t1\n' "$pane_id" "$spec" >> "$queue"
+        enqueue_capture "$pane_id" "$spec" "$uuid" floor 1
       fi
     fi
   done < "$current.raw"
@@ -348,6 +387,11 @@ while :; do
       { if (!($1 in seen)) print $1 "\t" $2 }
     ' "$STATE_FILE" | while IFS=$'\t' read -r dead_id dead_spec; do
       claude-rescue-log pane-died "$dead_id" 2>/dev/null &
+      if command -v claude-rescue-state >/dev/null 2>&1; then
+        claude-rescue-state capture-release --server "$SERVER_NAME" \
+          --epoch "${current_server_pid:-unknown}" --pane-spec "$dead_spec" \
+          >/dev/null 2>&1 || true
+      fi
       rm -f "$OUTDIR/pane-$dead_spec" "$OUTDIR/.hash-$dead_spec" "$OUTDIR/.touch-$dead_spec"
     done
   fi
@@ -355,11 +399,12 @@ while :; do
   # --- drain capture queue (rate-limited) ---
   if [ -s "$queue" ]; then
     drained=0
-    while IFS=$'\t' read -r q_pane_id q_spec q_floor_only; do
+    while IFS=$'\t' read -r q_pane_id q_spec q_uuid q_reason q_floor_only; do
       [ "$drained" -ge "$QUEUE_PER_TICK" ] && break
-      capture_pane "$q_pane_id" "$q_spec"; rc=$?
+      capture_pane "$q_pane_id" "$q_spec" "$q_uuid" "$q_reason" \
+        "${current_server_pid:-unknown}"; rc=$?
       # Only treat rc=0 (real content change with prior baseline) as a hole;
-      # rc=3 (first capture, no baseline) is expected on cold start.
+      # rc=3 (first Capture) and rc=4 (durably spooled) are expected.
       if [ "$rc" = 0 ] && [ "$q_floor_only" = "1" ]; then
         if ! grep -Fxq "$q_pane_id" "$emit_seen" 2>/dev/null; then
           printf '%s\tfloor-caught\t%s\t%s\n' \

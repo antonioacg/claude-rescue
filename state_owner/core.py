@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .archive import ArchiveIndex
+from .capture import CaptureIndex
 
 SCHEMA_VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -63,6 +64,10 @@ class StatePaths:
     @property
     def archive_spool(self) -> Path:
         return self.data_home / "state" / "archive-spool"
+
+    @property
+    def capture_spool(self) -> Path:
+        return self.data_home / "state" / "capture-spool"
 
     @property
     def socket(self) -> Path:
@@ -407,6 +412,38 @@ class StateClient:
     def archive_maintain(self) -> dict[str, Any]:
         return self._request({"operation": "archive_maintain"})
 
+    def capture_ingest(
+        self,
+        path: Path,
+        *,
+        server: str,
+        epoch: str,
+        pane_spec: str,
+        pane_uuid: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        return self._request(
+            {
+                "operation": "capture_ingest",
+                "path": str(path),
+                "server": server,
+                "epoch": epoch,
+                "pane_spec": pane_spec,
+                "pane_uuid": pane_uuid,
+                "reason": reason,
+            }
+        )
+
+    def capture_release(self, *, server: str, epoch: str, pane_spec: str) -> dict[str, Any]:
+        return self._request(
+            {
+                "operation": "capture_release",
+                "server": server,
+                "epoch": epoch,
+                "pane_spec": pane_spec,
+            }
+        )
+
     def control(self, command: str) -> dict[str, Any]:
         return self._request({"operation": "control", "command": command})
 
@@ -434,6 +471,7 @@ class StateOwner:
         self.paths = paths
         self.store = EventStore(paths.database)
         self.archive = ArchiveIndex(paths.database, paths.archive)
+        self.captures = CaptureIndex(paths.database, paths.data_home)
         self._listener: socket.socket | None = None
         self._lock_file: Any = None
         self._stop: threading.Event | None = None
@@ -486,6 +524,7 @@ class StateOwner:
     def _drain_spools(self, *, limit: int = 1000) -> None:
         drain_spool(self.store, self.paths.spool, limit=limit)
         self.archive.drain_spool(self.paths.archive_spool, limit=max(1, limit // 10))
+        self.captures.drain_spool(self.paths.capture_spool, limit=max(1, limit // 10))
 
     def _handle(self, connection: socket.socket) -> None:
         try:
@@ -518,6 +557,7 @@ class StateOwner:
                 "spooled": len(list(self.paths.spool.glob("*.json"))) if self.paths.spool.is_dir() else 0,
                 **self.store.status(),
                 **self.archive.status(),
+                **self.captures.status(),
             }
         if operation == "events":
             after = request.get("after", 0)
@@ -535,7 +575,38 @@ class StateOwner:
         if operation == "archive_import":
             return {"ok": True, **self.archive.import_existing()}
         if operation == "archive_maintain":
-            return {"ok": True, **self.archive.maintain()}
+            return {"ok": True, **self.archive.maintain(), **self.captures.maintain()}
+        if operation == "capture_ingest":
+            required = ("path", "server", "epoch", "pane_spec", "reason")
+            values = {name: request.get(name) for name in required}
+            if any(not isinstance(value, str) or not value for value in values.values()):
+                raise ValueError("capture path, server, epoch, pane_spec, and reason are required")
+            pane_uuid = request.get("pane_uuid")
+            if pane_uuid is not None and not isinstance(pane_uuid, str):
+                raise ValueError("pane_uuid must be a string or null")
+            captured = self.captures.ingest(
+                Path(values["path"]),
+                server=values["server"],
+                epoch=values["epoch"],
+                pane_spec=values["pane_spec"],
+                pane_uuid=pane_uuid,
+                reason=values["reason"],
+            )
+            maintained = self.captures.maintain_if_due()
+            return {"ok": True, **captured, "maintenance": maintained}
+        if operation == "capture_release":
+            required = ("server", "epoch", "pane_spec")
+            values = {name: request.get(name) for name in required}
+            if any(not isinstance(value, str) or not value for value in values.values()):
+                raise ValueError("capture server, epoch, and pane_spec are required")
+            return {
+                "ok": True,
+                "released": self.captures.release_current(
+                    server=values["server"],
+                    epoch=values["epoch"],
+                    pane_spec=values["pane_spec"],
+                ),
+            }
         if operation == "control":
             command = request.get("command")
             if command != "shutdown":
@@ -555,6 +626,7 @@ class StateOwner:
             self._listener = None
         if owned_socket:
             self.paths.socket.unlink(missing_ok=True)
+        self.captures.close()
         self.archive.close()
         self.store.close()
         if self._lock_file is not None:

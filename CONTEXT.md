@@ -74,6 +74,13 @@ or a file, add it here.
   session_id, cwd — *last-active*, not launch — pids, ts). Access via
   `capture_txt_path` / `capture_meta_path` / `capture_meta_field`
   (lib/common.sh), same rule as the hibernation marker.
+- **Capture Blob** — content-addressed watcher output under
+  `$DATA/captures/blobs/<sha256>.txt`, written by the State Owner. Identical
+  pane content is stored once even when observed repeatedly or across Epochs.
+- **Capture Reference** — a semantic historical link from a Pane UUID and
+  Epoch to a Capture Blob (title/activity/visibility/create). Floor polling
+  updates the current Capture but does not create history. References use
+  dense recent and hourly older retention; current Captures are protected.
 - **Paint / the peek** — replaying the capture into a pane at the shell
   (`claude-rescue print`) so the user can see what the session was without
   resuming it. Needed because claude runs on the terminal's alternate

@@ -647,6 +647,8 @@ S16_ARCHIVE_DIR="$HOME_DIR/archive-test"
 S16_SAVES="$S16_ARCHIVE_DIR/saves"
 S16_BLOBS="$S16_ARCHIVE_DIR/blobs"
 S16_RD=$(mktemp -d)
+# Exercise the compatibility Adapter independently of the indexed path.
+export CLAUDE_RESCUE_LEGACY_ARCHIVE=1
 
 # (a) First save with pane_contents A: archives one save + one blob.
 S16_STATE_1="$S16_RD/tmux_resurrect_20260521T000001.txt"
@@ -791,6 +793,7 @@ assert "scenario 16h: concurrent maintenance remains bounded" "yes" "$S16_CONCUR
 assert "scenario 16h: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
 
 rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
+unset CLAUDE_RESCUE_LEGACY_ARCHIVE
 
 # ---------------------------------------------------------------------------
 echo "[state-owner] durable event journal, spooling, and single-writer lifecycle"
@@ -802,6 +805,9 @@ assert "legacy window events mirror into History Events" "yes" "$S17_HISTORY_PRE
 S17_ARCHIVE_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.archive_saves // 0')
 [ "$S17_ARCHIVE_COUNT" -gt 0 ] && S17_ARCHIVE_INDEXED=yes || S17_ARCHIVE_INDEXED=no
 assert "recovery checkpoints are indexed by the State Owner" "yes" "$S17_ARCHIVE_INDEXED"
+S17_CAPTURE_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.capture_current // 0')
+[ "$S17_CAPTURE_COUNT" -gt 0 ] && S17_CAPTURES_INDEXED=yes || S17_CAPTURES_INDEXED=no
+assert "watcher Captures are indexed by the State Owner" "yes" "$S17_CAPTURES_INDEXED"
 S17_SESSION_STARTS=$(
   CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
     "$REPO/bin/claude-rescue-state" events --limit 1000 2>/dev/null \
