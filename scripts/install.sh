@@ -54,7 +54,7 @@ for src in "$REPO/bin/"*; do
     echo "  [dry-run] ln -s $src $dst"
   elif confirm "  create $dst → $src?"; then
     ln -s "$src" "$dst"
-    echo "    linked."
+    echo "    linked $name."
   else
     echo "    skipped."
   fi
