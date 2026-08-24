@@ -12,15 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from .archive import spool_archive_checkpoint
-from .core import (
-    CapturePublisher,
-    Event,
-    OwnerUnavailable,
-    Publisher,
-    StateClient,
-    StateOwner,
-    StatePaths,
-)
+from .client import CapturePublisher, EventPublisher, OwnerUnavailable, StateClient
+from .core import StateOwner
+from .events import Event
+from .paths import StatePaths
 
 
 def _json_object(value: str) -> dict[str, Any]:
@@ -49,7 +44,7 @@ def _publish(args: argparse.Namespace, paths: StatePaths) -> int:
         event_id=args.event_id,
         occurred_at=args.occurred_at,
     )
-    _print(Publisher(paths, timeout=args.timeout).publish(event))
+    _print(EventPublisher(paths, timeout=args.timeout).publish(event))
     return 0
 
 
@@ -72,7 +67,7 @@ def _publish_window_event(args: argparse.Namespace, paths: StatePaths) -> int:
         occurred_at=occurred_at,
         payload={"window_uuid": args.window_uuid, "event": legacy},
     )
-    _print(Publisher(paths, timeout=args.timeout).publish(event))
+    _print(EventPublisher(paths, timeout=args.timeout).publish(event))
     return 0
 
 

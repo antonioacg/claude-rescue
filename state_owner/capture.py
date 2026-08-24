@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,8 +71,8 @@ class CaptureIndex:
                     capture_hash TEXT PRIMARY KEY,
                     blob_path TEXT NOT NULL,
                     size_bytes INTEGER NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    last_seen_at INTEGER NOT NULL
+                    created_at REAL NOT NULL,
+                    last_seen_at REAL NOT NULL
                 )
                 """
             )
@@ -82,7 +84,7 @@ class CaptureIndex:
                     pane_spec TEXT NOT NULL,
                     pane_uuid TEXT,
                     capture_hash TEXT NOT NULL,
-                    observed_at INTEGER NOT NULL,
+                    observed_at REAL NOT NULL,
                     PRIMARY KEY(server, epoch, pane_spec)
                 )
                 """
@@ -97,7 +99,7 @@ class CaptureIndex:
                     pane_uuid TEXT,
                     capture_hash TEXT NOT NULL,
                     reason TEXT NOT NULL,
-                    captured_at INTEGER NOT NULL
+                    captured_at REAL NOT NULL
                 )
                 """
             )
@@ -116,6 +118,37 @@ class CaptureIndex:
                 """
             )
 
+    def _capture_state(
+        self,
+        *,
+        server: str,
+        epoch: str,
+        pane_spec: str,
+        observed_at: float,
+    ) -> tuple[bool, Any]:
+        latest = self._connection.execute(
+            """
+            SELECT epoch, observed_at FROM capture_current
+            WHERE server = ?
+            ORDER BY observed_at DESC LIMIT 1
+            """,
+            (server,),
+        ).fetchone()
+        current = self._connection.execute(
+            """
+            SELECT capture_hash, observed_at FROM capture_current
+            WHERE server = ? AND epoch = ? AND pane_spec = ?
+            """,
+            (server, epoch, pane_spec),
+        ).fetchone()
+        stale_epoch = (
+            latest is not None
+            and latest["epoch"] != epoch
+            and observed_at < latest["observed_at"]
+        )
+        stale_current = current is not None and observed_at < current["observed_at"]
+        return stale_epoch or stale_current, current
+
     def ingest(
         self,
         source: Path,
@@ -125,7 +158,7 @@ class CaptureIndex:
         pane_spec: str,
         pane_uuid: str | None,
         reason: str,
-        observed_at: int | None = None,
+        observed_at: float | None = None,
     ) -> dict[str, Any]:
         if not source.is_file():
             raise ValueError(f"Capture does not exist: {source}")
@@ -133,27 +166,32 @@ class CaptureIndex:
             raise ValueError("server, epoch, pane_spec, and reason are required")
         if pane_uuid == "-":
             pane_uuid = None
-        observed_at = _now() if observed_at is None else observed_at
+        observed_at = _observation_time(observed_at)
 
         with self._lock:
-            latest = self._connection.execute(
-                """
-                SELECT epoch, observed_at FROM capture_current
-                WHERE server = ?
-                ORDER BY observed_at DESC LIMIT 1
-                """,
-                (server,),
-            ).fetchone()
-        if (
-            latest is not None
-            and latest["epoch"] != epoch
-            and observed_at < latest["observed_at"]
-        ):
+            stale, _ = self._capture_state(
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+                observed_at=observed_at,
+            )
+        if stale:
             return {"status": "stale", "capture_hash": None}
 
         capture_hash = sha256_file(source)
 
         with self._lock, self._connection:
+            # Re-check after hashing: another caller may have advanced current
+            # state while the source file was being read.
+            stale, current = self._capture_state(
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+                observed_at=observed_at,
+            )
+            if stale:
+                return {"status": "stale", "capture_hash": None}
+
             # A tmux pane spec can be recycled after a server restart. Once the
             # new Epoch produces its first Capture, old current pointers stop
             # protecting stale blobs from retention.
@@ -161,21 +199,13 @@ class CaptureIndex:
                 "DELETE FROM capture_current WHERE server = ? AND epoch <> ?",
                 (server, epoch),
             )
-            current = self._connection.execute(
-                """
-                SELECT capture_hash FROM capture_current
-                WHERE server = ? AND epoch = ? AND pane_spec = ?
-                """,
-                (server, epoch, pane_spec),
-            ).fetchone()
-        first = current is None
-        changed = first or current["capture_hash"] != capture_hash
+            first = current is None
+            changed = first or current["capture_hash"] != capture_hash
 
-        if changed:
-            blob = self.blobs_dir / f"{capture_hash}.txt"
-            if not blob.exists():
-                atomic_copy(source, blob)
-            with self._lock, self._connection:
+            if changed:
+                blob = self.blobs_dir / f"{capture_hash}.txt"
+                if not blob.exists():
+                    atomic_copy(source, blob)
                 self._connection.execute(
                     """
                     INSERT INTO capture_blobs (
@@ -207,8 +237,7 @@ class CaptureIndex:
                         """,
                         (server, epoch, pane_spec, pane_uuid, capture_hash, reason, observed_at),
                     )
-        else:
-            with self._lock, self._connection:
+            else:
                 self._connection.execute(
                     """
                     UPDATE capture_current SET pane_uuid = ?, observed_at = ?
@@ -256,6 +285,7 @@ class CaptureIndex:
                         server=manifest["server"],
                         epoch=manifest["epoch"],
                         pane_spec=manifest["pane_spec"],
+                        observed_at=manifest["observed_at"],
                     )
                 else:
                     raise ValueError(f"unknown Capture spool operation: {operation}")
@@ -270,14 +300,23 @@ class CaptureIndex:
             result["committed"] += 1
         return result
 
-    def release_current(self, *, server: str, epoch: str, pane_spec: str) -> bool:
+    def release_current(
+        self,
+        *,
+        server: str,
+        epoch: str,
+        pane_spec: str,
+        observed_at: float | None = None,
+    ) -> bool:
+        observed_at = _observation_time(observed_at)
         with self._lock, self._connection:
             cursor = self._connection.execute(
                 """
                 DELETE FROM capture_current
                 WHERE server = ? AND epoch = ? AND pane_spec = ?
+                  AND observed_at <= ?
                 """,
-                (server, epoch, pane_spec),
+                (server, epoch, pane_spec, observed_at),
             )
         return cursor.rowcount == 1
 
@@ -404,11 +443,11 @@ def spool_capture(
     pane_spec: str,
     pane_uuid: str | None,
     reason: str,
-    observed_at: int | None = None,
+    observed_at: float | None = None,
 ) -> Path:
     if not source.is_file():
         raise ValueError(f"Capture does not exist: {source}")
-    observed_at = _now() if observed_at is None else observed_at
+    observed_at = _observation_time(observed_at)
     spool_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(spool_dir, 0o700)
     identity = uuid.uuid4().hex
@@ -441,11 +480,11 @@ def spool_capture_release(
     server: str,
     epoch: str,
     pane_spec: str,
-    observed_at: int | None = None,
+    observed_at: float | None = None,
 ) -> Path:
     if not server or not epoch or not pane_spec:
         raise ValueError("server, epoch, and pane_spec are required")
-    observed_at = _now() if observed_at is None else observed_at
+    observed_at = _observation_time(observed_at)
     spool_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(spool_dir, 0o700)
     identity = uuid.uuid4().hex
@@ -469,17 +508,30 @@ def spool_capture_release(
     return destination
 
 
-def _capture_spool_order(entry: Path) -> tuple[int, int, str]:
+def _capture_spool_order(entry: Path) -> tuple[float, int, str]:
     try:
         modified_ns = entry.stat().st_mtime_ns
     except OSError:
         modified_ns = 0
     try:
         manifest = json.loads((entry / "manifest.json").read_text())
-        observed_at = int(manifest.get("observed_at", 0))
+        observed_at = float(manifest.get("observed_at", 0))
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         observed_at = modified_ns // 1_000_000_000
     return observed_at, modified_ns, entry.name
+
+
+def _observation_time(value: float | None) -> float:
+    if value is None:
+        return time.time()
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("observed_at must be a non-negative number")
+    return float(value)
 
 
 def _now() -> int:

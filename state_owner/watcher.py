@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-import re
 import shutil
 import signal
 import socket
@@ -13,13 +13,21 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, IO, Mapping
 
-from .core import CapturePublisher, OwnerUnavailable, StateClient, StatePaths
+from .client import CapturePublisher, OwnerUnavailable, StateClient
+from .paths import StatePaths
 from .storage import atomic_write
+from .watcher_model import (
+    CaptureRequest,
+    PaneState,
+    default_cleaned_title,
+    plan_tick,
+)
 
 _FIELD_SEPARATOR = "\x1f"
 _TMUX_FIELDS = (
+    "#{pid}",
     "#{pane_id}",
     "#{session_name}:#{window_index}.#{pane_index}",
     "#{@claude-pane-id}",
@@ -33,7 +41,6 @@ _TMUX_FIELDS = (
     "#{session_attached}",
 )
 _TMUX_FORMAT = _FIELD_SEPARATOR.join(_TMUX_FIELDS)
-_LEADING_STATUS = re.compile(r"^[^\x20-\x7e]+ *")
 _STATE_VERSION = 1
 
 
@@ -90,157 +97,130 @@ class WatcherConfig:
         )
 
 
-@dataclass(frozen=True)
-class PaneState:
-    pane_id: str
-    pane_spec: str
-    pane_uuid: str
-    window_uuid: str
-    window_name: str
-    command: str
-    raw_title: str
-    unseen: str
-    active: bool
-    visible: bool
-    cleaned_title: str
-
-    @property
-    def raw_key(self) -> tuple[str, str, str]:
-        return self.window_name, self.command, self.raw_title
-
-    def to_mapping(self) -> dict[str, object]:
-        return {
-            "pane_id": self.pane_id,
-            "pane_spec": self.pane_spec,
-            "pane_uuid": self.pane_uuid,
-            "window_uuid": self.window_uuid,
-            "window_name": self.window_name,
-            "command": self.command,
-            "raw_title": self.raw_title,
-            "unseen": self.unseen,
-            "active": self.active,
-            "visible": self.visible,
-            "cleaned_title": self.cleaned_title,
-        }
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> "PaneState":
-        strings = (
-            "pane_id",
-            "pane_spec",
-            "pane_uuid",
-            "window_uuid",
-            "window_name",
-            "command",
-            "raw_title",
-            "unseen",
-            "cleaned_title",
-        )
-        if any(not isinstance(value.get(name), str) for name in strings):
-            raise ValueError("invalid watcher pane state")
-        active = value.get("active")
-        visible = value.get("visible")
-        if not isinstance(active, bool) or not isinstance(visible, bool):
-            raise ValueError("invalid watcher pane visibility state")
-        return cls(
-            pane_id=str(value["pane_id"]),
-            pane_spec=str(value["pane_spec"]),
-            pane_uuid=str(value["pane_uuid"]),
-            window_uuid=str(value["window_uuid"]),
-            window_name=str(value["window_name"]),
-            command=str(value["command"]),
-            raw_title=str(value["raw_title"]),
-            unseen=str(value["unseen"]),
-            active=active,
-            visible=visible,
-            cleaned_title=str(value["cleaned_title"]),
-        )
-
-
-@dataclass(frozen=True)
-class CaptureRequest:
-    pane: PaneState
-    reason: str
-    floor_only: bool
-
-
-@dataclass(frozen=True)
-class TickPlan:
-    created: tuple[PaneState, ...]
-    titles: tuple[PaneState, ...]
-    died: tuple[PaneState, ...]
-    captures: tuple[CaptureRequest, ...]
-
-
-def default_cleaned_title(
-    window_name: str,
-    command: str,
-    pane_title: str,
-    host_short: str,
-) -> str:
-    if window_name.startswith("[tmux]"):
-        window_name = command
-
-    custom = window_name if window_name != command else ""
-    meaningful_title = bool(pane_title) and pane_title != host_short
-    if command in {"nvim", "claude"}:
-        if meaningful_title:
-            sequence = (
-                _LEADING_STATUS.sub("", pane_title) if command == "claude" else pane_title
-            )
-            base = f"{sequence} - {command}"
-        else:
-            base = command
-    elif meaningful_title:
-        base = f"{command} - {pane_title}"
-    else:
-        base = command
-
-    return f"{custom}: {base}" if custom else base
-
-
-def plan_tick(
-    previous: Mapping[str, PaneState],
-    current: Mapping[str, PaneState],
+def parse_tmux_snapshot(
+    output: str,
     *,
-    first_tick: bool,
-    now: float,
-    last_captured: Mapping[str, float],
-    visible_floor_seconds: int,
-    background_floor_seconds: int,
-) -> TickPlan:
-    created: list[PaneState] = []
-    titles: list[PaneState] = []
-    captures: list[CaptureRequest] = []
-
-    for pane in current.values():
-        prior = previous.get(pane.pane_id)
-        request: CaptureRequest | None = None
-        if prior is None:
-            if not first_tick:
-                created.append(pane)
-            request = CaptureRequest(pane, "created", False)
-        else:
-            if pane.cleaned_title != prior.cleaned_title:
-                titles.append(pane)
-                request = CaptureRequest(pane, "title", False)
-            elif pane.unseen != prior.unseen:
-                request = CaptureRequest(pane, "activity", False)
-            elif pane.active != prior.active:
-                request = CaptureRequest(pane, "visibility", False)
-
-        if request is None:
-            floor = (
-                visible_floor_seconds if pane.visible else background_floor_seconds
+    expected_epoch: str,
+    previous: Mapping[str, PaneState],
+    clean_title: Callable[[str, str, str], str],
+) -> dict[str, PaneState]:
+    panes: dict[str, PaneState] = {}
+    for line in output.splitlines():
+        fields = line.split(_FIELD_SEPARATOR)
+        if len(fields) != len(_TMUX_FIELDS):
+            raise ValueError(f"malformed tmux pane row with {len(fields)} fields")
+        (
+            epoch,
+            pane_id,
+            pane_spec,
+            pane_uuid,
+            window_uuid,
+            window_name,
+            command,
+            raw_title,
+            unseen,
+            active,
+            window_active,
+            session_attached,
+        ) = fields
+        if epoch != expected_epoch:
+            raise TmuxUnavailable(
+                f"tmux server Epoch changed from {expected_epoch} to {epoch}"
             )
-            last = last_captured.get(pane.pane_spec)
-            if last is None or now - last >= floor:
-                request = CaptureRequest(pane, "floor", True)
-        if request is not None:
-            captures.append(request)
+        prior = previous.get(pane_id)
+        raw_key = (window_name, command, raw_title)
+        cleaned = (
+            prior.cleaned_title
+            if prior is not None and prior.raw_key == raw_key
+            else clean_title(window_name, command, raw_title)
+        )
+        panes[pane_id] = PaneState(
+            pane_id=pane_id,
+            pane_spec=pane_spec,
+            pane_uuid=pane_uuid,
+            window_uuid=window_uuid,
+            window_name=window_name,
+            command=command,
+            raw_title=raw_title,
+            unseen=unseen,
+            active=active == "1",
+            visible=(active == "1" and window_active == "1" and session_attached != "0"),
+            cleaned_title=cleaned,
+        )
+    return panes
 
-    died = tuple(pane for pane_id, pane in previous.items() if pane_id not in current)
-    return TickPlan(tuple(created), tuple(titles), died, tuple(captures))
+
+class WatcherLease:
+    """Hold the per-server watcher claim for the process lifetime."""
+
+    def __init__(
+        self,
+        lock_path: Path,
+        pid_path: Path,
+        *,
+        expected_commands: tuple[str, ...],
+    ):
+        self.lock_path = lock_path
+        self.pid_path = pid_path
+        self.expected_commands = expected_commands
+        self._lock_file: IO[str] | None = None
+
+    @staticmethod
+    def _pid_command_contains(pid: int, expected: str) -> bool:
+        try:
+            os.kill(pid, 0)
+        except (OSError, ValueError):
+            return False
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0 and expected in result.stdout
+
+    def acquire(self) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_file = self.lock_path.open("a+")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock_file.close()
+            return False
+
+        try:
+            other_pid = int(self.pid_path.read_text().strip())
+        except (OSError, ValueError):
+            other_pid = 0
+        if other_pid and other_pid != os.getpid() and any(
+            self._pid_command_contains(other_pid, expected)
+            for expected in self.expected_commands
+        ):
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            return False
+
+        try:
+            atomic_write(self.pid_path, f"{os.getpid()}\n".encode())
+        except Exception:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+            raise
+        self._lock_file = lock_file
+        return True
+
+    def release(self) -> None:
+        try:
+            owner = int(self.pid_path.read_text().strip())
+        except (OSError, ValueError):
+            owner = 0
+        if owner == os.getpid():
+            self.pid_path.unlink(missing_ok=True)
+        if self._lock_file is not None:
+            fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            self._lock_file.close()
+            self._lock_file = None
 
 
 class Watcher:
@@ -261,6 +241,14 @@ class Watcher:
         self.state_file = self.outdir / ".state"
         self.server_pid_file = self.outdir / ".server-pid"
         self.pid_file = paths.data_home / f"watcher-{self.server_name}.pid"
+        self.lease = WatcherLease(
+            paths.cache_home / f"watcher-{self.server_name}.lock",
+            self.pid_file,
+            expected_commands=(
+                f"{repository}/bin/claude-rescue-state watch",
+                str(repository / "bin/claude-rescue-watcher"),
+            ),
+        )
         self.audit_file = paths.data_home / "watcher-audit.log"
         self.error_file = paths.cache_home / f"watcher-{self.server_name}.log"
         self.capture_publisher = CapturePublisher(paths)
@@ -356,41 +344,6 @@ class Watcher:
                 pass
         return captured
 
-    def _pid_command_contains(self, pid: int, expected: str) -> bool:
-        try:
-            os.kill(pid, 0)
-        except (OSError, ValueError):
-            return False
-        result = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(pid)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-        )
-        return result.returncode == 0 and expected in result.stdout
-
-    def _claim_pid(self) -> bool:
-        try:
-            other_pid = int(self.pid_file.read_text().strip())
-        except (OSError, ValueError):
-            other_pid = 0
-        if other_pid and other_pid != os.getpid():
-            if self._pid_command_contains(other_pid, "claude-rescue-state watch"):
-                return False
-            if self._pid_command_contains(other_pid, str(self.repository / "bin/claude-rescue-watcher")):
-                return False
-        atomic_write(self.pid_file, f"{os.getpid()}\n".encode())
-        return True
-
-    def _release_pid(self) -> None:
-        try:
-            owner = int(self.pid_file.read_text().strip())
-        except (OSError, ValueError):
-            return
-        if owner == os.getpid():
-            self.pid_file.unlink(missing_ok=True)
-
     def _cleaned_title(
         self,
         window_name: str,
@@ -425,46 +378,12 @@ class Watcher:
         if result.returncode != 0:
             raise TmuxUnavailable("tmux server is unavailable")
 
-        panes: dict[str, PaneState] = {}
-        for line in result.stdout.splitlines():
-            fields = line.split(_FIELD_SEPARATOR)
-            if len(fields) != len(_TMUX_FIELDS):
-                self._log_error(f"ignored malformed tmux pane row with {len(fields)} fields")
-                continue
-            (
-                pane_id,
-                pane_spec,
-                pane_uuid,
-                window_uuid,
-                window_name,
-                command,
-                raw_title,
-                unseen,
-                active,
-                window_active,
-                session_attached,
-            ) = fields
-            prior = self.previous.get(pane_id)
-            raw_key = (window_name, command, raw_title)
-            cleaned = (
-                prior.cleaned_title
-                if prior is not None and prior.raw_key == raw_key
-                else self._cleaned_title(window_name, command, raw_title)
-            )
-            panes[pane_id] = PaneState(
-                pane_id=pane_id,
-                pane_spec=pane_spec,
-                pane_uuid=pane_uuid,
-                window_uuid=window_uuid,
-                window_name=window_name,
-                command=command,
-                raw_title=raw_title,
-                unseen=unseen,
-                active=active == "1",
-                visible=(active == "1" and window_active == "1" and session_attached != "0"),
-                cleaned_title=cleaned,
-            )
-        return panes
+        return parse_tmux_snapshot(
+            result.stdout,
+            expected_epoch=self.epoch,
+            previous=self.previous,
+            clean_title=self._cleaned_title,
+        )
 
     def _emit_log(self, *arguments: str) -> None:
         self._reap_children()
@@ -550,14 +469,11 @@ class Watcher:
             pass
 
     def _release_dead(self, pane: PaneState) -> None:
-        try:
-            self.capture_publisher.release(
-                server=self.server_name,
-                epoch=self.epoch,
-                pane_spec=pane.pane_spec,
-            )
-        except OSError as error:
-            self._log_error(f"Capture release failed for {pane.pane_id}: {error}")
+        self.capture_publisher.release(
+            server=self.server_name,
+            epoch=self.epoch,
+            pane_spec=pane.pane_spec,
+        )
         for prefix in ("pane-", ".hash-", ".touch-"):
             (self.outdir / f"{prefix}{pane.pane_spec}").unlink(missing_ok=True)
         self.last_captured.pop(pane.pane_spec, None)
@@ -572,7 +488,11 @@ class Watcher:
                 continue
             if live != request.pane:
                 request = CaptureRequest(live, request.reason, request.floor_only)
-            status = self._capture(request)
+            try:
+                status = self._capture(request)
+            except Exception:
+                self.pending[pane_id] = request
+                raise
             if status is None:
                 self.pending[pane_id] = request
             elif status == "changed" and request.floor_only:
@@ -584,11 +504,13 @@ class Watcher:
     def _repair_owner_if_due(self, now: float) -> None:
         if now < self.next_owner_check:
             return
+        healthy = True
         try:
             self.owner_client.status()
         except (OwnerUnavailable, RuntimeError):
+            healthy = False
             try:
-                subprocess.run(
+                result = subprocess.run(
                     [str(self.repository / "bin/claude-rescue-state"), "ensure"],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -596,9 +518,11 @@ class Watcher:
                     timeout=5,
                     check=False,
                 )
+                healthy = result.returncode == 0
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        self.next_owner_check = now + self.config.owner_check_seconds
+        retry = self.config.owner_check_seconds if healthy else 1
+        self.next_owner_check = now + retry
 
     def _log_error(self, message: str) -> None:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -609,6 +533,7 @@ class Watcher:
             pass
 
     def tick(self) -> None:
+        self._reap_children()
         now = time.time()
         self._repair_owner_if_due(now)
         current = self._list_panes()
@@ -633,8 +558,8 @@ class Watcher:
                 pane.pane_uuid,
             )
         for pane in plan.died:
-            self._emit_log("pane-died", pane.pane_id, pane.window_uuid, pane.pane_uuid)
             self._release_dead(pane)
+            self._emit_log("pane-died", pane.pane_id, pane.window_uuid, pane.pane_uuid)
         for request in plan.captures:
             self._enqueue(request)
 
@@ -644,16 +569,16 @@ class Watcher:
         self.first_tick = False
 
     def run(self) -> int:
-        if not self._claim_pid():
+        if not self.lease.acquire():
             return 0
 
         def request_stop(_signum: int, _frame: object) -> None:
             self.stop_requested = True
 
-        signal.signal(signal.SIGHUP, request_stop)
-        signal.signal(signal.SIGINT, request_stop)
-        signal.signal(signal.SIGTERM, request_stop)
         try:
+            signal.signal(signal.SIGHUP, request_stop)
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
             while not self.stop_requested:
                 started = time.monotonic()
                 try:
@@ -666,6 +591,6 @@ class Watcher:
                 if delay > 0:
                     time.sleep(delay)
         finally:
-            self._release_pid()
+            self.lease.release()
             self._reap_children()
         return 0

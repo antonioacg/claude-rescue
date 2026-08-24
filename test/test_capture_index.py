@@ -21,7 +21,7 @@ class CaptureIndexTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def ingest(
-        self, *, content: str, reason: str = "title", epoch: str = "1", observed_at: int = 100
+        self, *, content: str, reason: str = "title", epoch: str = "1", observed_at: float = 100
     ):
         self.capture.write_text(content)
         return self.index.ingest(
@@ -71,6 +71,41 @@ class CaptureIndexTests(unittest.TestCase):
         self.assertEqual("stale", stale["status"])
         self.assertEqual("unchanged", unchanged["status"])
         self.assertEqual(1, self.index.status()["capture_current"])
+
+    def test_delayed_same_epoch_capture_cannot_replace_current_capture(self) -> None:
+        self.ingest(content="old", observed_at=100.1)
+        changed = self.ingest(content="new", observed_at=100.9)
+        stale = self.ingest(content="delayed", observed_at=100.5)
+        unchanged = self.ingest(content="new", observed_at=101.0)
+
+        self.assertEqual("changed", changed["status"])
+        self.assertEqual("stale", stale["status"])
+        self.assertEqual("unchanged", unchanged["status"])
+
+    def test_delayed_release_cannot_remove_a_newer_current_capture(self) -> None:
+        self.ingest(content="current", observed_at=100.9)
+
+        self.assertFalse(
+            self.index.release_current(
+                server="default",
+                epoch="1",
+                pane_spec="work:1.0",
+                observed_at=100.1,
+            )
+        )
+        self.assertEqual(1, self.index.status()["capture_current"])
+        self.assertTrue(
+            self.index.release_current(
+                server="default",
+                epoch="1",
+                pane_spec="work:1.0",
+                observed_at=201,
+            )
+        )
+
+    def test_non_finite_observation_time_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "observed_at"):
+            self.ingest(content="invalid", observed_at=float("nan"))
 
     def test_release_and_retention_delete_unreferenced_blobs_in_batches(self) -> None:
         self.index.close()
@@ -168,6 +203,20 @@ class CaptureIndexTests(unittest.TestCase):
         self.assertEqual({"committed": 1, "invalid": 0}, self.index.drain_spool(spool))
         self.assertFalse(duplicate.exists())
         self.assertEqual(0, self.index.status()["capture_current"])
+
+    def test_spooled_old_release_does_not_remove_newer_capture(self) -> None:
+        self.ingest(content="current", observed_at=200)
+        spool = self.root / "state" / "capture-spool"
+        spool_capture_release(
+            spool,
+            server="default",
+            epoch="1",
+            pane_spec="work:1.0",
+            observed_at=100,
+        )
+
+        self.assertEqual({"committed": 1, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertEqual(1, self.index.status()["capture_current"])
 
     def test_spooled_capture_survives_source_removal_and_replays(self) -> None:
         self.capture.write_text("offline")

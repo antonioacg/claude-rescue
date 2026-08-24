@@ -1,523 +1,28 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
-import json
+import math
 import os
-import re
 import socket
-import tempfile
 import threading
-import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
 from .archive import ArchiveIndex
-from .capture import CaptureIndex, spool_capture, spool_capture_release
-from .storage import atomic_write, open_database
-
-SCHEMA_VERSION = 1
-MAX_MESSAGE_BYTES = 1024 * 1024
-_EVENT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+from .capture import CaptureIndex
+from .events import Event, EventStore, drain_spool
+from .paths import StatePaths
+from .protocol import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, encode_message, read_message
 
 
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-
-
-@dataclass(frozen=True)
-class StatePaths:
-    data_home: Path
-    cache_home: Path
-
-    @classmethod
-    def from_environment(cls) -> "StatePaths":
-        home = Path.home()
-        data_home = Path(
-            os.environ.get(
-                "CLAUDE_RESCUE_DATA_HOME",
-                os.environ.get("XDG_DATA_HOME", str(home / ".local" / "share")) + "/claude-rescue",
-            )
-        )
-        cache_home = Path(
-            os.environ.get(
-                "CLAUDE_RESCUE_CACHE_HOME",
-                os.environ.get("XDG_CACHE_HOME", str(home / ".cache")) + "/claude-rescue",
-            )
-        )
-        return cls(data_home=data_home, cache_home=cache_home)
-
-    @property
-    def database(self) -> Path:
-        return self.data_home / "state" / "state.db"
-
-    @property
-    def spool(self) -> Path:
-        return self.data_home / "state" / "spool"
-
-    @property
-    def archive(self) -> Path:
-        return Path(os.environ.get("CLAUDE_RESCUE_ARCHIVE_DIR", self.data_home / "archive"))
-
-    @property
-    def archive_spool(self) -> Path:
-        return self.data_home / "state" / "archive-spool"
-
-    @property
-    def capture_spool(self) -> Path:
-        return self.data_home / "state" / "capture-spool"
-
-    @property
-    def socket(self) -> Path:
-        runtime_home = Path(os.environ.get("XDG_RUNTIME_DIR", self.cache_home))
-        candidate = runtime_home / "claude-rescue-state.sock"
-        # sockaddr_un.sun_path is only 104 bytes on macOS. A hashed path in the
-        # user's temporary directory keeps custom/test data homes usable.
-        if len(os.fsencode(candidate)) < 100:
-            return candidate
-        digest = hashlib.sha256(os.fsencode(self.cache_home)).hexdigest()[:12]
-        return Path(tempfile.gettempdir()) / f"claude-rescue-{os.getuid()}-{digest}.sock"
-
-    @property
-    def lock(self) -> Path:
-        return self.cache_home / "state-owner.lock"
-
-    @property
-    def log(self) -> Path:
-        return self.cache_home / "state-owner.log"
-
-
-@dataclass(frozen=True)
-class Event:
-    event_id: str
-    source: str
-    kind: str
-    occurred_at: str
-    epoch: str | None = None
-    pane_uuid: str | None = None
-    session_id: str | None = None
-    payload: Mapping[str, Any] = field(default_factory=dict)
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        source: str,
-        kind: str,
-        epoch: str | None = None,
-        pane_uuid: str | None = None,
-        session_id: str | None = None,
-        payload: Mapping[str, Any] | None = None,
-        event_id: str | None = None,
-        occurred_at: str | None = None,
-    ) -> "Event":
-        return cls.from_mapping(
-            {
-                "event_id": event_id or str(uuid.uuid4()),
-                "source": source,
-                "kind": kind,
-                "occurred_at": occurred_at or utc_now(),
-                "epoch": epoch,
-                "pane_uuid": pane_uuid,
-                "session_id": session_id,
-                "payload": dict(payload or {}),
-            }
-        )
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "Event":
-        event_id = value.get("event_id")
-        source = value.get("source")
-        kind = value.get("kind")
-        occurred_at = value.get("occurred_at")
-        payload = value.get("payload", {})
-
-        if not isinstance(event_id, str) or not _EVENT_ID.fullmatch(event_id):
-            raise ValueError("event_id must contain 1-128 letters, digits, dots, underscores, or dashes")
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError("source is required")
-        if not isinstance(kind, str) or not kind.strip():
-            raise ValueError("kind is required")
-        if not isinstance(occurred_at, str) or not occurred_at.strip():
-            raise ValueError("occurred_at is required")
-        if not isinstance(payload, Mapping):
-            raise ValueError("payload must be a JSON object")
-
-        optional: dict[str, str | None] = {}
-        for name in ("epoch", "pane_uuid", "session_id"):
-            item = value.get(name)
-            if item is not None and not isinstance(item, str):
-                raise ValueError(f"{name} must be a string or null")
-            optional[name] = item
-
-        event = cls(
-            event_id=event_id,
-            source=source,
-            kind=kind,
-            occurred_at=occurred_at,
-            epoch=optional["epoch"],
-            pane_uuid=optional["pane_uuid"],
-            session_id=optional["session_id"],
-            payload=dict(payload),
-        )
-        json.dumps(event.to_mapping(), separators=(",", ":"), sort_keys=True)
-        return event
-
-    def to_mapping(self) -> dict[str, Any]:
-        return {
-            "event_id": self.event_id,
-            "source": self.source,
-            "kind": self.kind,
-            "occurred_at": self.occurred_at,
-            "epoch": self.epoch,
-            "pane_uuid": self.pane_uuid,
-            "session_id": self.session_id,
-            "payload": dict(self.payload),
-        }
-
-
-class EventStore:
-    def __init__(self, path: Path):
-        self._connection = open_database(path)
-        self._lock = threading.Lock()
-        with self._connection:
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    occurred_at TEXT NOT NULL,
-                    received_at TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    epoch TEXT,
-                    pane_uuid TEXT,
-                    session_id TEXT,
-                    payload_json TEXT NOT NULL
-                )
-                """
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS events_pane_sequence ON events(pane_uuid, sequence)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS events_session_sequence ON events(session_id, sequence)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS events_kind_sequence ON events(kind, sequence)"
-            )
-            self._connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-
-    def append(self, event: Event) -> tuple[int, bool]:
-        payload = json.dumps(event.payload, separators=(",", ":"), sort_keys=True)
-        with self._lock, self._connection:
-            cursor = self._connection.execute(
-                """
-                INSERT OR IGNORE INTO events (
-                    event_id, occurred_at, received_at, source, kind,
-                    epoch, pane_uuid, session_id, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    event.event_id,
-                    event.occurred_at,
-                    utc_now(),
-                    event.source,
-                    event.kind,
-                    event.epoch,
-                    event.pane_uuid,
-                    event.session_id,
-                    payload,
-                ),
-            )
-            inserted = cursor.rowcount == 1
-            if inserted:
-                return int(cursor.lastrowid), True
-            row = self._connection.execute(
-                """
-                SELECT sequence, occurred_at, source, kind, epoch, pane_uuid,
-                       session_id, payload_json
-                FROM events WHERE event_id = ?
-                """,
-                (event.event_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("event insert was ignored without an existing event")
-            existing = (
-                row["occurred_at"],
-                row["source"],
-                row["kind"],
-                row["epoch"],
-                row["pane_uuid"],
-                row["session_id"],
-                row["payload_json"],
-            )
-            proposed = (
-                event.occurred_at,
-                event.source,
-                event.kind,
-                event.epoch,
-                event.pane_uuid,
-                event.session_id,
-                payload,
-            )
-            if existing != proposed:
-                raise ValueError(f"event_id {event.event_id} was reused with different content")
-            return int(row["sequence"]), False
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT COUNT(*) AS event_count, COALESCE(MAX(sequence), 0) AS latest_sequence FROM events"
-            ).fetchone()
-            return {
-                "schema_version": SCHEMA_VERSION,
-                "event_count": int(row["event_count"]),
-                "latest_sequence": int(row["latest_sequence"]),
-            }
-
-    def events(self, *, after: int = 0, limit: int = 100) -> list[dict[str, Any]]:
-        if after < 0:
-            raise ValueError("after must be non-negative")
-        if not 1 <= limit <= 1000:
-            raise ValueError("limit must be between 1 and 1000")
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT sequence, event_id, occurred_at, received_at, source, kind,
-                       epoch, pane_uuid, session_id, payload_json
-                FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?
-                """,
-                (after, limit),
-            ).fetchall()
-        return [
-            {
-                "sequence": int(row["sequence"]),
-                "event_id": row["event_id"],
-                "occurred_at": row["occurred_at"],
-                "received_at": row["received_at"],
-                "source": row["source"],
-                "kind": row["kind"],
-                "epoch": row["epoch"],
-                "pane_uuid": row["pane_uuid"],
-                "session_id": row["session_id"],
-                "payload": json.loads(row["payload_json"]),
-            }
-            for row in rows
-        ]
-
-    def close(self) -> None:
-        with self._lock:
-            self._connection.close()
-
-
-def spool_event(path: Path, event: Event) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
-    destination = path / f"{event.event_id}.json"
-    if destination.exists():
-        return destination
-
-    encoded = json.dumps(event.to_mapping(), separators=(",", ":"), sort_keys=True).encode() + b"\n"
-    atomic_write(destination, encoded)
-    return destination
-
-
-def _event_spool_order(item: Path) -> tuple[int, float, int, str]:
-    try:
-        modified_ns = item.stat().st_mtime_ns
-    except OSError:
-        modified_ns = 0
-    try:
-        event = Event.from_mapping(json.loads(item.read_text()))
-        parsed = datetime.fromisoformat(event.occurred_at.replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return 0, parsed.timestamp(), modified_ns, item.name
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        return 1, modified_ns / 1_000_000_000, modified_ns, item.name
-
-
-def drain_spool(store: EventStore, path: Path, *, limit: int = 1000) -> dict[str, int]:
-    result = {"committed": 0, "duplicates": 0, "invalid": 0}
-    if not path.is_dir():
-        return result
-
-    items = list(path.glob("*.json"))
-    items.sort(key=_event_spool_order)
-    for item in items[:limit]:
-        try:
-            event = Event.from_mapping(json.loads(item.read_text()))
-            _, inserted = store.append(event)
-        except (OSError, ValueError, json.JSONDecodeError, TypeError):
-            invalid = item.with_suffix(item.suffix + ".invalid")
-            os.replace(item, invalid)
-            result["invalid"] += 1
-            continue
-        item.unlink(missing_ok=True)
-        result["committed" if inserted else "duplicates"] += 1
-    return result
-
-
-class OwnerUnavailable(ConnectionError):
-    pass
-
-
-class StateClient:
-    def __init__(self, paths: StatePaths, *, timeout: float = 0.25):
-        self.paths = paths
-        self.timeout = timeout
-
-    def _request(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        encoded = json.dumps(request, separators=(",", ":"), sort_keys=True).encode() + b"\n"
-        if len(encoded) > MAX_MESSAGE_BYTES:
-            raise ValueError("request exceeds maximum size")
-
-        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        connection.settimeout(self.timeout)
-        try:
-            connection.connect(str(self.paths.socket))
-            connection.sendall(encoded)
-            response = _read_message(connection)
-        except (FileNotFoundError, ConnectionRefusedError, socket.timeout, OSError) as error:
-            raise OwnerUnavailable(str(error)) from error
-        finally:
-            connection.close()
-
-        if not response.get("ok"):
-            raise RuntimeError(str(response.get("error", "state owner request failed")))
-        return response
-
-    def publish(self, event: Event) -> dict[str, Any]:
-        return self._request({"operation": "publish", "event": event.to_mapping()})
-
-    def status(self) -> dict[str, Any]:
-        return self._request({"operation": "status"})
-
-    def events(self, *, after: int = 0, limit: int = 100) -> dict[str, Any]:
-        return self._request({"operation": "events", "after": after, "limit": limit})
-
-    def archive_ingest(self, path: Path) -> dict[str, Any]:
-        return self._request({"operation": "archive_ingest", "path": str(path)})
-
-    def archive_import(self) -> dict[str, Any]:
-        return self._request({"operation": "archive_import"})
-
-    def archive_maintain(self) -> dict[str, Any]:
-        return self._request({"operation": "archive_maintain"})
-
-    def capture_ingest(
-        self,
-        path: Path,
-        *,
-        server: str,
-        epoch: str,
-        pane_spec: str,
-        pane_uuid: str | None,
-        reason: str,
-    ) -> dict[str, Any]:
-        return self._request(
-            {
-                "operation": "capture_ingest",
-                "path": str(path),
-                "server": server,
-                "epoch": epoch,
-                "pane_spec": pane_spec,
-                "pane_uuid": pane_uuid,
-                "reason": reason,
-            }
-        )
-
-    def capture_release(self, *, server: str, epoch: str, pane_spec: str) -> dict[str, Any]:
-        return self._request(
-            {
-                "operation": "capture_release",
-                "server": server,
-                "epoch": epoch,
-                "pane_spec": pane_spec,
-            }
-        )
-
-    def control(self, command: str) -> dict[str, Any]:
-        return self._request({"operation": "control", "command": command})
-
-
-class Publisher:
-    def __init__(self, paths: StatePaths, *, timeout: float = 0.25):
-        self.paths = paths
-        self.client = StateClient(paths, timeout=timeout)
-
-    def publish(self, event: Event) -> dict[str, Any]:
-        try:
-            response = self.client.publish(event)
-            return {
-                "status": "committed",
-                "sequence": response["sequence"],
-                "inserted": response["inserted"],
-            }
-        except (OwnerUnavailable, RuntimeError):
-            destination = spool_event(self.paths.spool, event)
-            return {"status": "spooled", "path": str(destination)}
-
-
-class CapturePublisher:
-    """Publish Capture ownership changes with durable outage fallback."""
-
-    def __init__(self, paths: StatePaths, *, timeout: float = 5.0):
-        self.paths = paths
-        self.client = StateClient(paths, timeout=timeout)
-
-    def ingest(
-        self,
-        path: Path,
-        *,
-        server: str,
-        epoch: str,
-        pane_spec: str,
-        pane_uuid: str | None,
-        reason: str,
-    ) -> dict[str, Any]:
-        try:
-            return self.client.capture_ingest(
-                path,
-                server=server,
-                epoch=epoch,
-                pane_spec=pane_spec,
-                pane_uuid=pane_uuid,
-                reason=reason,
-            )
-        except (OwnerUnavailable, RuntimeError):
-            destination = spool_capture(
-                self.paths.capture_spool,
-                path,
-                server=server,
-                epoch=epoch,
-                pane_spec=pane_spec,
-                pane_uuid=pane_uuid,
-                reason=reason,
-            )
-            return {"ok": True, "status": "spooled", "path": str(destination)}
-
-    def release(self, *, server: str, epoch: str, pane_spec: str) -> dict[str, Any]:
-        try:
-            return self.client.capture_release(
-                server=server,
-                epoch=epoch,
-                pane_spec=pane_spec,
-            )
-        except (OwnerUnavailable, RuntimeError):
-            destination = spool_capture_release(
-                self.paths.capture_spool,
-                server=server,
-                epoch=epoch,
-                pane_spec=pane_spec,
-            )
-            return {"ok": True, "status": "spooled", "path": str(destination)}
+def observed_now() -> float:
+    return datetime.now(timezone.utc).timestamp()
 
 
 class StateOwner:
+    """Single writer for History Events, Recovery Checkpoints, and Captures."""
+
     def __init__(self, paths: StatePaths):
         self.paths = paths
         self.store = EventStore(paths.database)
@@ -557,9 +62,9 @@ class StateOwner:
     def serve(self, stop: threading.Event | None = None) -> None:
         stop = stop or threading.Event()
         self._stop = stop
-        self._open_listener()
-        self._drain_spools()
         try:
+            self._open_listener()
+            self._drain_spools()
             while not stop.is_set():
                 try:
                     connection, _ = self._listener.accept()
@@ -579,14 +84,19 @@ class StateOwner:
 
     def _handle(self, connection: socket.socket) -> None:
         try:
-            request = _read_message(connection)
+            request = read_message(connection, max_bytes=MAX_REQUEST_BYTES)
             response = self._dispatch(request)
         except Exception as error:
             response = {"ok": False, "error": str(error)}
         try:
-            connection.sendall(
-                json.dumps(response, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+            encoded = encode_message(response, max_bytes=MAX_RESPONSE_BYTES)
+        except ValueError:
+            encoded = encode_message(
+                {"ok": False, "error": "response exceeds maximum size"},
+                max_bytes=MAX_RESPONSE_BYTES,
             )
+        try:
+            connection.sendall(encoded)
         except OSError:
             # The client may have timed out and durably spooled the same event.
             # Keep serving; event-id deduplication removes the replay later.
@@ -643,6 +153,7 @@ class StateOwner:
             pane_uuid = request.get("pane_uuid")
             if pane_uuid is not None and not isinstance(pane_uuid, str):
                 raise ValueError("pane_uuid must be a string or null")
+            observed_at = _capture_observed_at(request)
             captured = self.captures.ingest(
                 Path(values["path"]),
                 server=values["server"],
@@ -650,6 +161,7 @@ class StateOwner:
                 pane_spec=values["pane_spec"],
                 pane_uuid=pane_uuid,
                 reason=values["reason"],
+                observed_at=observed_at,
             )
             maintained = self.captures.maintain_if_due()
             return {"ok": True, **captured, "maintenance": maintained}
@@ -664,6 +176,7 @@ class StateOwner:
                     server=values["server"],
                     epoch=values["epoch"],
                     pane_spec=values["pane_spec"],
+                    observed_at=_capture_observed_at(request),
                 ),
             }
         if operation == "control":
@@ -696,6 +209,18 @@ class StateOwner:
         self._closed = True
 
 
+def _capture_observed_at(request: Mapping[str, Any]) -> float:
+    observed_at = request.get("observed_at", observed_now())
+    if (
+        isinstance(observed_at, bool)
+        or not isinstance(observed_at, (int, float))
+        or not math.isfinite(observed_at)
+        or observed_at < 0
+    ):
+        raise ValueError("capture observed_at must be a non-negative number")
+    return float(observed_at)
+
+
 def _spool_directory_count(path: Path) -> int:
     if not path.is_dir():
         return 0
@@ -704,27 +229,3 @@ def _spool_directory_count(path: Path) -> int:
         for entry in path.iterdir()
         if entry.is_dir() and not entry.name.endswith(".invalid")
     )
-
-
-def _read_message(connection: socket.socket) -> dict[str, Any]:
-    chunks: list[bytes] = []
-    size = 0
-    while True:
-        chunk = connection.recv(min(65536, MAX_MESSAGE_BYTES + 1 - size))
-        if not chunk:
-            break
-        newline = chunk.find(b"\n")
-        if newline >= 0:
-            chunks.append(chunk[:newline])
-            break
-        chunks.append(chunk)
-        size += len(chunk)
-        if size > MAX_MESSAGE_BYTES:
-            raise ValueError("message exceeds maximum size")
-    raw = b"".join(chunks)
-    if not raw:
-        raise ValueError("empty request")
-    value = json.loads(raw)
-    if not isinstance(value, dict):
-        raise ValueError("request must be a JSON object")
-    return value

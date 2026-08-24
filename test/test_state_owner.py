@@ -77,6 +77,10 @@ class EventStoreTests(unittest.TestCase):
             self.assertEqual(1, store.status()["event_count"])
             store.close()
 
+    def test_event_payload_rejects_non_standard_nan(self) -> None:
+        with self.assertRaises(ValueError):
+            Event.create(source="test", kind="invalid", payload={"value": float("nan")})
+
     def test_events_are_returned_in_commit_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             store = EventStore(Path(temporary) / "state.db")
@@ -158,6 +162,19 @@ class StateOwnerTests(unittest.TestCase):
         response = StateClient(harness.paths).events()
         self.assertEqual("session.started", response["events"][0]["kind"])
         self.assertEqual({"cwd": "/tmp/work"}, response["events"][0]["payload"])
+
+    def test_query_response_can_exceed_the_request_size_limit(self) -> None:
+        harness = self.start_owner()
+        payload = "x" * 700_000
+        harness.owner.store.append(
+            Event.create(source="test", kind="large-1", payload={"value": payload})
+        )
+        harness.owner.store.append(
+            Event.create(source="test", kind="large-2", payload={"value": payload})
+        )
+
+        response = StateClient(harness.paths, timeout=2).events(limit=2)
+        self.assertEqual(["large-1", "large-2"], [event["kind"] for event in response["events"]])
 
     def test_client_disconnect_after_publish_does_not_stop_owner(self) -> None:
         harness = self.start_owner()

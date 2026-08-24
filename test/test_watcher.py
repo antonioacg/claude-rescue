@@ -1,9 +1,18 @@
+import json
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 
 from state_owner import CapturePublisher, StatePaths
-from state_owner.watcher import PaneState, default_cleaned_title, plan_tick
+from state_owner.watcher import (
+    TmuxUnavailable,
+    Watcher,
+    WatcherConfig,
+    WatcherLease,
+    parse_tmux_snapshot,
+)
+from state_owner.watcher_model import PaneState, default_cleaned_title, plan_tick
 
 
 def pane(
@@ -44,6 +53,71 @@ class TitleFormattingTests(unittest.TestCase):
             "nvim",
             default_cleaned_title("[tmux] copy mode", "nvim", "host", "host"),
         )
+
+
+class TmuxSnapshotTests(unittest.TestCase):
+    def row(self, *, epoch: str = "1") -> str:
+        return "\x1f".join(
+            (
+                epoch,
+                "%1",
+                "work:0.0",
+                "pane-1",
+                "window-1",
+                "claude",
+                "claude",
+                "✳ Working",
+                "0",
+                "1",
+                "1",
+                "1",
+            )
+        )
+
+    def test_snapshot_parses_one_consolidated_tmux_row(self) -> None:
+        panes = parse_tmux_snapshot(
+            self.row(),
+            expected_epoch="1",
+            previous={},
+            clean_title=lambda window, command, title: default_cleaned_title(
+                window, command, title, "host"
+            ),
+        )
+        self.assertEqual(["%1"], list(panes))
+        self.assertEqual("Working - claude", panes["%1"].cleaned_title)
+        self.assertTrue(panes["%1"].visible)
+
+    def test_snapshot_rejects_a_replaced_tmux_server_epoch(self) -> None:
+        with self.assertRaisesRegex(TmuxUnavailable, "Epoch changed"):
+            parse_tmux_snapshot(
+                self.row(epoch="2"),
+                expected_epoch="1",
+                previous={},
+                clean_title=lambda _window, _command, title: title,
+            )
+
+    def test_snapshot_rejects_malformed_rows_instead_of_inventing_deaths(self) -> None:
+        with self.assertRaisesRegex(ValueError, "malformed tmux pane row"):
+            parse_tmux_snapshot(
+                "too\x1ffew",
+                expected_epoch="1",
+                previous={},
+                clean_title=lambda _window, _command, title: title,
+            )
+
+
+class WatcherLeaseTests(unittest.TestCase):
+    def test_only_one_watcher_can_hold_a_server_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = WatcherLease(root / "watcher.lock", root / "watcher.pid", expected_commands=())
+            second = WatcherLease(root / "watcher.lock", root / "watcher.pid", expected_commands=())
+            try:
+                self.assertTrue(first.acquire())
+                self.assertFalse(second.acquire())
+            finally:
+                first.release()
+                second.release()
 
 
 class WatcherPlanningTests(unittest.TestCase):
@@ -99,6 +173,28 @@ class WatcherPlanningTests(unittest.TestCase):
         )
         self.assertEqual(["%1"], [item.pane.pane_id for item in plan.captures])
         self.assertTrue(plan.captures[0].floor_only)
+    def test_capture_failure_preserves_the_pending_request(self) -> None:
+        current = pane("%1")
+        request = plan_tick(
+            {},
+            {current.pane_id: current},
+            first_tick=True,
+            now=100,
+            last_captured={},
+            visible_floor_seconds=5,
+            background_floor_seconds=300,
+        ).captures[0]
+        watcher = object.__new__(Watcher)
+        watcher.pending = OrderedDict({current.pane_id: request})
+        watcher.config = WatcherConfig(queue_per_tick=1, pace_seconds=0)
+
+        def fail_capture(_request):
+            raise RuntimeError("capture failed")
+
+        watcher._capture = fail_capture
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            watcher._drain_captures({current.pane_id: current})
+        self.assertEqual(request, watcher.pending[current.pane_id])
 
 
 class CapturePublisherTests(unittest.TestCase):
@@ -117,16 +213,25 @@ class CapturePublisherTests(unittest.TestCase):
                 pane_spec="work:0.0",
                 pane_uuid="pane-1",
                 reason="title",
+                observed_at=123,
             )
             released = publisher.release(
                 server="default",
                 epoch="1",
                 pane_spec="work:0.0",
+                observed_at=124,
             )
 
             self.assertEqual("spooled", ingested["status"])
             self.assertEqual("spooled", released["status"])
-            self.assertEqual(2, len(list(paths.capture_spool.iterdir())))
+            manifests = [
+                json.loads((entry / "manifest.json").read_text())
+                for entry in paths.capture_spool.iterdir()
+            ]
+            self.assertEqual(
+                {"ingest": 123, "release": 124},
+                {manifest["operation"]: manifest["observed_at"] for manifest in manifests},
+            )
 
 
 if __name__ == "__main__":
