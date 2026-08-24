@@ -799,9 +799,19 @@ cmd_resurrect_save() {
   } > "$sidecar.tmp"
   mv "$sidecar.tmp" "$sidecar"
 
-  # 1b. Archive tier — hardlink saves + content-addressed pane_contents.
-  # Best-effort; archive failures must not block sidecar bookkeeping.
-  __rescue_archive_save "$state_file" || true
+  # 1b. Archive/history tier. New installs hand the completed checkpoint to
+  # the State Owner, which serializes indexing, content dedupe, and bounded
+  # retention. Its client durably spools the checkpoint if the owner is down.
+  # Keep the legacy path only for installations that have not linked the new
+  # command yet; once present, no save hook writes archive state directly.
+  if command -v claude-rescue-state >/dev/null 2>&1; then
+    if ! claude-rescue-state archive-ingest "$state_file" \
+      >/dev/null 2>>"$CLAUDE_RESCUE_CACHE_HOME/rescue-log.err"; then
+      log_err "resurrect-save: State Owner failed to ingest $state_file"
+    fi
+  else
+    __rescue_archive_save "$state_file" || true
+  fi
 
   # Title-diff and pane-died inference used to live here (snapshot-vs-prev-
   # snapshot diff against tmux_resurrect_*.txt files). Retired in favor of

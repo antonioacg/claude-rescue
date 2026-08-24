@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .archive import ArchiveIndex
+
 SCHEMA_VERSION = 1
 MAX_MESSAGE_BYTES = 1024 * 1024
 _EVENT_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -53,6 +55,14 @@ class StatePaths:
     @property
     def spool(self) -> Path:
         return self.data_home / "state" / "spool"
+
+    @property
+    def archive(self) -> Path:
+        return Path(os.environ.get("CLAUDE_RESCUE_ARCHIVE_DIR", self.data_home / "archive"))
+
+    @property
+    def archive_spool(self) -> Path:
+        return self.data_home / "state" / "archive-spool"
 
     @property
     def socket(self) -> Path:
@@ -388,6 +398,15 @@ class StateClient:
     def events(self, *, after: int = 0, limit: int = 100) -> dict[str, Any]:
         return self._request({"operation": "events", "after": after, "limit": limit})
 
+    def archive_ingest(self, path: Path) -> dict[str, Any]:
+        return self._request({"operation": "archive_ingest", "path": str(path)})
+
+    def archive_import(self) -> dict[str, Any]:
+        return self._request({"operation": "archive_import"})
+
+    def archive_maintain(self) -> dict[str, Any]:
+        return self._request({"operation": "archive_maintain"})
+
     def control(self, command: str) -> dict[str, Any]:
         return self._request({"operation": "control", "command": command})
 
@@ -414,6 +433,7 @@ class StateOwner:
     def __init__(self, paths: StatePaths):
         self.paths = paths
         self.store = EventStore(paths.database)
+        self.archive = ArchiveIndex(paths.database, paths.archive)
         self._listener: socket.socket | None = None
         self._lock_file: Any = None
         self._stop: threading.Event | None = None
@@ -449,19 +469,23 @@ class StateOwner:
         stop = stop or threading.Event()
         self._stop = stop
         self._open_listener()
-        drain_spool(self.store, self.paths.spool)
+        self._drain_spools()
         try:
             while not stop.is_set():
                 try:
                     connection, _ = self._listener.accept()
                 except socket.timeout:
-                    drain_spool(self.store, self.paths.spool, limit=100)
+                    self._drain_spools(limit=100)
                     continue
                 with connection:
                     self._handle(connection)
-                drain_spool(self.store, self.paths.spool, limit=100)
+                self._drain_spools(limit=100)
         finally:
             self.close()
+
+    def _drain_spools(self, *, limit: int = 1000) -> None:
+        drain_spool(self.store, self.paths.spool, limit=limit)
+        self.archive.drain_spool(self.paths.archive_spool, limit=max(1, limit // 10))
 
     def _handle(self, connection: socket.socket) -> None:
         try:
@@ -493,6 +517,7 @@ class StateOwner:
                 "socket": str(self.paths.socket),
                 "spooled": len(list(self.paths.spool.glob("*.json"))) if self.paths.spool.is_dir() else 0,
                 **self.store.status(),
+                **self.archive.status(),
             }
         if operation == "events":
             after = request.get("after", 0)
@@ -500,6 +525,17 @@ class StateOwner:
             if not isinstance(after, int) or not isinstance(limit, int):
                 raise ValueError("after and limit must be integers")
             return {"ok": True, "events": self.store.events(after=after, limit=limit)}
+        if operation == "archive_ingest":
+            path = request.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError("archive checkpoint path is required")
+            ingested = self.archive.ingest(Path(path))
+            maintained = self.archive.maintain_if_due()
+            return {"ok": True, **ingested, "maintenance": maintained}
+        if operation == "archive_import":
+            return {"ok": True, **self.archive.import_existing()}
+        if operation == "archive_maintain":
+            return {"ok": True, **self.archive.maintain()}
         if operation == "control":
             command = request.get("command")
             if command != "shutdown":
@@ -519,6 +555,7 @@ class StateOwner:
             self._listener = None
         if owned_socket:
             self.paths.socket.unlink(missing_ok=True)
+        self.archive.close()
         self.store.close()
         if self._lock_file is not None:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)

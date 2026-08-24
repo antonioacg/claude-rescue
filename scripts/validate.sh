@@ -799,6 +799,9 @@ S17_STATUS=$(CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME
 S17_HISTORY_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.event_count // 0')
 [ "$S17_HISTORY_COUNT" -gt 0 ] && S17_HISTORY_PRESENT=yes || S17_HISTORY_PRESENT=no
 assert "legacy window events mirror into History Events" "yes" "$S17_HISTORY_PRESENT"
+S17_ARCHIVE_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.archive_saves // 0')
+[ "$S17_ARCHIVE_COUNT" -gt 0 ] && S17_ARCHIVE_INDEXED=yes || S17_ARCHIVE_INDEXED=no
+assert "recovery checkpoints are indexed by the State Owner" "yes" "$S17_ARCHIVE_INDEXED"
 S17_SESSION_STARTS=$(
   CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
     "$REPO/bin/claude-rescue-state" events --limit 1000 2>/dev/null \
@@ -809,7 +812,7 @@ assert "session_start is queryable from the History Event journal" "yes" "$S17_S
 
 S17_OUTPUT="$HOME_DIR/state-owner-tests.log"
 if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s "$REPO/test" -p 'test_state_owner.py' >"$S17_OUTPUT" 2>&1; then
+  -s "$REPO/test" -p 'test_*.py' >"$S17_OUTPUT" 2>&1; then
   S17_RESULT=pass
 else
   S17_RESULT=fail

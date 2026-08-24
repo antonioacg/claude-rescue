@@ -34,6 +34,13 @@ or a file, add it here.
   waiting for the State Owner. The publisher writes here when the socket is
   unavailable; replay is at-least-once and event-id deduplication makes it
   effectively exactly-once in the journal.
+- **Recovery Checkpoint** — a completed tmux-resurrect save retained for
+  crash recovery, not used as the History Event model. The State Owner indexes
+  checkpoints and applies bounded tiered retention: dense recent recovery,
+  progressively coarser older recovery, then expiry.
+- **Archive spool** — `$DATA/state/archive-spool/`: hardlinked checkpoint
+  inputs waiting for the State Owner. It preserves the checkpoint and paired
+  pane contents without allowing a save hook to write the archive index.
 
 ## Hibernation
 

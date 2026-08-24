@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .archive import spool_archive_checkpoint
 from .core import Event, OwnerUnavailable, Publisher, StateClient, StateOwner, StatePaths
 
 
@@ -125,6 +126,34 @@ def _events(args: argparse.Namespace, paths: StatePaths) -> int:
     return 0
 
 
+def _archive_ingest(args: argparse.Namespace, paths: StatePaths) -> int:
+    try:
+        _print(StateClient(paths, timeout=args.timeout).archive_ingest(args.state_file))
+    except (OwnerUnavailable, RuntimeError):
+        spooled = spool_archive_checkpoint(paths.archive_spool, args.state_file)
+        _print({"ok": True, "status": "spooled", "path": str(spooled)})
+    return 0
+
+
+def _archive_import(args: argparse.Namespace, paths: StatePaths) -> int:
+    _print(StateClient(paths, timeout=args.timeout).archive_import())
+    return 0
+
+
+def _archive_maintain(args: argparse.Namespace, paths: StatePaths) -> int:
+    client = StateClient(paths, timeout=args.timeout)
+    totals = {"deleted_saves": 0, "deleted_blobs": 0, "batches": 0}
+    while True:
+        response = client.archive_maintain()
+        totals["deleted_saves"] += response["deleted_saves"]
+        totals["deleted_blobs"] += response["deleted_blobs"]
+        totals["batches"] += 1
+        if not args.all or not (response["deleted_saves"] or response["deleted_blobs"]):
+            break
+    _print({"ok": True, **totals})
+    return 0
+
+
 def _stop(args: argparse.Namespace, paths: StatePaths) -> int:
     _print(StateClient(paths, timeout=args.timeout).control("shutdown"))
     return 0
@@ -167,6 +196,23 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("--limit", type=int, default=100)
     events.add_argument("--timeout", type=float, default=0.25)
 
+    archive_ingest = commands.add_parser(
+        "archive-ingest", help="index one completed recovery checkpoint"
+    )
+    archive_ingest.add_argument("state_file", type=Path)
+    archive_ingest.add_argument("--timeout", type=float, default=30.0)
+
+    archive_import = commands.add_parser(
+        "archive-import", help="index the existing archive without changing files"
+    )
+    archive_import.add_argument("--timeout", type=float, default=120.0)
+
+    archive_maintain = commands.add_parser(
+        "archive-maintain", help="run one bounded indexed-retention batch"
+    )
+    archive_maintain.add_argument("--all", action="store_true", help="run batches until no victims remain")
+    archive_maintain.add_argument("--timeout", type=float, default=30.0)
+
     stop = commands.add_parser("stop", help="stop the running State Owner")
     stop.add_argument("--timeout", type=float, default=0.25)
     return parser
@@ -189,6 +235,12 @@ def main(argv: list[str] | None = None) -> int:
             return _status(args, paths)
         if args.command == "events":
             return _events(args, paths)
+        if args.command == "archive-ingest":
+            return _archive_ingest(args, paths)
+        if args.command == "archive-import":
+            return _archive_import(args, paths)
+        if args.command == "archive-maintain":
+            return _archive_maintain(args, paths)
         if args.command == "stop":
             return _stop(args, paths)
     except (OwnerUnavailable, RuntimeError, ValueError, OSError, json.JSONDecodeError) as error:
