@@ -2,7 +2,9 @@ import json
 import tempfile
 import unittest
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from state_owner import CapturePublisher, StatePaths
 from state_owner.watcher import (
@@ -12,7 +14,13 @@ from state_owner.watcher import (
     WatcherLease,
     parse_tmux_snapshot,
 )
-from state_owner.watcher_model import PaneState, default_cleaned_title, plan_tick
+from state_owner.watcher_model import (
+    PaneState,
+    abbreviate_label,
+    default_cleaned_title,
+    labels_by_window,
+    plan_tick,
+)
 
 
 def pane(
@@ -28,6 +36,7 @@ def pane(
         pane_id=pane_id,
         pane_spec=spec or f"work:0.{pane_id.removeprefix('%')}",
         pane_uuid=f"pane-{pane_id}",
+        window_id="@1",
         window_uuid="window-1",
         window_name="claude",
         command="claude",
@@ -54,6 +63,21 @@ class TitleFormattingTests(unittest.TestCase):
             default_cleaned_title("[tmux] copy mode", "nvim", "host", "host"),
         )
 
+    def test_inactive_label_matches_the_previous_shell_abbreviation(self) -> None:
+        self.assertEqual("Wrkng", abbreviate_label("Working - claude"))
+        self.assertEqual(
+            "RvwPR",
+            abbreviate_label("Review PR #1500 against MCP C# SDK - claude"),
+        )
+
+    def test_window_label_uses_the_window_active_pane(self) -> None:
+        inactive = pane("%1", title="old", active=False)
+        active = replace(pane("%2", title="current", active=True), window_id="@1")
+        labels = labels_by_window({inactive.pane_id: inactive, active.pane_id: active})
+
+        self.assertEqual("current - claude", labels["@1"].full)
+        self.assertEqual("crrnt", labels["@1"].short)
+
 
 class TmuxSnapshotTests(unittest.TestCase):
     def row(self, *, epoch: str = "1") -> str:
@@ -63,6 +87,7 @@ class TmuxSnapshotTests(unittest.TestCase):
                 "%1",
                 "work:0.0",
                 "pane-1",
+                "@1",
                 "window-1",
                 "claude",
                 "claude",
@@ -195,6 +220,47 @@ class WatcherPlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "capture failed"):
             watcher._drain_captures({current.pane_id: current})
         self.assertEqual(request, watcher.pending[current.pane_id])
+
+
+class WatcherStatusTests(unittest.TestCase):
+    def test_changed_labels_are_batched_into_one_tmux_process(self) -> None:
+        watcher = object.__new__(Watcher)
+        watcher.tmux = "/opt/tmux"
+        watcher.window_labels = {}
+        current = pane("%1", title="Working", active=True)
+
+        with patch("state_owner.watcher.subprocess.run", return_value=Mock(returncode=0)) as run:
+            watcher._update_window_labels({current.pane_id: current})
+            arguments = run.call_args.args[0]
+            self.assertEqual("/opt/tmux", arguments[0])
+            self.assertIn("@claude-window-label", arguments)
+            self.assertIn("Working - claude", arguments)
+            self.assertIn("@claude-window-label-short", arguments)
+            self.assertIn("Wrkng", arguments)
+
+            run.reset_mock()
+            watcher._update_window_labels({current.pane_id: current})
+            run.assert_not_called()
+
+    def test_continuum_due_check_runs_at_most_once_per_interval(self) -> None:
+        watcher = object.__new__(Watcher)
+        watcher.config = WatcherConfig(continuum_check_seconds=60)
+        watcher.continuum_save = Path("/tmp/continuum-save")
+        watcher.next_continuum_check = 0
+        watcher.children = []
+
+        child = Mock()
+        with (
+            patch("state_owner.watcher.os.access", return_value=True),
+            patch("state_owner.watcher.subprocess.Popen", return_value=child) as popen,
+            patch.object(watcher, "_reap_children"),
+        ):
+            watcher._run_continuum_if_due(100)
+            watcher._run_continuum_if_due(101)
+
+        popen.assert_called_once()
+        self.assertEqual(160, watcher.next_continuum_check)
+        self.assertEqual([child], watcher.children)
 
 
 class CapturePublisherTests(unittest.TestCase):

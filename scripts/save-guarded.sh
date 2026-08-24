@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Wrapper around tmux-resurrect's save.sh that bails when a restore is in
-# progress. Wired via @resurrect-save-script-path so tmux-continuum's
-# auto-save (status-bar-interval driven) also honors the lock — without
-# this gate, continuum's save fires during restore, captures partial state
-# (panes still in send-keys handoff, claude argv empty), and rotates `last`
-# to point at the partial snapshot. The pre-restore-pane-processes hook
+# progress. Wired via @resurrect-save-script-path so watcher-scheduled
+# auto-saves also honor the lock — without this gate, a save can fire during
+# restore, capture partial state (panes still in send-keys handoff, claude argv
+# empty), and rotate `last` to the broken snapshot. The pre-restore hook
 # then can't find a matching sidecar and bails, breaking @claude-pane-id
 # reapply for every pane.
 #
@@ -17,8 +16,8 @@ RESURRECT_DIR="$(tmux show -gqv @resurrect-dir 2>/dev/null || true)"
 LOCK_FILE="${RESURRECT_DIR:-/dev/null}/.restoring"
 
 if [ -n "$RESURRECT_DIR" ] && [ -f "$LOCK_FILE" ]; then
-  # Bail silently — restore is in progress. tmux's status-right is the
-  # caller; surfacing an error here would clutter the status line.
+  # Bail silently — restore is in progress. The periodic watcher will retry
+  # the due-check after the lock clears.
   exit 0
 fi
 

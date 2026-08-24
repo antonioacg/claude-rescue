@@ -874,6 +874,9 @@ assert "recovery checkpoints are indexed by the State Owner" "yes" "$S17_ARCHIVE
 S17_CAPTURE_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.capture_current // 0')
 [ "$S17_CAPTURE_COUNT" -gt 0 ] && S17_CAPTURES_INDEXED=yes || S17_CAPTURES_INDEXED=no
 assert "watcher Captures are indexed by the State Owner" "yes" "$S17_CAPTURES_INDEXED"
+S17_LABEL_COUNT=$(tmux -L "$SOCK" list-windows -aF '#{@claude-window-label}' | grep -c . || true)
+[ "$S17_LABEL_COUNT" -gt 0 ] && S17_LABELS_CACHED=yes || S17_LABELS_CACHED=no
+assert "watcher caches process-free tmux window labels" "yes" "$S17_LABELS_CACHED"
 S17_SESSION_STARTS=$(
   CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
     "$REPO/bin/claude-rescue-state" events --limit 1000 2>/dev/null \

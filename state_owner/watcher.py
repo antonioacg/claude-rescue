@@ -21,7 +21,9 @@ from .storage import atomic_write
 from .watcher_model import (
     CaptureRequest,
     PaneState,
+    WindowLabels,
     default_cleaned_title,
+    labels_by_window,
     plan_tick,
 )
 
@@ -31,6 +33,7 @@ _TMUX_FIELDS = (
     "#{pane_id}",
     "#{session_name}:#{window_index}.#{pane_index}",
     "#{@claude-pane-id}",
+    "#{window_id}",
     "#{@claude-window-id}",
     "#{window_name}",
     "#{pane_current_command}",
@@ -41,7 +44,9 @@ _TMUX_FIELDS = (
     "#{session_attached}",
 )
 _TMUX_FORMAT = _FIELD_SEPARATOR.join(_TMUX_FIELDS)
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+_LABEL_OPTION = "@claude-window-label"
+_SHORT_LABEL_OPTION = "@claude-window-label-short"
 
 
 class TmuxUnavailable(RuntimeError):
@@ -56,8 +61,10 @@ class WatcherConfig:
     queue_per_tick: int = 8
     pace_seconds: float = 0.05
     owner_check_seconds: int = 60
+    continuum_check_seconds: int = 60
     tick_seconds: float = 1.0
     title_formatter: Path | None = None
+    continuum_save: Path | None = None
 
     @classmethod
     def from_environment(cls) -> "WatcherConfig":
@@ -70,6 +77,7 @@ class WatcherConfig:
             return value
 
         formatter = os.environ.get("CLAUDE_RESCUE_TITLE_FORMATTER")
+        continuum = os.environ.get("CLAUDE_RESCUE_CONTINUUM_SAVE")
         return cls(
             visible_floor_seconds=integer(
                 "CLAUDE_RESCUE_WATCHER_VISIBLE_FLOOR_S", defaults.visible_floor_seconds
@@ -92,8 +100,12 @@ class WatcherConfig:
             owner_check_seconds=integer(
                 "CLAUDE_RESCUE_OWNER_CHECK_S", defaults.owner_check_seconds
             ),
+            continuum_check_seconds=integer(
+                "CLAUDE_RESCUE_CONTINUUM_CHECK_S", defaults.continuum_check_seconds
+            ),
             tick_seconds=defaults.tick_seconds,
             title_formatter=Path(formatter) if formatter else None,
+            continuum_save=Path(continuum) if continuum else None,
         )
 
 
@@ -114,6 +126,7 @@ def parse_tmux_snapshot(
             pane_id,
             pane_spec,
             pane_uuid,
+            window_id,
             window_uuid,
             window_name,
             command,
@@ -138,6 +151,7 @@ def parse_tmux_snapshot(
             pane_id=pane_id,
             pane_spec=pane_spec,
             pane_uuid=pane_uuid,
+            window_id=window_id,
             window_uuid=window_uuid,
             window_name=window_name,
             command=command,
@@ -253,10 +267,16 @@ class Watcher:
         self.error_file = paths.cache_home / f"watcher-{self.server_name}.log"
         self.capture_publisher = CapturePublisher(paths)
         self.owner_client = StateClient(paths, timeout=0.1)
+        self.continuum_save = self.config.continuum_save or (
+            Path.home()
+            / ".config/tmux/plugins/tmux-continuum/scripts/continuum_save.sh"
+        )
         self.pending: OrderedDict[str, CaptureRequest] = OrderedDict()
+        self.window_labels: dict[str, WindowLabels] = {}
         self.children: list[subprocess.Popen[bytes]] = []
         self.stop_requested = False
         self.next_owner_check = 0.0
+        self.next_continuum_check = 0.0
 
         self.outdir.mkdir(parents=True, exist_ok=True)
         paths.cache_home.mkdir(parents=True, exist_ok=True)
@@ -385,6 +405,44 @@ class Watcher:
             clean_title=self._cleaned_title,
         )
 
+    def _update_window_labels(self, panes: Mapping[str, PaneState]) -> None:
+        labels = labels_by_window(panes)
+        changed = [
+            (window_id, value)
+            for window_id, value in labels.items()
+            if self.window_labels.get(window_id) != value
+        ]
+        if changed:
+            commands: list[list[str]] = []
+            for window_id, value in changed:
+                commands.append(
+                    ["set-option", "-w", "-t", window_id, _LABEL_OPTION, value.full]
+                )
+                commands.append(
+                    [
+                        "set-option",
+                        "-w",
+                        "-t",
+                        window_id,
+                        _SHORT_LABEL_OPTION,
+                        value.short,
+                    ]
+                )
+            arguments = [self.tmux]
+            for index, command in enumerate(commands):
+                if index:
+                    arguments.append(";")
+                arguments.extend(command)
+            result = subprocess.run(
+                arguments,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError("failed to publish tmux window labels")
+        self.window_labels = labels
+
     def _emit_log(self, *arguments: str) -> None:
         self._reap_children()
         child = subprocess.Popen(
@@ -501,6 +559,22 @@ class Watcher:
             if self.pending and drained < self.config.queue_per_tick and self.config.pace_seconds:
                 time.sleep(self.config.pace_seconds)
 
+    def _run_continuum_if_due(self, now: float) -> None:
+        interval = self.config.continuum_check_seconds
+        if interval <= 0 or now < self.next_continuum_check:
+            return
+        self.next_continuum_check = now + interval
+        if not os.access(self.continuum_save, os.X_OK):
+            return
+        self._reap_children()
+        child = subprocess.Popen(
+            [str(self.continuum_save)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.children.append(child)
+
     def _repair_owner_if_due(self, now: float) -> None:
         if now < self.next_owner_check:
             return
@@ -537,6 +611,8 @@ class Watcher:
         now = time.time()
         self._repair_owner_if_due(now)
         current = self._list_panes()
+        self._update_window_labels(current)
+        self._run_continuum_if_due(now)
         plan = plan_tick(
             self.previous,
             current,

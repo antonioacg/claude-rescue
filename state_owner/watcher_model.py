@@ -12,6 +12,7 @@ class PaneState:
     pane_id: str
     pane_spec: str
     pane_uuid: str
+    window_id: str
     window_uuid: str
     window_name: str
     command: str
@@ -30,6 +31,7 @@ class PaneState:
             "pane_id": self.pane_id,
             "pane_spec": self.pane_spec,
             "pane_uuid": self.pane_uuid,
+            "window_id": self.window_id,
             "window_uuid": self.window_uuid,
             "window_name": self.window_name,
             "command": self.command,
@@ -46,6 +48,7 @@ class PaneState:
             "pane_id",
             "pane_spec",
             "pane_uuid",
+            "window_id",
             "window_uuid",
             "window_name",
             "command",
@@ -63,6 +66,7 @@ class PaneState:
             pane_id=str(value["pane_id"]),
             pane_spec=str(value["pane_spec"]),
             pane_uuid=str(value["pane_uuid"]),
+            window_id=str(value["window_id"]),
             window_uuid=str(value["window_uuid"]),
             window_name=str(value["window_name"]),
             command=str(value["command"]),
@@ -79,6 +83,12 @@ class CaptureRequest:
     pane: PaneState
     reason: str
     floor_only: bool
+
+
+@dataclass(frozen=True)
+class WindowLabels:
+    full: str
+    short: str
 
 
 @dataclass(frozen=True)
@@ -114,6 +124,30 @@ def default_cleaned_title(
         base = command
 
     return f"{custom}: {base}" if custom else base
+
+
+def abbreviate_label(label: str) -> str:
+    letters = (
+        character
+        for character in label
+        if ("a" <= character <= "z" or "A" <= character <= "Z")
+        and character not in "aeiou"
+    )
+    return "".join(letters)[:5]
+
+
+def labels_by_window(panes: Mapping[str, PaneState]) -> dict[str, WindowLabels]:
+    selected: dict[str, PaneState] = {}
+    for pane in panes.values():
+        if pane.window_id not in selected or pane.active:
+            selected[pane.window_id] = pane
+    return {
+        window_id: WindowLabels(
+            full=pane.cleaned_title,
+            short=abbreviate_label(pane.cleaned_title),
+        )
+        for window_id, pane in selected.items()
+    }
 
 
 def plan_tick(
