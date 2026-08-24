@@ -372,6 +372,7 @@ def spool_capture(
         raise ValueError(f"Capture does not exist: {source}")
     observed_at = _now() if observed_at is None else observed_at
     spool_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(spool_dir, 0o700)
     identity = uuid.uuid4().hex
     destination = spool_dir / identity
     temporary = spool_dir / f".{identity}.tmp"

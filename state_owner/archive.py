@@ -346,6 +346,7 @@ def spool_archive_checkpoint(spool_dir: Path, state_file: Path) -> Path:
     if not state_file.is_file():
         raise ValueError(f"checkpoint does not exist: {state_file}")
     spool_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(spool_dir, 0o700)
     destination = spool_dir / state_file.stem
     destination_state = destination / state_file.name
     if destination_state.is_file():

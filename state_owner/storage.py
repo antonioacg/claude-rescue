@@ -10,7 +10,9 @@ from pathlib import Path
 
 def open_database(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     connection = sqlite3.connect(path, timeout=5, check_same_thread=False)
+    os.chmod(path, 0o600)
     connection.row_factory = sqlite3.Row
     with connection:
         connection.execute("PRAGMA journal_mode=WAL")

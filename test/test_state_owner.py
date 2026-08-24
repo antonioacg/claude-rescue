@@ -1,5 +1,6 @@
 import json
 import socket
+import stat
 import sys
 import tempfile
 import threading
@@ -52,6 +53,8 @@ class EventStoreTests(unittest.TestCase):
             self.assertEqual((1, True), first)
             self.assertEqual((1, False), second)
             self.assertEqual(1, store.status()["event_count"])
+            self.assertEqual(0o600, stat.S_IMODE((Path(temporary) / "state.db").stat().st_mode))
+            self.assertEqual(0o700, stat.S_IMODE(Path(temporary).stat().st_mode))
             store.close()
 
     def test_event_id_cannot_be_reused_with_different_content(self) -> None:
@@ -97,6 +100,7 @@ class StateOwnerTests(unittest.TestCase):
         result = Publisher(paths, timeout=0.01).publish(event)
         self.assertEqual("spooled", result["status"])
         self.assertTrue((paths.spool / f"{event.event_id}.json").is_file())
+        self.assertEqual(0o700, stat.S_IMODE(paths.spool.stat().st_mode))
 
         self.start_owner()
         status = StateClient(paths).status()

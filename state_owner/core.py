@@ -315,6 +315,7 @@ class EventStore:
 
 def spool_event(path: Path, event: Event) -> Path:
     path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
     destination = path / f"{event.event_id}.json"
     if destination.exists():
         return destination
