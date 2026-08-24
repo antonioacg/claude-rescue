@@ -794,6 +794,19 @@ rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
 
 # ---------------------------------------------------------------------------
 echo "[state-owner] durable event journal, spooling, and single-writer lifecycle"
+S17_STATUS=$(CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+  "$REPO/bin/claude-rescue-state" status 2>/dev/null || echo '{}')
+S17_HISTORY_COUNT=$(printf '%s' "$S17_STATUS" | jq -r '.event_count // 0')
+[ "$S17_HISTORY_COUNT" -gt 0 ] && S17_HISTORY_PRESENT=yes || S17_HISTORY_PRESENT=no
+assert "legacy window events mirror into History Events" "yes" "$S17_HISTORY_PRESENT"
+S17_SESSION_STARTS=$(
+  CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+    "$REPO/bin/claude-rescue-state" events --limit 1000 2>/dev/null \
+    | grep -c '"kind":"session_start"' || true
+)
+[ "$S17_SESSION_STARTS" -gt 0 ] && S17_SESSION_HISTORY=yes || S17_SESSION_HISTORY=no
+assert "session_start is queryable from the History Event journal" "yes" "$S17_SESSION_HISTORY"
+
 S17_OUTPUT="$HOME_DIR/state-owner-tests.log"
 if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s "$REPO/test" -p 'test_state_owner.py' >"$S17_OUTPUT" 2>&1; then

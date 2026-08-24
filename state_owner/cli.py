@@ -44,6 +44,29 @@ def _publish(args: argparse.Namespace, paths: StatePaths) -> int:
     return 0
 
 
+def _publish_window_event(args: argparse.Namespace, paths: StatePaths) -> int:
+    raw = sys.stdin.read().strip()
+    if not raw:
+        raise ValueError("window event JSON is required on stdin")
+    legacy = _json_object(raw)
+    kind = legacy.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise ValueError("window event kind is required")
+    occurred_at = legacy.get("ts")
+    if occurred_at is not None and not isinstance(occurred_at, str):
+        raise ValueError("window event ts must be a string")
+    event = Event.create(
+        source="window-log",
+        kind=kind,
+        pane_uuid=legacy.get("pane_uuid"),
+        session_id=legacy.get("session_id"),
+        occurred_at=occurred_at,
+        payload={"window_uuid": args.window_uuid, "event": legacy},
+    )
+    _print(Publisher(paths, timeout=args.timeout).publish(event))
+    return 0
+
+
 def _serve(paths: StatePaths) -> int:
     stop = threading.Event()
 
@@ -125,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--payload", type=_json_object)
     publish.add_argument("--timeout", type=float, default=0.25)
 
+    publish_window = commands.add_parser(
+        "publish-window-event", help="mirror one legacy window JSONL event into the journal"
+    )
+    publish_window.add_argument("--window-uuid", required=True)
+    publish_window.add_argument("--timeout", type=float, default=0.25)
+
     commands.add_parser("serve", help="run the single-writer State Owner")
 
     ensure = commands.add_parser("ensure", help="start the State Owner when it is not running")
@@ -150,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "publish":
             return _publish(args, paths)
+        if args.command == "publish-window-event":
+            return _publish_window_event(args, paths)
         if args.command == "serve":
             return _serve(paths)
         if args.command == "ensure":

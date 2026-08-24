@@ -308,10 +308,18 @@ kill_only_if_comm() {
   return 0
 }
 
-# Atomic JSONL append. Lines under PIPE_BUF (typically 512+ bytes) are atomic.
+# Durable compatibility write: legacy JSONL remains the picker/backfill surface
+# while the State Owner becomes the indexed History Event authority. Publishing
+# is best-effort only because the JSONL append already made the event durable;
+# the publisher handles socket outages with its own atomic spool.
 append_event() {
   local window_uuid="$1" json="$2"
   printf '%s\n' "$json" >> "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
+  if command -v claude-rescue-state >/dev/null 2>&1; then
+    claude-rescue-state publish-window-event \
+      --window-uuid "$window_uuid" --timeout 0.1 \
+      <<< "$json" >/dev/null 2>&1 || true
+  fi
 }
 
 # tmux helpers ----------------------------------------------------------------
