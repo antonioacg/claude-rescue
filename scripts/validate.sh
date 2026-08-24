@@ -415,6 +415,18 @@ write_fake_snap() {
 S12_DIR="$HOME_DIR/resurrect-scenario12"
 mkdir -p "$S12_DIR"
 S12_LOG="$HOME_DIR/windows/$S12_WU.jsonl"
+# Pause the asynchronous watcher so this scenario measures only the
+# resurrect-save hook. Otherwise a legitimate title-now event can land between
+# the baseline read and assertion and make the retired-diff test flaky.
+S12_WATCHER_PID_FILE="$HOME_DIR/watcher-$SOCK.pid"
+S12_WATCHER_PID="$(cat "$S12_WATCHER_PID_FILE" 2>/dev/null || true)"
+if [ -n "$S12_WATCHER_PID" ]; then
+  kill -TERM "$S12_WATCHER_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$S12_WATCHER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
 S12_BASE=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 
 # (a) First save — no prev snapshot in this dir → no diff → no event.
@@ -463,6 +475,14 @@ sleep 1
 S12_AFTER4=$(grep '"kind":"title"' "$S12_LOG" 2>/dev/null | wc -l | tr -d ' ')
 S12_DELTA4=$((S12_AFTER4 - S12_AFTER3))
 assert "scenario 12d: sibling resurrect-dir present — still no title events" "0" "$S12_DELTA4"
+
+# Resume normal asynchronous Capture/title tracking for later scenarios.
+tmux -L "$SOCK" run-shell -b "claude-rescue-watcher-ensure"
+for _ in $(seq 1 30); do
+  S12_NEW_WATCHER_PID="$(cat "$S12_WATCHER_PID_FILE" 2>/dev/null || true)"
+  [ -n "$S12_NEW_WATCHER_PID" ] && kill -0 "$S12_NEW_WATCHER_PID" 2>/dev/null && break
+  sleep 0.1
+done
 
 # ---------------------------------------------------------------------------
 # Snapshot-race lock: continuum's status-bar-interval save can fire DURING
