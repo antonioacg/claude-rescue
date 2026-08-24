@@ -542,7 +542,7 @@ __rescue_md5() {
 # prevents a recycled pid from keeping a stale lock alive indefinitely.
 __rescue_archive_lock_owner_live() {
   local lock_dir="$1"
-  local owner args mtime now grace
+  local owner mtime now grace
   owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
   if [ -z "$owner" ]; then
     # mkdir publishes the claim before the winner can write its pid. Treat that
@@ -557,12 +557,7 @@ __rescue_archive_lock_owner_live() {
     [ "$((now - mtime))" -lt "$grace" ]
     return
   fi
-  kill -0 "$owner" 2>/dev/null || return 1
-  args="$(ps -o command= -p "$owner" 2>/dev/null || true)"
-  case "$args" in
-    *"claude-rescue-log resurrect-save"*) return 0 ;;
-    *) return 1 ;;
-  esac
+  pid_command_contains "$owner" "claude-rescue-log resurrect-save"
 }
 
 # Acquire the archive-maintenance lock. mkdir is the atomic claim; a separate

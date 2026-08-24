@@ -293,6 +293,20 @@ arm_still_authoritative() {
   return 0
 }
 
+# True when pid is live and its full command contains the expected literal.
+# PID files outlive processes; checking argv prevents a recycled pid from
+# suppressing a replacement worker or receiving a signal meant for the old one.
+pid_command_contains() {
+  local pid="$1" expected="$2" command
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  command="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  case "$command" in
+    *"$expected"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Send a signal to a pid only if its current comm matches the expected target
 # (default: claude). Defends against pid recycling: if the OS handed our
 # recorded pid to an unrelated process between arm and fire, we MUST NOT kill it.

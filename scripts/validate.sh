@@ -870,9 +870,36 @@ else
 fi
 assert "state owner unit suite" "pass" "$S17_RESULT"
 
+# A stale PID file may point at a live, unrelated recycled pid. The ensure path
+# must replace it rather than suppressing the watcher indefinitely.
+S17_WATCHER_PID_FILE="$HOME_DIR/watcher-$SOCK.pid"
+S17_OLD_WATCHER_PID="$(cat "$S17_WATCHER_PID_FILE" 2>/dev/null || true)"
+if [ -n "$S17_OLD_WATCHER_PID" ]; then
+  kill -TERM "$S17_OLD_WATCHER_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$S17_OLD_WATCHER_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+fi
+printf '%s\n' "$$" > "$S17_WATCHER_PID_FILE"
+tmux -L "$SOCK" run-shell -b "$REPO/bin/claude-rescue-watcher-ensure"
+S17_REPAIRED_WATCHER=no
+for _ in $(seq 1 30); do
+  S17_WATCHER_PID="$(cat "$S17_WATCHER_PID_FILE" 2>/dev/null || true)"
+  if [ -n "$S17_WATCHER_PID" ] && [ "$S17_WATCHER_PID" != "$$" ] \
+     && ps -o command= -p "$S17_WATCHER_PID" 2>/dev/null \
+        | grep -Fq "$REPO/bin/claude-rescue-watcher"; then
+    S17_REPAIRED_WATCHER=yes
+    break
+  fi
+  sleep 0.1
+done
+assert "watcher ensure rejects a live unrelated recycled pid" "yes" "$S17_REPAIRED_WATCHER"
+kill -0 $$ 2>/dev/null && S17_VALIDATOR_LIVE=yes || S17_VALIDATOR_LIVE=no
+assert "watcher ensure does not signal the recycled pid target" "yes" "$S17_VALIDATOR_LIVE"
+
 # The watcher used to trap TERM by removing its pid file without exiting,
 # leaving an orphan that could attach to a later server reusing the socket.
-S17_WATCHER_PID_FILE="$HOME_DIR/watcher-$SOCK.pid"
 S17_WATCHER_PID="$(cat "$S17_WATCHER_PID_FILE" 2>/dev/null || true)"
 if [ -n "$S17_WATCHER_PID" ] && kill -0 "$S17_WATCHER_PID" 2>/dev/null; then
   kill -TERM "$S17_WATCHER_PID" 2>/dev/null || true

@@ -107,9 +107,10 @@ mkdir -p "$OUTDIR"
 # Single-instance gate.
 if [ -f "$PIDFILE" ]; then
   other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
-  if [ -n "$other_pid" ] && kill -0 "$other_pid" 2>/dev/null; then
+  if pid_command_contains "$other_pid" "$REPO/bin/claude-rescue-watcher"; then
     exit 0
   fi
+  rm -f "$PIDFILE"
 fi
 echo "$$" > "$PIDFILE"
 cleanup_watcher() {
