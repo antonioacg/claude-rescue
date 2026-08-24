@@ -26,6 +26,11 @@ or a file, add it here.
   `claude-rescue-state`. It serializes durable History Events into SQLite
   and exposes a local Unix-socket Interface for publishing and queries.
   Shell hooks never open the database directly.
+- **Watcher Adapter** — one native process per tmux server. It obtains one
+  consolidated pane snapshot per tick, detects lifecycle/title/activity
+  changes in-process, and publishes Captures through the State Owner. Keeping
+  this Adapter per server preserves tmux socket locality without coupling the
+  global State Owner to any one tmux environment.
 - **History Event** — an immutable, idempotent state transition committed
   by the State Owner. Each carries an event id, source, kind, occurrence
   time, optional Epoch / Pane UUID / session id, and a JSON payload. Commit

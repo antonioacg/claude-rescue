@@ -332,6 +332,7 @@ cmd_title_commit() {
 # are no-ops.
 cmd_title_now() {
   local pane_id="$1" title="$2"
+  local window_uuid="${3:-}" pane_uuid="${4:-}"
   [ -z "$pane_id" ] && return 0
   [ -z "$title" ] && return 0
 
@@ -340,10 +341,10 @@ cmd_title_now() {
     return 0
   fi
 
-  local window_uuid pane_uuid session_id
-  window_uuid="$(tmux_get_window_uuid "$pane_id")"
+  local session_id
+  [ -n "$window_uuid" ] || window_uuid="$(tmux_get_window_uuid "$pane_id")"
   [ -z "$window_uuid" ] && return 0
-  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  [ -n "$pane_uuid" ] || pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
   session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
 
   append_event "$window_uuid" "$(jq -nc \
@@ -358,11 +359,11 @@ cmd_title_now() {
 
 cmd_pane_created() {
   local pane_id="$1"
+  local window_uuid="${2:-}" pane_uuid="${3:-}"
   [ -z "$pane_id" ] && return 0
-  local window_uuid pane_uuid
-  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  [ -n "$window_uuid" ] || window_uuid="$(tmux_get_window_uuid "$pane_id")"
   [ -z "$window_uuid" ] && return 0
-  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  [ -n "$pane_uuid" ] || pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
   append_event "$window_uuid" "$(jq -nc \
     --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
     '{ts:$ts, kind:"pane_created", pane_uuid:$puuid}')"
@@ -390,15 +391,16 @@ cmd_alert_bell()     { __cmd_alert_log "alert-bell"     "${1:-}"; }
 
 cmd_pane_died() {
   local pane_id="$1"
+  local window_uuid="${2:-}" pane_uuid="${3:-}"
   [ -z "$pane_id" ] && return 0
-  # Pane is gone, but window options may still resolve via the parent window.
-  local window_uuid pane_uuid
-  window_uuid="$(tmux_get_window_uuid "$pane_id")" || true
+  # The Watcher Adapter passes identities from its previous snapshot because
+  # tmux can no longer resolve options after the pane disappears. Other callers
+  # retain the live-pane lookup fallback.
+  [ -n "$window_uuid" ] || window_uuid="$(tmux_get_window_uuid "$pane_id")"
   [ -z "$window_uuid" ] && return 0
-  # Pane option likely already gone with the pane; best-effort.
-  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  [ -n "$pane_uuid" ] || pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
 
-  flush_pending_title "$pane_id" "$window_uuid"
+  flush_pending_title "$pane_id" "$window_uuid" "$pane_uuid"
   append_event "$window_uuid" "$(jq -nc \
     --arg ts "$(now_iso)" --arg puuid "$pane_uuid" \
     '{ts:$ts, kind:"pane_died", pane_uuid:$puuid}')"
@@ -481,7 +483,7 @@ latest_open_session_in_pane() {
 }
 
 flush_pending_title() {
-  local pane_id="$1" window_uuid="$2"
+  local pane_id="$1" window_uuid="$2" pane_uuid="${3:-}"
   local cand last
   cand="$(title_cand_path "$pane_id")"
   last="$(title_last_path "$pane_id")"
@@ -491,8 +493,8 @@ flush_pending_title() {
   if [ -f "$last" ] && [ "$(cat "$last")" = "$title" ]; then
     return 0
   fi
-  local session_id pane_uuid
-  pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  local session_id
+  [ -n "$pane_uuid" ] || pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
   session_id="$(latest_open_session_in_pane "$window_uuid" "$pane_uuid")"
   append_event "$window_uuid" "$(jq -nc \
     --arg ts "$(now_iso)" --arg t "$title" \

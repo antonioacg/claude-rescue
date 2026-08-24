@@ -167,6 +167,28 @@ assert "scenario 5: pane_died event logged" "1" \
 assert "scenario 5: forced title flush captured" "1" \
   "$(cat "$HOME_DIR/windows/"*.jsonl 2>/dev/null | grep -c '"forced":true')"
 
+# The Watcher Adapter detects death after tmux has already removed the pane.
+# It must use the identities retained in its previous snapshot rather than
+# asking tmux to resolve options on a pane that no longer exists.
+echo "[scenario 5b] watcher attributes a pane that already disappeared"
+tmux -L "$SOCK" new-window -t t1
+S5B_P=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S5B_P"
+emit_session_start "$S5B_P" "$(uuidgen|tr A-Z a-z)" "/tmp/s5b" startup
+sleep 2
+S5B_PUUID=$(tmux -L "$SOCK" show-options -pv -t "$S5B_P" @claude-pane-id)
+tmux -L "$SOCK" kill-pane -t "$S5B_P"
+S5B_DIED=no
+for _ in $(seq 1 30); do
+  if grep -h '"kind":"pane_died"' "$HOME_DIR/windows/"*.jsonl 2>/dev/null \
+     | grep -Fq "\"pane_uuid\":\"$S5B_PUUID\""; then
+    S5B_DIED=yes
+    break
+  fi
+  sleep 0.1
+done
+assert "scenario 5b: watcher retains identity for an already-dead pane" "yes" "$S5B_DIED"
+
 # ---------------------------------------------------------------------------
 echo "[scenario 6] resurrect save → kill-server → restore preserves UUID"
 ORIG=$(tmux -L "$SOCK" show-options -wv -t "$PB" @claude-window-id)
@@ -888,7 +910,7 @@ for _ in $(seq 1 30); do
   S17_WATCHER_PID="$(cat "$S17_WATCHER_PID_FILE" 2>/dev/null || true)"
   if [ -n "$S17_WATCHER_PID" ] && [ "$S17_WATCHER_PID" != "$$" ] \
      && ps -o command= -p "$S17_WATCHER_PID" 2>/dev/null \
-        | grep -Fq "$REPO/bin/claude-rescue-watcher"; then
+        | grep -Fq "$REPO/bin/claude-rescue-state watch"; then
     S17_REPAIRED_WATCHER=yes
     break
   fi

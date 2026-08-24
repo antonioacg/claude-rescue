@@ -36,7 +36,8 @@ log_debug "watcher-ensure" "server=$SERVER_NAME socket=${SOCKET_PATH:-} pid=$$ t
 
 if [ -f "$PIDFILE" ]; then
   other_pid="$(cat "$PIDFILE" 2>/dev/null || echo "")"
-  if pid_command_contains "$other_pid" "$REPO/bin/claude-rescue-watcher"; then
+  if pid_command_contains "$other_pid" "$REPO/bin/claude-rescue-state watch" \
+     || pid_command_contains "$other_pid" "$REPO/bin/claude-rescue-watcher"; then
     exit 0
   fi
   rm -f "$PIDFILE"

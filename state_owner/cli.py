@@ -12,8 +12,15 @@ from pathlib import Path
 from typing import Any
 
 from .archive import spool_archive_checkpoint
-from .capture import spool_capture, spool_capture_release
-from .core import Event, OwnerUnavailable, Publisher, StateClient, StateOwner, StatePaths
+from .core import (
+    CapturePublisher,
+    Event,
+    OwnerUnavailable,
+    Publisher,
+    StateClient,
+    StateOwner,
+    StatePaths,
+)
 
 
 def _json_object(value: str) -> dict[str, Any]:
@@ -163,48 +170,27 @@ def _archive_maintain(args: argparse.Namespace, paths: StatePaths) -> int:
 
 
 def _capture_ingest(args: argparse.Namespace, paths: StatePaths) -> int:
-    try:
-        response = StateClient(paths, timeout=args.timeout).capture_ingest(
-            args.capture_file,
-            server=args.server,
-            epoch=args.epoch,
-            pane_spec=args.pane_spec,
-            pane_uuid=args.pane_uuid,
-            reason=args.reason,
-        )
-        status = response["status"]
-    except (OwnerUnavailable, RuntimeError):
-        spool_capture(
-            paths.capture_spool,
-            args.capture_file,
-            server=args.server,
-            epoch=args.epoch,
-            pane_spec=args.pane_spec,
-            pane_uuid=args.pane_uuid,
-            reason=args.reason,
-        )
-        response = {"ok": True, "status": "spooled"}
-        status = "spooled"
+    response = CapturePublisher(paths, timeout=args.timeout).ingest(
+        args.capture_file,
+        server=args.server,
+        epoch=args.epoch,
+        pane_spec=args.pane_spec,
+        pane_uuid=args.pane_uuid,
+        reason=args.reason,
+    )
     if args.result_only:
-        print(status)
+        print(response["status"])
     else:
         _print(response)
     return 0
 
 
 def _capture_release(args: argparse.Namespace, paths: StatePaths) -> int:
-    try:
-        response = StateClient(paths, timeout=args.timeout).capture_release(
-            server=args.server, epoch=args.epoch, pane_spec=args.pane_spec
-        )
-    except (OwnerUnavailable, RuntimeError):
-        spooled = spool_capture_release(
-            paths.capture_spool,
-            server=args.server,
-            epoch=args.epoch,
-            pane_spec=args.pane_spec,
-        )
-        response = {"ok": True, "status": "spooled", "path": str(spooled)}
+    response = CapturePublisher(paths, timeout=args.timeout).release(
+        server=args.server,
+        epoch=args.epoch,
+        pane_spec=args.pane_spec,
+    )
     _print(response)
     return 0
 
@@ -212,6 +198,12 @@ def _capture_release(args: argparse.Namespace, paths: StatePaths) -> int:
 def _stop(args: argparse.Namespace, paths: StatePaths) -> int:
     _print(StateClient(paths, timeout=args.timeout).control("shutdown"))
     return 0
+
+
+def _watch(args: argparse.Namespace, paths: StatePaths) -> int:
+    from .watcher import Watcher
+
+    return Watcher(paths, args.repository).run()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -239,6 +231,14 @@ def build_parser() -> argparse.ArgumentParser:
     publish_window.add_argument("--timeout", type=float, default=0.25)
 
     commands.add_parser("serve", help="run the single-writer State Owner")
+
+    watch = commands.add_parser("watch", help="run the native per-tmux-server Watcher Adapter")
+    watch.add_argument(
+        "--repository",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help=argparse.SUPPRESS,
+    )
 
     ensure = commands.add_parser("ensure", help="start the State Owner when it is not running")
     ensure.add_argument("--wait", type=float, default=3.0)
@@ -304,6 +304,8 @@ def main(argv: list[str] | None = None) -> int:
             return _publish_window_event(args, paths)
         if args.command == "serve":
             return _serve(paths)
+        if args.command == "watch":
+            return _watch(args, paths)
         if args.command == "ensure":
             return _ensure(args, paths)
         if args.command == "status":

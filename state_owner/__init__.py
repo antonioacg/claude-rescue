@@ -1,4 +1,5 @@
 from .core import (
+    CapturePublisher,
     Event,
     EventStore,
     OwnerUnavailable,
@@ -11,6 +12,7 @@ from .core import (
 )
 
 __all__ = [
+    "CapturePublisher",
     "Event",
     "EventStore",
     "OwnerUnavailable",

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .archive import ArchiveIndex
-from .capture import CaptureIndex
+from .capture import CaptureIndex, spool_capture, spool_capture_release
 from .storage import atomic_write, open_database
 
 SCHEMA_VERSION = 1
@@ -460,6 +460,61 @@ class Publisher:
         except (OwnerUnavailable, RuntimeError):
             destination = spool_event(self.paths.spool, event)
             return {"status": "spooled", "path": str(destination)}
+
+
+class CapturePublisher:
+    """Publish Capture ownership changes with durable outage fallback."""
+
+    def __init__(self, paths: StatePaths, *, timeout: float = 5.0):
+        self.paths = paths
+        self.client = StateClient(paths, timeout=timeout)
+
+    def ingest(
+        self,
+        path: Path,
+        *,
+        server: str,
+        epoch: str,
+        pane_spec: str,
+        pane_uuid: str | None,
+        reason: str,
+    ) -> dict[str, Any]:
+        try:
+            return self.client.capture_ingest(
+                path,
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+                pane_uuid=pane_uuid,
+                reason=reason,
+            )
+        except (OwnerUnavailable, RuntimeError):
+            destination = spool_capture(
+                self.paths.capture_spool,
+                path,
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+                pane_uuid=pane_uuid,
+                reason=reason,
+            )
+            return {"ok": True, "status": "spooled", "path": str(destination)}
+
+    def release(self, *, server: str, epoch: str, pane_spec: str) -> dict[str, Any]:
+        try:
+            return self.client.capture_release(
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+            )
+        except (OwnerUnavailable, RuntimeError):
+            destination = spool_capture_release(
+                self.paths.capture_spool,
+                server=server,
+                epoch=epoch,
+                pane_spec=pane_spec,
+            )
+            return {"ok": True, "status": "spooled", "path": str(destination)}
 
 
 class StateOwner:
