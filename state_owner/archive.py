@@ -19,6 +19,7 @@ from .storage import (
     fsync_directory,
     link_or_copy,
     open_database,
+    published_spool_entries,
     sha256_file,
 )
 
@@ -189,11 +190,7 @@ class ArchiveIndex:
         result = {"committed": 0, "invalid": 0}
         if not spool_dir.is_dir():
             return result
-        entries = [
-            entry
-            for entry in sorted(spool_dir.iterdir())
-            if entry.is_dir() and not entry.name.endswith(".invalid")
-        ]
+        entries = published_spool_entries(spool_dir)
         for entry in entries[:limit]:
             states = list(entry.glob("tmux_resurrect_*.txt"))
             if len(states) != 1:

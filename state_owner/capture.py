@@ -18,6 +18,7 @@ from .storage import (
     fsync_directory,
     link_or_copy,
     open_database,
+    published_spool_entries,
     sha256_file,
 )
 
@@ -259,11 +260,7 @@ class CaptureIndex:
         result = {"committed": 0, "invalid": 0}
         if not spool_dir.is_dir():
             return result
-        entries = [
-            entry
-            for entry in spool_dir.iterdir()
-            if entry.is_dir() and not entry.name.endswith(".invalid")
-        ]
+        entries = published_spool_entries(spool_dir)
         entries.sort(key=_capture_spool_order)
         for entry in entries[:limit]:
             manifest_path = entry / "manifest.json"

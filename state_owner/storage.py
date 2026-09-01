@@ -66,6 +66,31 @@ def atomic_write(destination: Path, content: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def published_spool_entries(spool_dir: Path) -> list[Path]:
+    """Directory spool entries that are complete and safe to drain.
+
+    Every writer here stages in-flight work under a leading dot — `atomic_write`
+    and `atomic_copy` for single files, `spool_capture` and
+    `spool_archive_checkpoint` for whole directories — and publishes by
+    `os.replace`-ing onto an undotted name. Only undotted entries are complete.
+
+    A drain that skips just `.invalid` races the writer: it can list a directory
+    whose manifest has not landed yet, fail to parse it, and quarantine work that
+    was about to commit. Observed 2026-08-31 — a quarantined Capture still held
+    its manifest in `.tmp` form beside a fully-linked capture.txt, and the
+    writer's own `os.replace` then failed on the renamed directory.
+    """
+    if not spool_dir.is_dir():
+        return []
+    return sorted(
+        entry
+        for entry in spool_dir.iterdir()
+        if entry.is_dir()
+        and not entry.name.startswith(".")
+        and not entry.name.endswith(".invalid")
+    )
+
+
 def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:

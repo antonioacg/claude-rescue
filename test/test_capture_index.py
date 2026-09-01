@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -238,6 +239,51 @@ class CaptureIndexTests(unittest.TestCase):
         self.assertFalse(entry.exists())
         self.assertEqual(1, self.index.status()["capture_blobs"])
         self.assertEqual(1, self.index.status()["capture_references"])
+
+    def test_in_flight_spool_entry_is_left_alone(self) -> None:
+        # A writer stages under a leading dot and publishes with os.replace. A
+        # drain that fires mid-write used to list the half-built directory, fail
+        # on the missing manifest, and quarantine a Capture that was about to
+        # commit — taking the writer's own os.replace down with it.
+        spool = self.root / "state" / "capture-spool"
+        in_flight = spool / ".d9497e4a1bfb4e2d8ecfec9bb57bde85.tmp"
+        in_flight.mkdir(parents=True)
+        (in_flight / "capture.txt").write_text("half-written")
+
+        self.assertEqual({"committed": 0, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertTrue(in_flight.is_dir())
+        self.assertFalse((spool / ".d9497e4a1bfb4e2d8ecfec9bb57bde85.tmp.invalid").exists())
+
+    def test_a_racing_drain_does_not_lose_the_capture(self) -> None:
+        # Replay the real interleaving deterministically: the writer has staged
+        # its dotted temp and linked capture.txt but has NOT written the manifest
+        # or run os.replace yet. A drain lands here. It must leave the entry
+        # alone so the writer's publish still commits on the next drain.
+        spool = self.root / "state" / "capture-spool"
+        staged = spool / ".d9497e4a1bfb4e2d8ecfec9bb57bde85.tmp"
+        staged.mkdir(parents=True)
+        (staged / "capture.txt").write_text("racing")
+
+        self.assertEqual({"committed": 0, "invalid": 0}, self.index.drain_spool(spool))
+
+        # Writer finishes: manifest lands, then the atomic publish.
+        (staged / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "operation": "ingest",
+                    "server": "default",
+                    "epoch": "1",
+                    "pane_spec": "work:1.0",
+                    "pane_uuid": "pane-uuid",
+                    "reason": "visibility",
+                    "observed_at": 100,
+                }
+            )
+        )
+        staged.rename(spool / "d9497e4a1bfb4e2d8ecfec9bb57bde85")
+
+        self.assertEqual({"committed": 1, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertEqual(1, self.index.status()["capture_blobs"])
 
 
 if __name__ == "__main__":

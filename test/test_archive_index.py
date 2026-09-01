@@ -217,6 +217,19 @@ class ArchiveIndexTests(unittest.TestCase):
         self.assertFalse(blob.exists())
         self.assertEqual(0, self.index.status()["archive_blobs"])
 
+    def test_in_flight_spool_entry_is_left_alone(self) -> None:
+        # Same race as the Capture spool: the checkpoint writer stages under a
+        # leading dot, so a drain firing mid-write must not claim the directory
+        # and quarantine a checkpoint that was about to commit.
+        spool = self.root / "state" / "archive-spool"
+        in_flight = spool / ".default__tmux_resurrect_20260831T105600.4242.abc.tmp"
+        in_flight.mkdir(parents=True)
+        (in_flight / "tmux_resurrect_20260831T105600.txt").write_text("half-written")
+
+        self.assertEqual({"committed": 0, "invalid": 0}, self.index.drain_spool(spool))
+        self.assertTrue(in_flight.is_dir())
+        self.assertEqual(0, self.index.status()["archive_saves"])
+
 
 if __name__ == "__main__":
     unittest.main()
