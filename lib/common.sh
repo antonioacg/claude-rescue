@@ -109,9 +109,8 @@ log_err() {
 
 # log_debug <namespace> <fields...>
 # Append a single timestamped TSV row to $DATA/debug/<namespace>-YYYY-MM-DD.log.
-# Files self-rotate by date; __rescue_debug_prune (called from
-# __rescue_archive_save's hourly throttle) drops anything older than
-# CLAUDE_RESCUE_DEBUG_KEEP_DAYS (default 7). Use for instrumentation that
+# Files self-rotate by date; the State Owner's retention pass drops anything
+# older than CLAUDE_RESCUE_DEBUG_KEEP_DAYS (default 7). Use for instrumentation that
 # wants high-volume per-event traces without committing to keeping them
 # forever — alert-activity / alert-bell fit this; a final wiring decision
 # can be made after a few days of data.

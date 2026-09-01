@@ -57,6 +57,17 @@ assert_nonempty() {
 # ---------------------------------------------------------------------------
 # Bring up the isolated server with production conf.
 
+# The State Owner inherits this environment from the tmux server, so retention
+# tuning has to be set before the server starts. Keep hot_keep above what any
+# other scenario writes into a checkpoint dir so only scenario 16 sees a prune.
+export CLAUDE_RESCUE_HOT_KEEP=8
+# The orphan grace window guards one interleaving: a blob row written just
+# before the save row that references it, with a maintenance pass landing
+# between the two. The single writer serializes requests, so that ordering
+# needs a crash to occur at all and cannot be produced synchronously here —
+# the window would only defer scenario 16g's assertion past the end of the run.
+export CLAUDE_RESCUE_HISTORY_ORPHAN_GRACE_SECONDS=0
+
 CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" CLAUDE_RESCUE_REPO="$REPO" PATH="$REPO/bin:$PATH" \
   tmux -L "$SOCK" -f "$REPO/tmux/test/test.conf" \
     new-session -d -s t1 -x 200 -y 50
@@ -678,188 +689,99 @@ assert "scenario 15: arm-sweep preserves active file when claude is alive in sub
 [ -n "$S15_SENTINEL_PID" ] && kill -TERM "$S15_SENTINEL_PID" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# Archive tier — hardlink saves + content-addressed pane_contents.tar.gz.
-# cmd_resurrect_save now also hardlinks the snapshot's .txt + .tsv into
-# $DATA/archive/saves/ and md5-dedupes pane_contents into $DATA/archive/blobs/.
-# Two distinct retention caps gate prune: --keep N (count of saves) and
-# --blob-days M (age of blobs).
-echo "[scenario 16] archive tier (hardlink + content-addressed blobs)"
+# Retention on the DEFAULT route. Every earlier resurrect-save assertion runs
+# either without claude-rescue-state on PATH or against the retired legacy
+# archive path, so the route production actually takes had no coverage — which
+# is how hot-dir and debug pruning were lost when checkpoints moved behind the
+# State Owner. This drives the real hook and asserts every store it must bound.
+echo "[scenario 16] default save route bounds every store"
 
-S16_ARCHIVE_DIR="$HOME_DIR/archive-test"
-S16_SAVES="$S16_ARCHIVE_DIR/saves"
-S16_BLOBS="$S16_ARCHIVE_DIR/blobs"
-S16_RD=$(mktemp -d)
-# Exercise the compatibility Adapter independently of the indexed path.
-export CLAUDE_RESCUE_LEGACY_ARCHIVE=1
+S16_RD="$HOME_DIR/retention-hot"
+mkdir -p "$S16_RD"
 
-# (a) First save with pane_contents A: archives one save + one blob.
-S16_STATE_1="$S16_RD/tmux_resurrect_20260521T000001.txt"
-printf 'window\tsess\t1\t1\t:\twuuid-A\npane\tsess\t1\t1\twuuid-A\tpuuid-A\n' > "$S16_STATE_1"
+# More checkpoints than CLAUDE_RESCUE_HOT_KEEP, each with its sidecar.
+S16_TOTAL=20
+for i in $(seq 1 $S16_TOTAL); do
+  S16_STAMP=$(printf '20260521T0000%02d' "$i")
+  printf 'window\tsess\t1\t1\t:\twuuid-A\npane\tsess\t1\t1\twuuid-A\tpuuid-A\n' \
+    > "$S16_RD/tmux_resurrect_$S16_STAMP.txt"
+  printf 'pane\tsess\t1\t1\tpuuid-A\n' \
+    > "$S16_RD/tmux_resurrect_$S16_STAMP.claude-userops.tsv"
+done
+# Sidecars whose checkpoint upstream rotation already removed. Pairing sidecar
+# deletion to checkpoint deletion can never reach these.
+for i in $(seq 1 7); do
+  printf 'stray\n' > "$S16_RD/tmux_resurrect_20260520T0000$(printf '%02d' "$i").claude-userops.tsv"
+done
 printf 'content-A' > "$S16_RD/pane_contents.tar.gz"
-HASH_A=$(md5 -q "$S16_RD/pane_contents.tar.gz")
+# A debug log old enough to be outside the keep window.
+mkdir -p "$HOME_DIR/debug"
+printf 'row\n' > "$HOME_DIR/debug/scenario16-2026-01-01.log"
+touch -t 202601010000 "$HOME_DIR/debug/scenario16-2026-01-01.log"
+
+# The real hook, through tmux, with the State Owner reachable on PATH.
+tmux -L "$SOCK" run-shell "$REPO/bin/claude-rescue-log resurrect-save $S16_RD/tmux_resurrect_20260521T000020.txt"
+sleep 0.5
+
+S16_INDEXED=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  "$REPO/bin/claude-rescue-state" status 2>/dev/null | jq -r '.archive_saves // 0')
+[ "$S16_INDEXED" -gt 0 ] && S16_INGESTED=yes || S16_INGESTED=no
+assert "scenario 16a: default route indexes the checkpoint" "yes" "$S16_INGESTED"
+
+# `last` must outrank age — it is what a restore actually loads.
+ln -sf "tmux_resurrect_20260521T000001.txt" "$S16_RD/last"
+
 CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_1" >/dev/null 2>&1 || true
-S16_TXT_LINKS=$(stat -f '%l' "$S16_STATE_1" 2>/dev/null)
-assert "scenario 16a: saved .txt is hardlinked into archive" "2" "$S16_TXT_LINKS"
-[ -f "$S16_BLOBS/$HASH_A.tar.gz" ] && S16_BLOB_A=present || S16_BLOB_A=absent
-assert "scenario 16a: pane_contents copied to content-addressed blob" "present" "$S16_BLOB_A"
-S16_HASH_FILE_A=$(cat "$S16_SAVES/tmux_resurrect_20260521T000001.pane_contents.hash" 2>/dev/null)
-assert "scenario 16a: .pane_contents.hash records the blob hash" "$HASH_A" "$S16_HASH_FILE_A"
+  "$REPO/bin/claude-rescue-state" retention-run --all >/dev/null 2>&1
 
-# (b) Second save, SAME pane_contents: blob is reused (dedupe), not recopied.
-S16_STATE_2="$S16_RD/tmux_resurrect_20260521T000002.txt"
-cp "$S16_STATE_1" "$S16_STATE_2"
-# pane_contents.tar.gz unchanged → same hash
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_2" >/dev/null 2>&1 || true
-S16_BLOB_COUNT_B=$(find "$S16_BLOBS" -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')
-assert "scenario 16b: identical pane_contents dedupes to single blob" "1" "$S16_BLOB_COUNT_B"
+S16_STATES=$(find "$S16_RD" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f | wc -l | tr -d ' ')
+[ "$S16_STATES" -le $((CLAUDE_RESCUE_HOT_KEEP + 1)) ] && S16_HOT_BOUNDED=yes || S16_HOT_BOUNDED=no
+assert "scenario 16b: hot dir is bounded on the default route" "yes" "$S16_HOT_BOUNDED"
 
-# (c) Third save with DIFFERENT pane_contents: new blob created.
-printf 'content-B' > "$S16_RD/pane_contents.tar.gz"
-HASH_B=$(md5 -q "$S16_RD/pane_contents.tar.gz")
-S16_STATE_3="$S16_RD/tmux_resurrect_20260521T000003.txt"
-cp "$S16_STATE_1" "$S16_STATE_3"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_3" >/dev/null 2>&1 || true
-S16_BLOB_COUNT_C=$(find "$S16_BLOBS" -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')
-assert "scenario 16c: changed pane_contents creates second blob" "2" "$S16_BLOB_COUNT_C"
-[ -f "$S16_BLOBS/$HASH_B.tar.gz" ] && S16_BLOB_B=present || S16_BLOB_B=absent
-assert "scenario 16c: new blob is content-addressed by its hash" "present" "$S16_BLOB_B"
+[ -f "$S16_RD/tmux_resurrect_20260521T000001.txt" ] && S16_PINNED=yes || S16_PINNED=no
+assert "scenario 16c: restore target survives the prune" "yes" "$S16_PINNED"
 
-# (d) Prune saves to --keep 2: oldest (state_1) is evicted, its trio removed.
-# Force the prune throttle to fire by clearing the marker.
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-S16_STATE_4="$S16_RD/tmux_resurrect_20260521T000004.txt"
-cp "$S16_STATE_1" "$S16_STATE_4"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_4" >/dev/null 2>&1 || true
-[ -f "$S16_SAVES/tmux_resurrect_20260521T000001.txt" ] && S16_EVICT=present || S16_EVICT=absent
-assert "scenario 16d: oldest save evicted when count exceeds --keep" "absent" "$S16_EVICT"
-S16_SAVE_COUNT=$(find "$S16_SAVES" -maxdepth 1 -name 'tmux_resurrect_*.txt' | wc -l | tr -d ' ')
-assert "scenario 16d: save count clamped to --keep" "2" "$S16_SAVE_COUNT"
+S16_ORPHANS=$(find "$S16_RD" -maxdepth 1 -name 'tmux_resurrect_20260520T*.claude-userops.tsv' | wc -l | tr -d ' ')
+assert "scenario 16d: sidecars without a checkpoint are collected" "0" "$S16_ORPHANS"
 
-# (e) Blob GC: backdate a blob to 2020-01-01 (well past any plausible
-# --blob-days window), re-run save with blob_days=14, expect the aged blob
-# removed. GC is age-only — the .hash file persists as a tombstone.
-touch -t 202001010000 "$S16_BLOBS/$HASH_A.tar.gz" 2>/dev/null || true
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-S16_STATE_5="$S16_RD/tmux_resurrect_20260521T000005.txt"
-cp "$S16_STATE_1" "$S16_STATE_5"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=100 \
-  CLAUDE_RESCUE_ARCHIVE_BLOB_DAYS=14 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_5" >/dev/null 2>&1 || true
-[ -f "$S16_BLOBS/$HASH_A.tar.gz" ] && S16_BLOB_A_AFTER=present || S16_BLOB_A_AFTER=absent
-assert "scenario 16e: aged blob GC'd past --blob-days" "absent" "$S16_BLOB_A_AFTER"
+# Every surviving sidecar still pairs with a surviving checkpoint.
+S16_UNPAIRED=0
+while IFS= read -r S16_TSV; do
+  [ -f "${S16_TSV%.claude-userops.tsv}.txt" ] || S16_UNPAIRED=$((S16_UNPAIRED + 1))
+done < <(find "$S16_RD" -maxdepth 1 -name '*.claude-userops.tsv' -type f)
+assert "scenario 16e: no sidecar outlives its checkpoint" "0" "$S16_UNPAIRED"
 
-# (f) High-cardinality maintenance batches stat calls. The old `{} \;` form
-# launched one process per snapshot; this probe wraps stat and counts actual
-# invocations while pruning hundreds of files.
-S16_FAKEBIN="$HOME_DIR/scenario16-bin"
-S16_STAT_COUNT="$HOME_DIR/scenario16-stat-count"
-mkdir -p "$S16_FAKEBIN"
-cat > "$S16_FAKEBIN/stat" <<'EOF'
-#!/bin/sh
-printf '1\n' >> "$S16_STAT_COUNT"
-exec /usr/bin/stat "$@"
-EOF
-chmod +x "$S16_FAKEBIN/stat"
-: > "$S16_STAT_COUNT"
-S16_I=0
-while [ "$S16_I" -lt 300 ]; do
-  printf -v S16_N '%06d' "$S16_I"
-  : > "$S16_SAVES/tmux_resurrect_20260520T$S16_N.txt"
-  S16_I=$((S16_I + 1))
-done
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-S16_STATE_6="$S16_RD/tmux_resurrect_20260521T000006.txt"
-cp "$S16_STATE_1" "$S16_STATE_6"
-PATH="$S16_FAKEBIN:$PATH" S16_STAT_COUNT="$S16_STAT_COUNT" \
-  CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_6" >/dev/null 2>&1 || true
-S16_STAT_CALLS=$(wc -l < "$S16_STAT_COUNT" | tr -d ' ')
-[ "$S16_STAT_CALLS" -le 10 ] && S16_BATCHED=yes || S16_BATCHED=no
-assert "scenario 16f: high-cardinality prune batches stat processes" "yes" "$S16_BATCHED"
+[ -f "$HOME_DIR/debug/scenario16-2026-01-01.log" ] && S16_DEBUG=present || S16_DEBUG=absent
+assert "scenario 16f: aged debug logs are collected" "absent" "$S16_DEBUG"
 
-# (g) A dead owner cannot wedge maintenance forever. The recovery claim removes
-# the stale lock before acquiring it for this save.
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-mkdir -p "$S16_ARCHIVE_DIR/.prune-lock"
-printf '999999\n' > "$S16_ARCHIVE_DIR/.prune-lock/pid"
-S16_STATE_7="$S16_RD/tmux_resurrect_20260521T000007.txt"
-cp "$S16_STATE_1" "$S16_STATE_7"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_7" >/dev/null 2>&1 || true
-[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_STALE_LOCK=present || S16_STALE_LOCK=absent
-assert "scenario 16g: stale maintenance lock is recovered" "absent" "$S16_STALE_LOCK"
+# A blob whose last save row is gone can never be read again — the .hash file
+# went with the save — so it must not wait out the age window on disk.
+S16_ORPHAN_BLOB=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR python3 - <<'PY'
+import os, sqlite3
+db = os.path.join(os.environ["CLAUDE_RESCUE_DATA_HOME"], "state", "state.db")
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+print(con.execute(
+    "SELECT COUNT(*) FROM archive_blobs b WHERE NOT EXISTS ("
+    "SELECT 1 FROM archive_saves s WHERE s.capture_hash = b.capture_hash)"
+).fetchone()[0])
+PY
+)
+assert "scenario 16g: unreferenced blobs are not retained" "0" "$S16_ORPHAN_BLOB"
 
-# (h) A lock claimant publishes mkdir before its pid file. Contenders must
-# preserve that fresh pid-less directory rather than stealing the live claim;
-# the same shape becomes recoverable after the grace period.
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-mkdir -p "$S16_ARCHIVE_DIR/.prune-lock"
-S16_STATE_8="$S16_RD/tmux_resurrect_20260521T000008.txt"
-cp "$S16_STATE_1" "$S16_STATE_8"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_8" >/dev/null 2>&1 || true
-[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_FRESH_PIDLESS=present || S16_FRESH_PIDLESS=absent
-assert "scenario 16h: fresh pid-less lock is not stolen" "present" "$S16_FRESH_PIDLESS"
+# The owner learns the hot dir from what it is handed; nothing configures it.
+S16_KNOWN_DIR=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR python3 - <<'PY'
+import os, sqlite3
+db = os.path.join(os.environ["CLAUDE_RESCUE_DATA_HOME"], "state", "state.db")
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+rows = con.execute(
+    "SELECT COUNT(*) FROM state_owner_meta WHERE key LIKE 'checkpoint_dir:%'"
+).fetchone()[0]
+print("yes" if rows else "no")
+PY
+)
+assert "scenario 16h: retention learns the hot dir from ingest" "yes" "$S16_KNOWN_DIR"
 
-touch -t 202001010000 "$S16_ARCHIVE_DIR/.prune-lock"
-S16_STATE_9="$S16_RD/tmux_resurrect_20260521T000009.txt"
-cp "$S16_STATE_1" "$S16_STATE_9"
-CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-  CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-  CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-  "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_9" >/dev/null 2>&1 || true
-[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_OLD_PIDLESS=present || S16_OLD_PIDLESS=absent
-assert "scenario 16h: old pid-less lock is recovered" "absent" "$S16_OLD_PIDLESS"
-
-# (i) Concurrent save hooks share one maintenance owner. The archive may grow
-# by contenders that ingest after the winning prune, but it stays bounded by
-# keep + (contenders - 1) and leaves no lock behind.
-S16_I=0
-while [ "$S16_I" -lt 20 ]; do
-  printf -v S16_N '%06d' "$S16_I"
-  : > "$S16_SAVES/tmux_resurrect_20260519T$S16_N.txt"
-  S16_I=$((S16_I + 1))
-done
-rm -f "$S16_ARCHIVE_DIR/.last-prune"
-S16_PIDS=()
-S16_I=1
-while [ "$S16_I" -le 8 ]; do
-  printf -v S16_N '%06d' "$S16_I"
-  S16_STATE_N="$S16_RD/tmux_resurrect_20260521T1$S16_N.txt"
-  cp "$S16_STATE_1" "$S16_STATE_N"
-  CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
-    CLAUDE_RESCUE_ARCHIVE_DIR="$S16_ARCHIVE_DIR" \
-    CLAUDE_RESCUE_ARCHIVE_KEEP=2 \
-    "$REPO/bin/claude-rescue-log" resurrect-save "$S16_STATE_N" >/dev/null 2>&1 &
-  S16_PIDS+=("$!")
-  S16_I=$((S16_I + 1))
-done
-for S16_PID in "${S16_PIDS[@]}"; do wait "$S16_PID" || true; done
-S16_CONCURRENT_COUNT=$(find "$S16_SAVES" -maxdepth 1 -name 'tmux_resurrect_*.txt' | wc -l | tr -d ' ')
-[ "$S16_CONCURRENT_COUNT" -le 9 ] && S16_CONCURRENT_BOUNDED=yes || S16_CONCURRENT_BOUNDED=no
-assert "scenario 16i: concurrent maintenance remains bounded" "yes" "$S16_CONCURRENT_BOUNDED"
-[ -d "$S16_ARCHIVE_DIR/.prune-lock" ] && S16_LIVE_LOCK=present || S16_LIVE_LOCK=absent
-assert "scenario 16i: concurrent maintenance releases its lock" "absent" "$S16_LIVE_LOCK"
-
-rm -rf "$S16_RD" "$S16_ARCHIVE_DIR"
-unset CLAUDE_RESCUE_LEGACY_ARCHIVE
+rm -rf "$S16_RD"
 
 # ---------------------------------------------------------------------------
 echo "[state-owner] durable event journal, spooling, and single-writer lifecycle"

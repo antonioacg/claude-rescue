@@ -92,8 +92,8 @@ the most-used surface. Most of the deferred items below cluster here.
 - **Resilient restore against dangling `last` symlink** *(#41)*.
   `cmd_resurrect_restore` reads `$resurrect_dir/last` to find the
   snapshot to replay. If `last` points at a file that's been rotated
-  away (cleanup-resurrect-snapshots.sh or upstream rotation deleted
-  it), restore bails. Should fall back to the
+  away (upstream rotation deleted it — the State Owner's retention pins
+  the `last` target), restore bails. Should fall back to the
   newest-by-filename `.txt` in the dir.
 
 ---
