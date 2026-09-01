@@ -493,10 +493,13 @@ running server. Code rollback can wait.
   hits this scale in under a week.
 
   Runs as one of the State Owner's retention jobs, on the retention
-  throttle (default hourly). Defaults: keep newest 2000 (tune via
-  `CLAUDE_RESCUE_HOT_KEEP`). The archive tier's hardlinks preserve any
-  inode dropped here, so eviction is information-preserving — only the
-  resurrect-loadable surface shrinks.
+  throttle (default hourly). Defaults: keep newest 4000 (tune via
+  `CLAUDE_RESCUE_HOT_KEEP`) — raised from 2000 once content-addressed
+  blobs and a working sidecar prune cut the tier by ~90%, so the cap now
+  buys weeks of restore history at the observed ~100 checkpoints/day
+  while staying clear of the ~6000-file break. The archive tier's
+  hardlinks preserve any inode dropped here, so eviction is
+  information-preserving — only the resurrect-loadable surface shrinks.
 
   Manual invocation (force a pass now, or drain a backlog):
 

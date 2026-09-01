@@ -734,6 +734,16 @@ ln -sf "tmux_resurrect_20260521T000001.txt" "$S16_RD/last"
 CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
   "$REPO/bin/claude-rescue-state" retention-run --all >/dev/null 2>&1
 
+# The orphan check is `created_at < now - grace`, strictly — which is what
+# stops a blob from being collected in the same second it was written, before
+# the save row referencing it lands. With grace pinned to 0 here, a blob whose
+# save is thinned in the same second as the pass survives that pass by design.
+# Step past the boundary and drain again so 16g reads a settled state instead
+# of a one-second window (observed flaking ~1 run in 6).
+sleep 1.1
+CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache \
+  "$REPO/bin/claude-rescue-state" retention-run --all >/dev/null 2>&1
+
 S16_STATES=$(find "$S16_RD" -maxdepth 1 -name 'tmux_resurrect_*.txt' -type f | wc -l | tr -d ' ')
 [ "$S16_STATES" -le $((CLAUDE_RESCUE_HOT_KEEP + 1)) ] && S16_HOT_BOUNDED=yes || S16_HOT_BOUNDED=no
 assert "scenario 16b: hot dir is bounded on the default route" "yes" "$S16_HOT_BOUNDED"

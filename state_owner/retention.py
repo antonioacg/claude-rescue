@@ -35,7 +35,13 @@ class _Index(Protocol):
 
 @dataclass(frozen=True)
 class RetentionPolicy:
-    hot_keep: int = 2000
+    # 2000 was sized when the hot dir was the only copy and every checkpoint
+    # carried a pane_contents tarball. Content-addressed blobs plus a working
+    # sidecar prune cut the tier by ~90%, so the cap can buy more restore
+    # history for the same disk: at the observed ~100 checkpoints/day this is
+    # weeks of headroom, and it stays clear of the ~6000 files where
+    # tmux-resurrect's own glob rotation breaks.
+    hot_keep: int = 4000
     debug_keep_seconds: int = 7 * 24 * 60 * 60
     interval_seconds: int = 60 * 60
     # Filesystem jobs get their own bound. The database jobs delete a few
