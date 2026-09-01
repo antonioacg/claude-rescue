@@ -143,22 +143,25 @@ def _archive_import(args: argparse.Namespace, paths: StatePaths) -> int:
     return 0
 
 
-def _archive_maintain(args: argparse.Namespace, paths: StatePaths) -> int:
+def _retention_run(args: argparse.Namespace, paths: StatePaths) -> int:
     client = StateClient(paths, timeout=args.timeout)
     keys = (
         "deleted_saves",
         "deleted_blobs",
         "deleted_capture_refs",
         "deleted_capture_blobs",
+        "deleted_checkpoints",
+        "deleted_sidecars",
+        "deleted_debug_logs",
     )
     totals = {key: 0 for key in keys}
     totals["batches"] = 0
     while True:
-        response = client.archive_maintain()
+        response = client.retention_run()
         for key in keys:
-            totals[key] += response[key]
+            totals[key] += response.get(key, 0)
         totals["batches"] += 1
-        if not args.all or not any(response[key] for key in keys):
+        if not args.all or not any(response.get(key, 0) for key in keys):
             break
     _print({"ok": True, **totals})
     return 0
@@ -257,11 +260,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     archive_import.add_argument("--timeout", type=float, default=600.0)
 
-    archive_maintain = commands.add_parser(
-        "archive-maintain", help="run one bounded indexed-retention batch"
+    retention_run = commands.add_parser(
+        "retention-run", help="run one bounded pass of every retention job"
     )
-    archive_maintain.add_argument("--all", action="store_true", help="run batches until no victims remain")
-    archive_maintain.add_argument("--timeout", type=float, default=30.0)
+    retention_run.add_argument("--all", action="store_true", help="run batches until no victims remain")
+    retention_run.add_argument("--timeout", type=float, default=30.0)
 
     capture_ingest = commands.add_parser(
         "capture-ingest", help="hash and index one pane Capture"
@@ -311,8 +314,8 @@ def main(argv: list[str] | None = None) -> int:
             return _archive_ingest(args, paths)
         if args.command == "archive-import":
             return _archive_import(args, paths)
-        if args.command == "archive-maintain":
-            return _archive_maintain(args, paths)
+        if args.command == "retention-run":
+            return _retention_run(args, paths)
         if args.command == "capture-ingest":
             return _capture_ingest(args, paths)
         if args.command == "capture-release":

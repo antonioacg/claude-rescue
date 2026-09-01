@@ -70,3 +70,8 @@ class StatePaths:
     @property
     def log(self) -> Path:
         return self.cache_home / "state-owner.log"
+
+    @property
+    def debug(self) -> Path:
+        """Self-dated debug logs written by lib/common.sh's log_debug."""
+        return self.data_home / "debug"

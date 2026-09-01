@@ -54,8 +54,8 @@ class StateClient:
     def archive_import(self) -> dict[str, Any]:
         return self._request({"operation": "archive_import"})
 
-    def archive_maintain(self) -> dict[str, Any]:
-        return self._request({"operation": "archive_maintain"})
+    def retention_run(self) -> dict[str, Any]:
+        return self._request({"operation": "retention_run"})
 
     def capture_ingest(
         self,

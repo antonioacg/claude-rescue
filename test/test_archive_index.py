@@ -26,6 +26,7 @@ class ArchiveIndexTests(unittest.TestCase):
             archive_seconds=7200,
             archive_bucket_seconds=1800,
             blob_seconds=300,
+            orphan_grace_seconds=60,
             batch_size=100,
         )
         self.index = ArchiveIndex(self.database, self.archive, self.policy)
@@ -74,6 +75,42 @@ class ArchiveIndexTests(unittest.TestCase):
             for result in states
         }
         self.assertEqual({"state-a", "state-b"}, archived)
+
+    def test_unreferenced_blob_survives_grace_then_is_collected(self) -> None:
+        # Two checkpoints land in the same medium bucket, so retention thins one
+        # of them. The thinned save takes its .pane_contents.hash with it, which
+        # leaves that save's blob unreachable — nothing can ever reference it
+        # again, and it must not sit on disk until blob_seconds elapses.
+        now = 2_000_000_000
+        self.index.ingest(self.checkpoint(now - 120, content=b"kept"), now=now)
+        self.index.ingest(self.checkpoint(now - 130, content=b"thinned"), now=now)
+        self.assertEqual(2, self.index.status()["archive_blobs"])
+
+        maintained = self.index.maintain(now=now)
+        self.assertEqual(1, maintained["deleted_saves"])
+        # Still inside the grace window: ingest writes the blob row before the
+        # save row, so collecting here could race a blob about to be referenced.
+        self.assertEqual(0, maintained["deleted_blobs"])
+        self.assertEqual(2, self.index.status()["archive_blobs"])
+
+        maintained = self.index.maintain(now=now + self.policy.orphan_grace_seconds + 1)
+        self.assertEqual(1, maintained["deleted_blobs"])
+        self.assertEqual(1, self.index.status()["archive_blobs"])
+
+        # The row and the file go together — a collected blob must not linger
+        # on disk as an untracked orphan.
+        surviving = list((self.archive / "blobs").iterdir())
+        self.assertEqual(1, len(surviving))
+        self.assertEqual(b"kept", surviving[0].read_bytes())
+
+    def test_referenced_blob_outlives_the_grace_window(self) -> None:
+        # The unreferenced arm must not touch a blob a live save still points at.
+        now = 2_000_000_000
+        self.index.ingest(self.checkpoint(now, content=b"referenced"), now=now)
+
+        maintained = self.index.maintain(now=now + self.policy.orphan_grace_seconds + 1)
+        self.assertEqual(0, maintained["deleted_blobs"])
+        self.assertEqual(1, self.index.status()["archive_blobs"])
 
     def test_retention_keeps_each_servers_checkpoint_in_shared_bucket(self) -> None:
         now = 2_000_000_000

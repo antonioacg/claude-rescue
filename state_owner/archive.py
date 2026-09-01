@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .retention import record_checkpoint_directory
 from .storage import (
     atomic_copy,
     atomic_write,
@@ -32,6 +33,7 @@ class ArchivePolicy:
     archive_seconds: int = 90 * 24 * 60 * 60
     archive_bucket_seconds: int = 24 * 60 * 60
     blob_seconds: int = 14 * 24 * 60 * 60
+    orphan_grace_seconds: int = 60 * 60
     batch_size: int = 500
 
     @classmethod
@@ -58,7 +60,10 @@ class ArchivePolicy:
             archive_bucket_seconds=integer(
                 "CLAUDE_RESCUE_HISTORY_ARCHIVE_BUCKET_SECONDS", defaults.archive_bucket_seconds
             ),
-            blob_seconds=integer("CLAUDE_RESCUE_CAPTURE_BLOB_SECONDS", defaults.blob_seconds),
+            blob_seconds=integer("CLAUDE_RESCUE_HISTORY_BLOB_SECONDS", defaults.blob_seconds),
+            orphan_grace_seconds=integer(
+                "CLAUDE_RESCUE_HISTORY_ORPHAN_GRACE_SECONDS", defaults.orphan_grace_seconds
+            ),
             batch_size=integer("CLAUDE_RESCUE_RETENTION_BATCH_SIZE", defaults.batch_size),
         )
 
@@ -174,6 +179,10 @@ class ArchiveIndex:
                     now,
                 ),
             )
+            # The hot dir this checkpoint came from is tmux-resurrect's, not
+            # ours, and nothing else tells us where it is. Recording it here is
+            # what lets Retention bound it — see retention.record_checkpoint_directory.
+            record_checkpoint_directory(self._connection, server, state_file.parent)
         return {"server": server, "save_name": save_name, "capture_hash": capture_hash}
 
     def drain_spool(self, spool_dir: Path, *, limit: int = 20) -> dict[str, int]:
@@ -253,29 +262,6 @@ class ArchiveIndex:
                 result["blobs"] += 1
         return result
 
-    def maintain_if_due(
-        self, *, now: int | None = None, interval_seconds: int = 60 * 60
-    ) -> dict[str, int]:
-        now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
-        with self._lock, self._connection:
-            row = self._connection.execute(
-                "SELECT value FROM state_owner_meta WHERE key = 'archive_maintained_at'"
-            ).fetchone()
-            last = int(row["value"]) if row is not None else 0
-            if now - last < interval_seconds:
-                return {"deleted_saves": 0, "deleted_blobs": 0}
-            # Claim the interval before doing filesystem work. The State Owner
-            # is the only writer; a crash delays retry rather than duplicating
-            # an unbounded maintenance pass in every save hook.
-            self._connection.execute(
-                """
-                INSERT INTO state_owner_meta(key, value) VALUES('archive_maintained_at', ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (str(now),),
-            )
-        return self.maintain(now=now)
-
     def maintain(self, *, now: int | None = None) -> dict[str, int]:
         now = int(datetime.now(timezone.utc).timestamp()) if now is None else now
         victims = self._retention_victims(now)
@@ -289,14 +275,39 @@ class ArchiveIndex:
                 )
             deleted_saves += 1
 
-        blob_cutoff = now - self.policy.blob_seconds
+        # A blob outlives its own age limit only while some save still points at
+        # it. Age alone is not enough: the retention pass above thins save rows
+        # far faster than blob_seconds elapses, and deleting a save also deletes
+        # its .pane_contents.hash, so an unreferenced blob can never be reached
+        # again — it is garbage the moment its last save row goes. Collecting on
+        # age alone left 98% of the tier (19k blobs, 3.1 GB) parked for the full
+        # blob_seconds window with nothing able to read it.
+        #
+        # The grace window is what makes the unreferenced arm safe: ingest()
+        # writes the blob row before the save row that references it, so a
+        # maintenance pass landing between those two writes would otherwise
+        # collect a blob that is about to be referenced. Same guard, same
+        # reasoning as CapturePolicy.orphan_grace_seconds.
         with self._lock:
             blob_rows = self._connection.execute(
                 """
-                SELECT capture_hash, blob_path FROM archive_blobs
-                WHERE created_at < ? ORDER BY created_at LIMIT ?
+                SELECT capture_hash, blob_path FROM archive_blobs AS blob
+                WHERE blob.created_at < :blob_cutoff
+                   OR (
+                       blob.created_at < :orphan_cutoff
+                       AND NOT EXISTS (
+                           SELECT 1 FROM archive_saves AS save
+                           WHERE save.capture_hash = blob.capture_hash
+                       )
+                   )
+                ORDER BY blob.created_at
+                LIMIT :batch_size
                 """,
-                (blob_cutoff, self.policy.batch_size),
+                {
+                    "blob_cutoff": now - self.policy.blob_seconds,
+                    "orphan_cutoff": now - self.policy.orphan_grace_seconds,
+                    "batch_size": self.policy.batch_size,
+                },
             ).fetchall()
         deleted_blobs = 0
         for row in blob_rows:

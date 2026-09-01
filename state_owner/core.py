@@ -14,6 +14,7 @@ from .capture import CaptureIndex
 from .events import Event, EventStore, drain_spool
 from .paths import StatePaths
 from .protocol import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, encode_message, read_message
+from .retention import Retention
 
 
 def observed_now() -> float:
@@ -28,6 +29,12 @@ class StateOwner:
         self.store = EventStore(paths.database)
         self.archive = ArchiveIndex(paths.database, paths.archive)
         self.captures = CaptureIndex(paths.database, paths.data_home)
+        self.retention = Retention(
+            paths.database,
+            archive=self.archive,
+            captures=self.captures,
+            debug_dir=paths.debug,
+        )
         self._listener: socket.socket | None = None
         self._lock_file: Any = None
         self._stop: threading.Event | None = None
@@ -139,12 +146,12 @@ class StateOwner:
             if not isinstance(path, str) or not path:
                 raise ValueError("archive checkpoint path is required")
             ingested = self.archive.ingest(Path(path))
-            maintained = self.archive.maintain_if_due()
+            maintained = self.retention.run_if_due()
             return {"ok": True, **ingested, "maintenance": maintained}
         if operation == "archive_import":
             return {"ok": True, **self.archive.import_existing()}
-        if operation == "archive_maintain":
-            return {"ok": True, **self.archive.maintain(), **self.captures.maintain()}
+        if operation == "retention_run":
+            return {"ok": True, **self.retention.run()}
         if operation == "capture_ingest":
             required = ("path", "server", "epoch", "pane_spec", "reason")
             values = {name: request.get(name) for name in required}
@@ -163,7 +170,7 @@ class StateOwner:
                 reason=values["reason"],
                 observed_at=observed_at,
             )
-            maintained = self.captures.maintain_if_due()
+            maintained = self.retention.run_if_due()
             return {"ok": True, **captured, "maintenance": maintained}
         if operation == "capture_release":
             required = ("server", "epoch", "pane_spec")
@@ -198,6 +205,7 @@ class StateOwner:
             self._listener = None
         if owned_socket:
             self.paths.socket.unlink(missing_ok=True)
+        self.retention.close()
         self.captures.close()
         self.archive.close()
         self.store.close()

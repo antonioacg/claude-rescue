@@ -320,26 +320,6 @@ class CaptureIndex:
             )
         return cursor.rowcount == 1
 
-    def maintain_if_due(
-        self, *, now: int | None = None, interval_seconds: int = 60 * 60
-    ) -> dict[str, int]:
-        now = _now() if now is None else now
-        with self._lock, self._connection:
-            row = self._connection.execute(
-                "SELECT value FROM state_owner_meta WHERE key = 'captures_maintained_at'"
-            ).fetchone()
-            last = int(row["value"]) if row is not None else 0
-            if now - last < interval_seconds:
-                return {"deleted_capture_refs": 0, "deleted_capture_blobs": 0}
-            self._connection.execute(
-                """
-                INSERT INTO state_owner_meta(key, value) VALUES('captures_maintained_at', ?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                """,
-                (str(now),),
-            )
-        return self.maintain(now=now)
-
     def maintain(self, *, now: int | None = None) -> dict[str, int]:
         now = _now() if now is None else now
         policy = self.policy
