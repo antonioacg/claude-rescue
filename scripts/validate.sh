@@ -689,6 +689,47 @@ assert "scenario 15: arm-sweep preserves active file when claude is alive in sub
 [ -n "$S15_SENTINEL_PID" ] && kill -TERM "$S15_SENTINEL_PID" 2>/dev/null
 
 # ---------------------------------------------------------------------------
+# Fork vs duplicate-resume. Claude Code <= 2.1.213 announced a --fork-session
+# pane as source=resume carrying the PARENT's id; from 2.1.214 it reports
+# source=fork carrying the fork's OWN id (verified on 2.1.257). Neither the
+# fork path nor the duplicate-resume guard had any coverage, so the guard could
+# silently stop matching reality on a Claude Code upgrade.
+echo "[scenario 17] fork stamps its own id; duplicate resume is declined"
+
+tmux -L "$SOCK" new-window -t t1
+S17_PA=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S17_PA"
+tmux -L "$SOCK" new-window -t t1
+S17_PB=$(tmux -L "$SOCK" display-message -p -t t1 -F '#{pane_id}')
+wait_for_shell "$S17_PB"
+
+# Pane A owns a session.
+S17_PARENT=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S17_PA" "$S17_PARENT" "/tmp/s17" startup
+sleep 2
+S17_UA=$(tmux -L "$SOCK" show-options -pv -t "$S17_PA" @claude-pane-id)
+assert "scenario 17a: parent pane owns the session" \
+  "$S17_PARENT" "$(cat "$HOME_DIR/active/$S17_UA" 2>/dev/null | tr -d '\n')"
+
+# (b) Pane B forks: source=fork with its OWN new id. The guard must NOT fire —
+# the id is unique, so declining it would leave the fork untracked.
+S17_FORK=$(uuidgen|tr A-Z a-z)
+emit_session_start "$S17_PB" "$S17_FORK" "/tmp/s17" fork
+sleep 2
+S17_UB=$(tmux -L "$SOCK" show-options -pv -t "$S17_PB" @claude-pane-id)
+assert "scenario 17b: forked pane is stamped with its own id" \
+  "$S17_FORK" "$(cat "$HOME_DIR/active/$S17_UB" 2>/dev/null | tr -d '\n')"
+assert "scenario 17c: fork does not disturb the parent pane" \
+  "$S17_PARENT" "$(cat "$HOME_DIR/active/$S17_UA" 2>/dev/null | tr -d '\n')"
+
+# (d) Duplicate resume: pane B resumes the id pane A still holds. The guard
+# MUST decline, or two live panes collide on one id.
+emit_session_start "$S17_PB" "$S17_PARENT" "/tmp/s17" resume
+sleep 2
+assert "scenario 17d: duplicate resume does not steal the parent's id" \
+  "$S17_FORK" "$(cat "$HOME_DIR/active/$S17_UB" 2>/dev/null | tr -d '\n')"
+
+# ---------------------------------------------------------------------------
 # Retention on the DEFAULT route. Every earlier resurrect-save assertion runs
 # either without claude-rescue-state on PATH or against the retired legacy
 # archive path, so the route production actually takes had no coverage — which
