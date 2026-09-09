@@ -226,11 +226,17 @@ if [ "$debug" -eq 1 ]; then
 fi
 
 # --- cwd-mismatch detection -----------------------------------------------
-# When resuming with -r <sid>, claude looks up the transcript jsonl under
-# the project dir derived from the SHELL's current cwd, not the session's
-# original cwd. If they differ, claude prints "No conversation found with
-# session ID: <sid>" and the user has to figure out where to cd. Catch the
-# divergence here so the log shows it the moment it happens.
+# A resumed session runs with the SHELL's cwd, not the cwd it was launched in.
+# When those differ the session comes back pointed at the wrong project: wrong
+# CLAUDE.md, wrong relative paths, wrong repo. Catch the divergence here so the
+# log shows it the moment it happens.
+#
+# It is NOT a resolution failure. Verified on claude 2.1.257: `claude -r <sid>`
+# finds the session from any directory and appends to its existing transcript.
+# Older comments here claimed a mismatch made claude print "No conversation
+# found with session ID" or silently start a FRESH session; neither reproduces.
+# The cwd rescue below is therefore about restoring context, not about making
+# the resume work at all.
 #
 # Source of truth for the session's cwd at hibernation time:
 # $DATA/captures/<pane_uuid>.json. If absent (pane was never hibernated,
@@ -247,13 +253,16 @@ fi
 __rescue_log "resolved pid=$$ pane=${TMUX_PANE:-<unset>} pane_uuid=${pane_uuid:-} active_sid=${active_sid:-} find_sessions_sid=${found_sid:-} saved_uuid=${existing_uuid:-} target=${target_uuid:-<fresh>} pwd=$PWD session_cwd=${session_cwd:-<none>} cwd_match=$cwd_match"
 
 # --- cwd rescue: land in the session's launch dir before exec --------------
-# A restore can drop this pane in the wrong $PWD (e.g. $HOME). `claude -r <sid>`
-# resolves the transcript against $PWD's project dir, so a wrong $PWD silently
-# starts a FRESH session instead of resuming. If we have a confident target and
-# the current $PWD does NOT hold its jsonl, cd to a candidate launch dir that
-# DOES. The jsonl-existence check is the safety net: we only move to a dir where
-# the resume is guaranteed to resolve, so a bad candidate can never make things
-# worse than the inherited $PWD (no-op on the happy path, where $PWD is right).
+# A restore can drop this pane in the wrong $PWD (e.g. $HOME), which resumes
+# the session against the wrong project (see the note above: the resume itself
+# resolves from anywhere). If we have a confident target and the current $PWD
+# does NOT hold its jsonl, cd to a candidate launch dir that DOES. The
+# jsonl-existence check is the safety net: we only move to a dir the session
+# actually belongs to, so a bad candidate can never make things worse than the
+# inherited $PWD (no-op on the happy path, where $PWD is right).
+#
+# `claude-rescue resume-dir <sid>` is the same lookup, exposed for the clr
+# front-end; keep the two in step.
 if [ -n "${target_uuid:-}" ]; then
   __projects_root="${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
   if [ ! -f "$__projects_root/$(encode_cwd_for_projects "$PWD")/${target_uuid}.jsonl" ]; then
