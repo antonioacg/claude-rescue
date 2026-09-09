@@ -1,33 +1,44 @@
 #!/usr/bin/env bash
-# claude-rescue — interactive picker for recovering Claude Code sessions
-# from the per-window event logs maintained by bin/rescue-log.
+# claude-rescue — find and resume a Claude Code session.
 #
-# Top-level usage (from inside tmux):
-#   claude-rescue              Open the two-stage drill-down picker.
+# Top-level usage:
+#   claude-rescue              Open the picker in a tmux popup and type the
+#                              chosen session's resume command into the pane it
+#                              was opened from. Bound to prefix+R.
 #
-# Internal subcommands (used by fzf and re-execs):
-#   list-windows                    Display rows of windows for the picker
-#                                   (\x1f-separated; see list_windows_tsv).
-#   list-sessions <window>          TSV of sessions for a given window.
-#   preview-window <window>         Preview text for the highlighted window row.
-#   preview-session <window> <sid>  Preview text for the highlighted session row.
-#   find-sessions [filter ...]      Cross-window session search (used by the
-#                                   filter-toggle modes and by claude-rescue-resume).
-#   print [pane_uuid|sid]           Cat a saved pane capture (no arg = current
-#                                   pane via @claude-pane-id). Reads from
-#                                   $DATA/captures/<pane_uuid>.{txt,json}.
+# The picker searches the TRANSCRIPT CORPUS (claude's own jsonl) by content
+# with ripgrep, orders by last-active, and scopes to $PWD's project by default
+# — tab widens to all projects. Sessions a live pane already holds are labelled
+# with that pane and cannot be selected, because two claudes on one transcript
+# corrupt it.
+#
+# Picker subcommands (the fzf callbacks; `pick` is also useful on its own):
+#   pick [query]                    Print the chosen session id, nothing on
+#                                   cancel. This is what `clr` calls.
+#   index                           The session index, newest first (debug).
+#   pick-rows [--scope cwd|all] [--state F] [query]
+#   pick-header F / pick-toggle F / pick-preview <sid> / pick-copy <sid>
+#   live-sessions                   session_id TAB session:window.pane for
+#                                   sessions a live pane still holds.
 #
 # Transcript-corpus subcommands (claude's own jsonl under ~/.claude/projects,
 # not our event log):
 #   model <sid>                     Model id to resume <sid> with, or empty.
 #   latest [--cwd DIR]              Newest session id for DIR (default $PWD).
-#   resume-dir <sid>                Directory `claude -r <sid>` resolves from.
+#   resume-dir <sid>                Directory <sid> belongs to.
 #
-# Exit keys (level 2):
+# Event-log subcommands (this repo's own History Events):
+#   find-sessions [filter ...]      Cross-window session search (used by
+#                                   claude-rescue-resume).
+#   print [pane_uuid|sid]           Cat a saved pane capture (no arg = current
+#                                   pane via @claude-pane-id). Reads from
+#                                   $DATA/captures/<pane_uuid>.{txt,json}.
+#
+# Picker keys:
 #   enter     resume in the originating pane
-#   ctrl-n    resume in a new tmux window in the originating session
-#   ctrl-w    resume in a brand-new tmux session
-#   ctrl-y    copy session UUID to the clipboard
+#   tab       toggle scope: this directory / all projects
+#   ctrl-y    copy the session id
+#   esc       cancel
 
 set -uo pipefail
 
@@ -49,104 +60,6 @@ ensure_dirs
 # ---------------------------------------------------------------------------
 # Data formatters
 
-# Display-ready rows for the picker's level-1 window list, newest-first.
-# Emits \x1f-separated: window_uuid, age, session_count, label
-#   age    humanized relative time (computed in jq)
-#   label  the window's last sampled title — which the watcher already ran
-#          through window-label.sh at sample time, so it matches the status
-#          bar — with a defensive leading-glyph strip; falls back to the
-#          tildified primary_cwd when the window never sampled a title.
-# Windows with zero sessions are skipped (title-only history, nothing to resume).
-#
-# One jq pass over ALL meta files (not one per file), with age + label + sort
-# all done inside jq. On a few-hundred-window store that is the difference
-# between ~6s (a jq fork per file plus a date/sed fork per row) and <100ms to
-# first paint.
-list_windows_tsv() {
-  local meta_dir="$CLAUDE_RESCUE_DATA_HOME/windows"
-  [ -d "$meta_dir" ] || return 0
-
-  shopt -s nullglob
-  local metas=("$meta_dir"/*.meta.json)
-  shopt -u nullglob
-  [ ${#metas[@]} -eq 0 ] && return 0
-
-  jq -rn \
-    --argjson now "$(date -u +%s)" \
-    --arg strip '^[^ -~]+ *' \
-    --arg home "$HOME" '
-    def age($ts):
-      if ($ts // "") == "" then "?"
-      else (try ($ts | fromdateiso8601) catch null) as $t
-        | if   $t == null            then "?"
-          elif ($now - $t) < 60      then "just now"
-          elif ($now - $t) < 3600    then "\((($now - $t) / 60)    | floor)m ago"
-          elif ($now - $t) < 86400   then "\((($now - $t) / 3600)  | floor)h ago"
-          else                            "\((($now - $t) / 86400) | floor)d ago"
-          end
-      end;
-    def tildify($p):
-      if   $p == $home                    then "~"
-      elif ($p | startswith($home + "/")) then "~" + ($p[($home | length):])
-      else $p end;
-    [ inputs ]
-    | map(
-        (.sessions // []) as $s | ($s | length) as $c | select($c > 0)
-        | (($s | map(.last_title) | map(select(. != null)) | .[0]) // "") as $t
-        | { uuid: .window_uuid, ls: (.last_seen // ""), c: $c,
-            label: (if $t == "" then tildify(.primary_cwd // "?")
-                    else ($t | gsub($strip; "")) end) }
-      )
-    | sort_by(.ls) | reverse
-    | .[] | [ .uuid, age(.ls), (.c | tostring), .label ]
-    | join("")
-  ' "${metas[@]}"
-}
-
-# Columns: session_id ⎵ started ⎵ ended ⎵ cwd ⎵ pane_uuid ⎵ source ⎵ window_name ⎵ label
-# Separator is ASCII unit-separator (\x1f), NOT tab. bash's `read` collapses
-# consecutive whitespace IFS chars (tabs included), which silently drops empty
-# fields and shifts the rest. Non-whitespace IFS preserves them.
-# `label` falls back: last_title → first_user_message → empty.
-list_sessions_tsv() {
-  local window_uuid="$1"
-  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
-  [ -f "$meta" ] || return 0
-  jq -r '
-    def US: "";
-    . as $meta |
-    .sessions // [] | .[] |
-      [
-        .session_id, (.started // ""), (.ended // ""),
-        (.cwd // ""), (.pane_uuid // ""), (.source // ""),
-        ($meta.window_name // ""),
-        (.last_title // (.first_user_message // "")[:80])
-      ] | join(US)
-  ' "$meta"
-}
-
-preview_window() {
-  local window_uuid="$1"
-  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
-  [ -f "$meta" ] || { echo "(no metadata)"; return 0; }
-
-  jq -r '
-    def tildify: sub("^" + env.HOME; "~");
-    def strip_glyphs: sub("^[^ -~]+ +"; "");
-    "Path:   \((.primary_cwd // "?") | tildify)",
-    "Range:  \(.first_seen // "?") → \(.last_seen // "?")",
-    "",
-    "Sessions (\(.sessions | length)):",
-    "",
-    (.sessions[] |
-      "  • \((.last_title | if . == null or . == "" then null else strip_glyphs end) // (.first_user_message[:80]) // "(no label)")",
-      "    id: \(.session_id)",
-      "    started: \(.started // "?")  ended: \(.ended // "(open)")",
-      "    pane: \(.pane_uuid // "?")  source: \(.source // "?")",
-      ""
-    )
-  ' "$meta"
-}
 
 # Replace the leading $HOME with ~ for display purposes.
 tildify() {
@@ -158,267 +71,41 @@ tildify() {
   esac
 }
 
-# Format a sampled pane title for display.
-#
-# If $CLAUDE_RESCUE_TITLE_FORMATTER is set and points to an executable, call
-# it with four positional args matching the user's existing window-label.sh
-# convention:
-#     <window_name> <pane_command> <pane_title> <host_short>
-# and use its stdout as the label. Empty stdout / formatter failure falls
-# back to the default behaviour.
-#
-# Default: strip a leading run of non-ASCII-printable bytes plus following
-# spaces (Claude's spinner glyph and similar). Raw event log keeps the
-# unmodified title for data fidelity; this is display-only.
-format_title() {
-  local window_name="$1" pane_command="$2" pane_title="$3"
-  # Backfilled events don't carry pane_command separately. window_name there
-  # is = pane_current_command (per the backfill fix), so substituting it in
-  # gives the formatter the same view it'd have for a live pane.
-  [ -z "$pane_command" ] && pane_command="$window_name"
-  if [ -n "${CLAUDE_RESCUE_TITLE_FORMATTER:-}" ] && [ -x "$CLAUDE_RESCUE_TITLE_FORMATTER" ]; then
-    local out
-    out="$("$CLAUDE_RESCUE_TITLE_FORMATTER" \
-      "${window_name:-}" "${pane_command:-}" "${pane_title:-}" "$(hostname -s)" 2>/dev/null)"
-    if [ -n "$out" ]; then
-      printf '%s' "$out"
-      return
-    fi
-  fi
-  printf '%s' "$pane_title" | sed -E 's/^[^ -~]+ *//'
-}
-
-preview_session() {
-  local window_uuid="$1" session_id="$2"
-  local log="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.jsonl"
-  [ -f "$log" ] || { echo "(no log)"; return 0; }
-
-  # Backfilled title events aren't session-attributed (no session_id on the
-  # event — they were derived from sampling). To produce a meaningful title
-  # timeline for a backfilled session, fall back to all window-level title
-  # events whose timestamp falls between this session's start and end.
-  # Header (static fields). $window_name pulled from the rollup meta — used
-  # below to feed the title formatter for both header context and history.
-  local window_name=""
-  local meta="$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json"
-  if [ -f "$meta" ]; then
-    window_name="$(jq -r '.window_name // ""' "$meta" 2>/dev/null)"
-  fi
-
-  jq -rs --arg sid "$session_id" '
-    . as $all
-    | [.[] | select(.session_id == $sid)] as $sevents
-    | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
-    | ([$sevents[] | select(.kind | startswith("session_end"))][0].ts) as $send
-    | [$sevents[] | select(.kind | startswith("title"))] as $own_titles
-    | (if ($own_titles | length) > 0
-       then $own_titles
-       else [.[] | select(.session_id == null
-                          and (.kind | startswith("title"))
-                          and ($sstart == null or .ts >= $sstart)
-                          and ($send == null or .ts <= $send))]
-       end) as $titles
-    | "Session: \($sid)",
-      "Started: \($sstart // "?")",
-      "Ended:   \($send // "(open)")",
-      "Cwd:     \((([$sevents[] | select(.cwd != null and .cwd != "")][0].cwd) // "?") | sub("^" + env.HOME; "~"))",
-      "Source:  \(([$sevents[] | select(.source != null)][0].source) // "?")",
-      "First:   \(([$sevents[] | select(.first_user_message != null)][0].first_user_message) // "(none)")",
-      "",
-      "Title history (\($titles | length)):",
-      ""
-  ' "$log"
-
-  # Title rows — emit raw <ts>\t<title> from jq, then run each title through
-  # format_title (which honours $CLAUDE_RESCUE_TITLE_FORMATTER if set, falls
-  # back to the built-in glyph strip). One fork per unique title; identical
-  # titles get cached in a tempdir keyed by SHA so heavy histories stay fast.
-  local cache_dir
-  cache_dir="$(mktemp -d -t cr-fmt.XXXXXX)"
-  trap "rm -rf '$cache_dir'" RETURN
-
-  # Use ASCII unit separator (\x1f) instead of tab. Bash's `read` collapses
-  # consecutive whitespace IFS chars (TAB included) into a single delimiter,
-  # which silently drops the empty window_name field — making raw_title read
-  # as the window_name and the actual title vanish entirely.
-  local US=$'\x1f'
-  jq -rs --arg sid "$session_id" --arg US "$US" '
-    . as $all
-    | [.[] | select(.session_id == $sid)] as $sevents
-    | ([$sevents[] | select(.kind | startswith("session_start"))][0].ts) as $sstart
-    | ([$sevents[] | select(.kind | startswith("session_end"))][0].ts) as $send
-    | [$sevents[] | select(.kind | startswith("title"))] as $own_titles
-    | (if ($own_titles | length) > 0
-       then $own_titles
-       else [.[] | select(.session_id == null
-                          and (.kind | startswith("title"))
-                          and ($sstart == null or .ts >= $sstart)
-                          and ($send == null or .ts <= $send))]
-       end)
-    | .[] | "\(.ts)\($US)\(.window_name // "")\($US)\(.title)"
-  ' "$log" \
-  | while IFS="$US" read -r ts ev_wname raw_title; do
-      [ -z "$raw_title" ] && continue
-      # Use the window_name AT THE TIME of the title event when present.
-      # Falls back to the window's rollup name (from meta) for live events
-      # which we don't currently re-stamp on every sample.
-      local effective_wname="${ev_wname:-$window_name}"
-      local cache_key cache_file formatted
-      cache_key="$(printf '%s|%s' "$effective_wname" "$raw_title" | shasum | cut -c1-12)"
-      cache_file="$cache_dir/$cache_key"
-      if [ -f "$cache_file" ]; then
-        formatted="$(cat "$cache_file")"
-      else
-        formatted="$(format_title "$effective_wname" "" "$raw_title")"
-        printf '%s' "$formatted" > "$cache_file"
-      fi
-      printf '  %s  %s\n' "$ts" "$formatted"
-    done
-}
 
 # ---------------------------------------------------------------------------
 # Render helpers (humanize TSV → display rows for fzf)
 
-humanize_age() {
-  # Argument: ISO 8601 UTC timestamp. Output a short relative string.
-  local ts="$1" then now diff
-  [ -z "$ts" ] && { echo "?"; return; }
-  then="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" "+%s" 2>/dev/null)" || { echo "?"; return; }
-  now="$(date -u +%s)"
-  diff=$((now - then))
-  if   [ $diff -lt 60 ];     then echo "just now"
-  elif [ $diff -lt 3600 ];   then echo "$((diff / 60))m ago"
-  elif [ $diff -lt 86400 ];  then echo "$((diff / 3600))h ago"
-  else echo "$((diff / 86400))d ago"
-  fi
-}
-
-format_window_rows() {
-  # Reads list_windows_tsv on stdin (\x1f-separated: uuid, age, count, label)
-  # and emits "uuid<TAB>display" rows for fzf. Columns: age(8L) #(3R) label.
-  # Pure printf — no per-row forks; jq humanized the age and cleaned the label
-  # (glyph strip, or cwd fallback for untitled windows) upstream. `label`
-  # already encodes the window name (e.g. "Implement storage… - claude"), so no
-  # separate window column is needed.
-  local US=$'\x1f' uuid age scount label
-  while IFS="$US" read -r uuid age scount label; do
-    printf '%s\t%-8s %3s  %s\n' "$uuid" "$age" "$scount" "$label"
-  done
-}
-
-format_find_session_rows() {
-  # Reads find-sessions output (US-separated, 9 cols) on stdin.
-  # Emits TSV: session_id<TAB>window_uuid<TAB>cwd<TAB>display
-  # display columns: age(8L) state(5L) source(15L) label
-  local US=$'\x1f'
-  while IFS="$US" read -r sid wuuid puuid started ended cwd source wname last_title; do
-    local age status line label
-    age="$(humanize_age "${started:-$ended}")"
-    if [ -z "$ended" ]; then status="open"; else status="ended"; fi
-    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
-    label="${label:-(no title)}"
-    line="$(printf '%-8s %-5s %-15s %s' \
-      "$age" "$status" "${source:--}" "$label")"
-    printf '%s\t%s\t%s\t%s\n' "$sid" "$wuuid" "$cwd" "$line"
-  done
-}
-
-# Cycle scope mode by `step` positions in the order list, skipping any mode
-# whose filter context is empty (e.g. no @claude-pane-id on the originating
-# pane → skip "pane" mode). step=+1 = forward (Tab); step=-1 = back (Shift-Tab).
-# Args: current_mode step wuuid puuid cwd. Echoes the next valid mode.
-cycle_mode() {
-  local current="$1" step="$2" w="$3" p="$4" c="$5"
-  local order=(all window pane cwd) i=0
-  for i in "${!order[@]}"; do
-    [ "${order[$i]}" = "$current" ] && break
-  done
-  local n=${#order[@]} j cand val
-  for ((j=1; j<=n; j++)); do
-    cand="${order[$(( ((i + step*j) % n + n) % n ))]}"
-    case "$cand" in
-      all)    echo "$cand"; return ;;
-      window) val="$w" ;;
-      pane)   val="$p" ;;
-      cwd)    val="$c" ;;
-    esac
-    if [ -n "$val" ]; then echo "$cand"; return; fi
-  done
-  echo all
-}
-next_mode() { cycle_mode "$1" 1  "$2" "$3" "$4"; }
-prev_mode() { cycle_mode "$1" -1 "$2" "$3" "$4"; }
-
-# Build a colored, single-line filter indicator for the picker header.
-# Bold cyan, no marker prefix.
-filter_indicator() {
-  local label="$1"
-  printf '\033[1;36m%s\033[0m' "$label"
-}
-
-format_session_rows() {
-  # Reads list_sessions_tsv (US-separated) on stdin, emits "session_id<TAB>display" rows.
-  # Columns: age(8L) state(5L) source(15L) label
-  local US=$'\x1f'
-  while IFS="$US" read -r sid started ended cwd pane_uuid source wname last_title; do
-    local age status line label
-    age="$(humanize_age "${started:-$ended}")"
-    if [ -z "$ended" ]; then status="open"; else status="ended"; fi
-    label="${last_title:+$(format_title "${wname:-}" "" "$last_title")}"
-    label="${label:-(no title)}"
-    line="$(printf '%-8s %-5s %-15s %s' \
-      "$age" "$status" "${source:--}" "$label")"
-    printf '%s\t%s\n' "$sid" "$line"
-  done
-}
 
 # ---------------------------------------------------------------------------
 # Action dispatch
 
 resume_command() {
-  # Builds the shell command to resume a session, given session_id and cwd.
-  local sid="$1" cwd="$2"
-  printf 'cd %q && claude --resume %q' "$cwd" "$sid"
+  # The command the picker types into a pane. `clr`, not `claude --resume`:
+  # the front-end repairs the [1m] context window (see the Model repair entry
+  # in CONTEXT.md), carries the usual flags, and lands in the session's own
+  # directory — so the cd has exactly one owner instead of being decided here
+  # too. Same recipe as the crash-restore Pre-fill.
+  local sid="$1"
+  printf 'clr %q' "$sid"
 }
 
 action_resume_here() {
-  local sid="$1" cwd="$2"
+  local sid="$1"
   local target="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
   if [ -z "$target" ]; then
     echo "no originating pane to send to" >&2
     return 1
   fi
-  # Shell gate: the target is whatever pane the picker was opened from. If
-  # its foreground isn't a shell (say, a claude already running there), the
-  # resume command would be submitted INTO that program as input.
+  # Shell gate: the target is whatever pane the picker was opened from. If its
+  # foreground isn't a shell (say, a claude already running there), the resume
+  # command would be submitted INTO that program as input.
   local cur_cmd
   cur_cmd="$(tmux display-message -p -t "$target" -F '#{pane_current_command}' 2>/dev/null || echo '')"
   if ! is_shell_cmd "$cur_cmd"; then
-    tmux display-message "claude-rescue: pane $target is running '$cur_cmd' — not typing a resume into it (use resume-in-new-window)" 2>/dev/null || true
+    tmux display-message "claude-rescue: pane $target is running '$cur_cmd' — not typing a resume into it" 2>/dev/null || true
     return 1
   fi
-  send_enter_burst "picker-resume-here" "$target" " $(resume_command "$sid" "$cwd")"
-}
-
-action_resume_new_window() {
-  local sid="$1" cwd="$2"
-  # Spawn a shell, then type the resume command into it. If we passed the
-  # claude command directly to new-window, tmux would close the window the
-  # moment claude exits — leaving the shell in place keeps the user at a
-  # prompt afterwards.
-  local pane
-  pane="$(tmux new-window -c "$cwd" -P -F '#{pane_id}')"
-  send_enter_burst "picker-resume-new-window" "$pane" " $(resume_command "$sid" "$cwd")"
-}
-
-action_resume_new_session() {
-  local sid="$1" cwd="$2"
-  local sname pane
-  sname="claude-$(printf '%s' "$sid" | cut -c1-8)"
-  tmux new-session -d -s "$sname" -c "$cwd"
-  pane="$(tmux display-message -p -t "$sname" '#{pane_id}')"
-  send_enter_burst "picker-resume-new-session" "$pane" " $(resume_command "$sid" "$cwd")"
-  tmux switch-client -t "$sname" 2>/dev/null || true
+  send_enter_burst "picker-resume-here" "$target" " $(resume_command "$sid")"
 }
 
 action_copy_uuid() {
@@ -435,204 +122,6 @@ action_copy_uuid() {
 # ---------------------------------------------------------------------------
 # Inner picker — runs inside the popup.
 
-popup_picker() {
-  local fzf_common=(
-    --ansi
-    --reverse
-    --no-multi
-    --header-lines=0
-    --preview-window=right:55%:wrap
-  )
-
-  # Originating pane context (used for filter scopes + indicator labels).
-  local orig_pane orig_window_uuid orig_pane_uuid orig_cwd orig_window_index orig_pane_index
-  orig_pane="${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}"
-  if [ -n "$orig_pane" ]; then
-    orig_window_uuid="$(tmux show-options -wv -t "$orig_pane" @claude-window-id 2>/dev/null || true)"
-    orig_pane_uuid="$(tmux show-options -pv -t "$orig_pane" @claude-pane-id 2>/dev/null || true)"
-    orig_cwd="$(tmux display-message -p -t "$orig_pane" '#{pane_current_path}' 2>/dev/null || true)"
-    orig_window_index="$(tmux display-message -p -t "$orig_pane" '#{window_index}' 2>/dev/null || true)"
-    orig_pane_index="$(tmux display-message -p -t "$orig_pane" '#{pane_index}' 2>/dev/null || true)"
-  fi
-
-  local mode=all
-  local last_window_uuid=""
-
-  while true; do
-    if [ "$mode" = "all" ]; then
-      # ===== Mode "all": two-stage drill (windows → sessions) =====
-      local rows
-      rows="$(list_windows_tsv | format_window_rows)"
-      if [ -z "$rows" ]; then
-        echo "No windows logged yet. Start a claude session and try again." >&2
-        return 1
-      fi
-
-      local start_pos=1
-      if [ -n "$last_window_uuid" ]; then
-        start_pos="$(printf '%s\n' "$rows" \
-          | awk -F'\t' -v u="$last_window_uuid" '$1==u {print NR; exit}')"
-      fi
-      start_pos="${start_pos:-1}"
-
-      local l1_out l1_key l1_sel l1_header l1_footer
-      l1_header="$(filter_indicator 'showing all')"$'\nage        #   label'
-      l1_footer=$'↩ open · ⎋ cancel\n⇥/⇧⇥ change filter'
-      l1_out="$(printf '%s\n' "$rows" \
-        | fzf "${fzf_common[@]}" \
-            --with-nth=2.. --delimiter=$'\t' \
-            --prompt='windows> ' \
-            --header="$l1_header" \
-            --footer="$l1_footer" \
-            --bind "start:pos($start_pos)" \
-            --expect=tab,shift-tab \
-            --preview "$0 preview-window {1}" \
-      )" || return 0
-
-      l1_key="$(printf '%s' "$l1_out" | sed -n 1p)"
-      l1_sel="$(printf '%s' "$l1_out" | sed -n 2p)"
-      if [ "$l1_key" = "tab" ]; then
-        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      elif [ "$l1_key" = "shift-tab" ]; then
-        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      fi
-
-      local window_uuid
-      window_uuid="$(printf '%s' "$l1_sel" | cut -f1)"
-      [ -z "$window_uuid" ] && return 0
-      last_window_uuid="$window_uuid"
-
-      local s_rows
-      s_rows="$(list_sessions_tsv "$window_uuid" | format_session_rows)"
-      if [ -z "$s_rows" ]; then
-        echo "(no sessions in window $window_uuid)" >&2
-        return 1
-      fi
-
-      local l2_out l2_key l2_sel l2_header l2_footer
-      l2_header="$(filter_indicator 'showing all')"$'\nage      state source          label'
-      l2_footer=$'↩ resume · ^N win · ^W sess · ^Y copy\n⎋ back · ⇥/⇧⇥ change filter'
-      l2_out="$(printf '%s\n' "$s_rows" \
-        | fzf "${fzf_common[@]}" \
-            --with-nth=2.. --delimiter=$'\t' \
-            --prompt='sessions> ' \
-            --header="$l2_header" \
-            --footer="$l2_footer" \
-            --expect=ctrl-n,ctrl-w,ctrl-y,tab,shift-tab \
-            --preview "$0 preview-session $window_uuid {1}" \
-      )"
-      local rc=$?
-
-      if [ $rc -ne 0 ]; then
-        # esc at level 2 → loop back to level 1 (same mode)
-        continue
-      fi
-
-      l2_key="$(printf '%s' "$l2_out" | sed -n 1p)"
-      l2_sel="$(printf '%s' "$l2_out" | sed -n 2p)"
-      if [ "$l2_key" = "tab" ]; then
-        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      elif [ "$l2_key" = "shift-tab" ]; then
-        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      fi
-
-      local sid
-      sid="$(printf '%s' "$l2_sel" | cut -f1)"
-      [ -z "$sid" ] && continue
-
-      local cwd
-      cwd="$(jq -r --arg sid "$sid" \
-        '.sessions[] | select(.session_id == $sid) | .cwd // ""' \
-        "$CLAUDE_RESCUE_DATA_HOME/windows/$window_uuid.meta.json")"
-      [ -z "$cwd" ] && cwd="$HOME"
-
-      case "$l2_key" in
-        ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
-        ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
-        ctrl-y) action_copy_uuid "$sid" ;;
-        *)      action_resume_here "$sid" "$cwd" ;;
-      esac
-      return 0
-
-    else
-      # ===== Scoped modes: flat session list via find-sessions =====
-      local filter_arg filter_val mode_label
-      case "$mode" in
-        window)
-          filter_arg=--window-uuid
-          filter_val="$orig_window_uuid"
-          mode_label="window #${orig_window_index:-?} ${orig_window_uuid:0:8}…"
-          ;;
-        pane)
-          filter_arg=--pane-uuid
-          filter_val="$orig_pane_uuid"
-          mode_label="pane #${orig_window_index:-?}.${orig_pane_index:-?} ${orig_pane_uuid:0:8}…"
-          ;;
-        cwd)
-          filter_arg=--cwd
-          filter_val="$orig_cwd"
-          mode_label="cwd $(tildify "${orig_cwd:-?}")"
-          ;;
-      esac
-
-      if [ -z "$filter_val" ]; then
-        # Skip — context missing for this mode.
-        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      fi
-
-      local f_rows
-      f_rows="$("$0" find-sessions "$filter_arg" "$filter_val" | format_find_session_rows)"
-
-      local f_out f_key f_sel
-      if [ -z "$f_rows" ]; then
-        f_rows=$'\t\t\t  (no sessions in this scope)'
-      fi
-
-      local f_header f_footer
-      f_header="$(filter_indicator "$mode_label")"$'\nage      state source          label'
-      f_footer=$'↩ resume · ^N win · ^W sess · ^Y copy\n⎋ cancel · ⇥/⇧⇥ change filter'
-      f_out="$(printf '%s\n' "$f_rows" \
-        | fzf "${fzf_common[@]}" \
-            --with-nth=4.. --delimiter=$'\t' \
-            --prompt='sessions> ' \
-            --header="$f_header" \
-            --footer="$f_footer" \
-            --expect=ctrl-n,ctrl-w,ctrl-y,tab,shift-tab \
-            --preview "$0 preview-session {2} {1}" \
-      )" || return 0
-
-      f_key="$(printf '%s' "$f_out" | sed -n 1p)"
-      f_sel="$(printf '%s' "$f_out" | sed -n 2p)"
-      if [ "$f_key" = "tab" ]; then
-        mode="$(next_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      elif [ "$f_key" = "shift-tab" ]; then
-        mode="$(prev_mode "$mode" "$orig_window_uuid" "$orig_pane_uuid" "$orig_cwd")"
-        continue
-      fi
-
-      local sid wuuid cwd
-      sid="$(printf '%s' "$f_sel" | cut -f1)"
-      wuuid="$(printf '%s' "$f_sel" | cut -f2)"
-      cwd="$(printf '%s' "$f_sel" | cut -f3)"
-      [ -z "$sid" ] && continue
-      [ -z "$cwd" ] && cwd="$HOME"
-
-      case "$f_key" in
-        ctrl-n) action_resume_new_window  "$sid" "$cwd" ;;
-        ctrl-w) action_resume_new_session "$sid" "$cwd" ;;
-        ctrl-y) action_copy_uuid "$sid" ;;
-        *)      action_resume_here "$sid" "$cwd" ;;
-      esac
-      return 0
-    fi
-  done
-}
 
 # ---------------------------------------------------------------------------
 # find-sessions: shared query primitive. Used by the picker filter toggle
@@ -939,22 +428,319 @@ latest_session() {
 }
 
 # ---------------------------------------------------------------------------
+# Session picker — fzf over the transcript corpus.
+
+# mtime, size and path for many files in ONE process: a fork per file costs
+# more than the scan itself at this corpus size. BSD stat first, GNU second —
+# the same probe order as is_busy in claude-rescue-log. Fields are
+# space-separated with the path last, so a path containing spaces survives
+# (awk rejoins from field 3 onward).
+stat_batch() {
+  [ $# -gt 0 ] || return 0
+  stat -f '%m %z %N' "$@" 2>/dev/null || stat -c '%Y %s %n' "$@" 2>/dev/null
+}
+
+session_index_path() { printf '%s/session-index.tsv' "$CLAUDE_RESCUE_CACHE_HOME"; }
+
+# Index of resumable sessions, newest first.
+# TSV: session_id, path, mtime, size, launch_cwd, warn, title
+#
+# Cached and refreshed incrementally. Entries are keyed by (path, mtime, size),
+# so reopening the picker rescans only transcripts that actually changed —
+# first paint then costs one stat call, not a walk over gigabytes. A cold build
+# is three rg passes over the changed set (never per file): one for the title
+# and model records, which are rare, and two -m1 passes for the launch cwd and
+# the first user message, where rg stops at the first hit per file.
+#
+# rg --json + jq rather than --with-filename: the output is path plus arbitrary
+# matched text, and a title can contain anything including a colon, so there is
+# no safe character to split a `path:match` line on. --json separates them
+# structurally and jq unescapes the values.
+#
+# `warn` marks a session whose newest model record is a bare downgrade of an
+# earlier [1m] — see the Model repair entry in CONTEXT.md.
+session_index() {
+  local root cache work
+  root="$(projects_root)"
+  cache="$(session_index_path)"
+  [ -d "$root" ] || return 0
+  shopt -s nullglob
+  local files=("$root"/*/*.jsonl)
+  shopt -u nullglob
+  [ ${#files[@]} -gt 0 ] || return 0
+
+  mkdir -p "$CLAUDE_RESCUE_CACHE_HOME" 2>/dev/null || return 0
+  work="$CLAUDE_RESCUE_CACHE_HOME/.index-work.$$"
+  [ -f "$cache" ] || : > "$cache"
+
+  stat_batch "${files[@]}" \
+    | awk '{ m=$1; s=$2; p=$3; for (i=4; i<=NF; i++) p = p " " $i
+             n=p; sub(/.*\//, "", n); sub(/\.jsonl$/, "", n)
+             print n "\t" p "\t" m "\t" s }' > "$work.now" 2>/dev/null
+
+  # FILENAME, not the usual NR==FNR: on the first run the cache is zero-byte,
+  # and an empty first file leaves NR and FNR in lockstep for the whole second
+  # file, so NR==FNR would stay true and mark nothing as changed.
+  awk -F'\t' -v cf="$cache" 'FILENAME == cf { k[$2] = $3 "\t" $4; next }
+                             k[$2] != $3 "\t" $4 { print $2 }' \
+      "$cache" "$work.now" > "$work.changed" 2>/dev/null
+
+  : > "$work.attrs"
+  if [ -s "$work.changed" ] && command -v rg >/dev/null 2>&1; then
+    local jqp='select(.type=="match")
+      | .data.path.text as $p | .data.submatches[0].match.text as $m
+      | if   ($m|test("^\\{\"type\":\"(ai|custom)-title\"")) then
+               [$p,"title",($m|capture("\"(?<k>ai|custom)-title\"").k),
+                ($m|capture("Title\":\"(?<v>.*)\"$").v)]
+        elif ($m|test("^\"type\":\"model\"")) then
+               [$p,"model","",($m|capture("modelId\":\"(?<v>.*)\"$").v)]
+        elif ($m|test("^\"cwd\"")) then
+               [$p,"cwd","",($m|capture("^\"cwd\":\"(?<v>.*)\"$").v)]
+        else   [$p,"msg","",($m|capture("content\":\"(?<v>.*)$").v)] end
+      | @tsv'
+    tr '\n' '\0' < "$work.changed" | xargs -0 rg --json --no-messages \
+        -e '^\{"type":"(ai-title|custom-title)","(aiTitle|customTitle)":"[^"]*"' \
+        -e '"type":"model","identity":\{"modelId":"[^"]*"' 2>/dev/null \
+      | jq -r "$jqp" >> "$work.attrs" 2>/dev/null
+    tr '\n' '\0' < "$work.changed" | xargs -0 rg --json --no-messages -m1 \
+        -e '"cwd":"[^"]*"' 2>/dev/null | jq -r "$jqp" >> "$work.attrs" 2>/dev/null
+    tr '\n' '\0' < "$work.changed" | xargs -0 rg --json --no-messages -m1 \
+        -e '"role":"user","content":"[^"]{1,200}' 2>/dev/null \
+      | jq -r "$jqp" >> "$work.attrs" 2>/dev/null
+  fi
+
+  # Per-path rollup. Title precedence: the newest /rename, else the newest
+  # auto-generated title, else a cleaned-up first user message.
+  awk -F'\t' '
+    { seen[$1] = 1 }
+    $2 == "cwd"   { cwd[$1] = $4 }
+    $2 == "model" { lastm[$1] = $4; if ($4 ~ /\[1m\]$/) had1m[$1] = 1 }
+    $2 == "msg"   { if (!($1 in msg)) msg[$1] = $4 }
+    $2 == "title" { if ($3 == "custom") cust[$1] = $4; else ai[$1] = $4 }
+    END {
+      for (p in seen) {
+        t = (p in cust) ? cust[p] : ((p in ai) ? ai[p] : msg[p])
+        gsub(/\\[nrt]|\\"|[\t\r\n]+/, " ", t); gsub(/  +/, " ", t)
+        sub(/^ +/, "", t); sub(/ +$/, "", t)
+        if (length(t) > 58) t = substr(t, 1, 57) "\xe2\x80\xa6"
+        w = (had1m[p] && lastm[p] !~ /\[1m\]$/) ? 1 : ""
+        print p "\t" cwd[p] "\t" w "\t" t
+      }
+    }' "$work.attrs" > "$work.roll" 2>/dev/null
+
+  awk -F'\t' -v rf="$work.roll" -v cf="$cache" '
+    FILENAME == rf { r_cwd[$1]=$2; r_warn[$1]=$3; r_title[$1]=$4; fresh[$1]=1; next }
+    FILENAME == cf { c_cwd[$2]=$5; c_warn[$2]=$6; c_title[$2]=$7; next }
+    {
+      p = $2
+      if (p in fresh) print $1 "\t" p "\t" $3 "\t" $4 "\t" r_cwd[p] "\t" r_warn[p] "\t" r_title[p]
+      else            print $1 "\t" p "\t" $3 "\t" $4 "\t" c_cwd[p] "\t" c_warn[p] "\t" c_title[p]
+    }' "$work.roll" "$cache" "$work.now" 2>/dev/null \
+    | sort -t"$(printf '\t')" -k3,3nr > "$work.next"
+
+  if [ -s "$work.next" ]; then
+    mv -f "$work.next" "$cache" 2>/dev/null
+  fi
+  rm -f "$work".*
+  cat "$cache"
+}
+
+# session_id -> "session:window.pane" for sessions a live pane still holds.
+#
+# The active files outlive the panes that wrote them, so tmux is the authority:
+# only panes present in this server get a label. Outside tmux there is nothing
+# to check against, so nothing is labelled and nothing is blocked.
+live_session_labels() {
+  [ -n "${TMUX:-}" ] || return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  local line puuid target sid
+  tmux list-panes -a -F '#{@claude-pane-id}|#{session_name}:#{window_index}.#{pane_index}' \
+       2>/dev/null | while IFS= read -r line; do
+    puuid="${line%%|*}"
+    target="${line#*|}"
+    [ -n "$puuid" ] || continue
+    sid="$(read_active_session "$puuid")"
+    [ -n "$sid" ] || continue
+    printf '%s\t%s\n' "$sid" "$target"
+  done
+}
+
+# Rows for the picker. Emits: session_id TAB live-label TAB display
+# (live label is "-" when the session is not held by a pane, so the Enter
+# binding can test the field without an empty-argument surprise).
+pick_rows() {
+  local scope="cwd" query="" state="" root slug idx work
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --state) state="${2:-}"; shift 2 ;;
+      --scope) scope="${2:-cwd}"; shift 2 ;;
+      *) query="$1"; shift ;;
+    esac
+  done
+  [ -n "$state" ] && [ -f "$state" ] && scope="$(head -1 "$state" 2>/dev/null)"
+  root="$(projects_root)"
+  idx="$(session_index)"
+  [ -n "$idx" ] || return 0
+
+  if [ "$scope" = "cwd" ]; then
+    slug="$(encode_cwd_for_projects "$PWD")"
+    idx="$(printf '%s\n' "$idx" | awk -F'\t' -v s="/$slug/" 'index($2, s) > 0')"
+  fi
+
+  mkdir -p "$CLAUDE_RESCUE_CACHE_HOME" 2>/dev/null
+  work="$CLAUDE_RESCUE_CACHE_HOME/.pick-work.$$"
+
+  # Content search. Short queries match everything, so they are not worth a
+  # pass over the corpus. Subagent hits fold into the session that owns them:
+  # only <slug>/<sid>.jsonl can be resumed by name, and an orphaned
+  # <slug>/subagents/... has no session to fold into.
+  #
+  # Matches are handed to awk through a FILE, never through -v: a -v value
+  # cannot contain a literal newline (awk aborts with "newline in string").
+  if [ ${#query} -ge 3 ]; then
+    local scan="$root"
+    [ "$scope" = "cwd" ] && scan="$root/$slug"
+    rg -l --no-messages -i -F -g '*.jsonl' -- "$query" "$scan" 2>/dev/null \
+      | awk -F'/' -v n="$(printf '%s' "$root" | awk -F'/' '{print NF}')" '
+          { if (NF == n + 2) { s = $NF; sub(/\.jsonl$/, "", s); print s }
+            else if (NF > n + 2 && $(n + 2) != "subagents") print $(n + 2) }' \
+      | sort -u > "$work.hits" 2>/dev/null
+    if [ ! -s "$work.hits" ]; then
+      rm -f "$work".*
+      return 0
+    fi
+    idx="$(printf '%s\n' "$idx" \
+      | awk -F'\t' -v hf="$work.hits" 'FILENAME == hf { keep[$1] = 1; next } keep[$1]' \
+            "$work.hits" -)"
+  fi
+  if [ -z "$idx" ]; then
+    rm -f "$work".*
+    return 0
+  fi
+
+  live_session_labels > "$work.live" 2>/dev/null
+  printf '%s\n' "$idx" | awk -F'\t' \
+      -v lf="$work.live" -v now="$(date +%s)" -v home="$HOME" '
+    FILENAME == lf { if ($1 != "") L[$1] = $2; next }
+    {
+      sid = $1; mt = $3; cw = $5; wn = $6; ti = $7
+      d = now - mt
+      if      (d <    60) a = "now"
+      else if (d <  3600) a = int(d /    60) "m"
+      else if (d < 86400) a = int(d /  3600) "h"
+      else                a = int(d / 86400) "d"
+      # Same rule as tildify(), inline because a bash call per row costs more
+      # than the whole render.
+      if (index(cw, home) == 1) cw = "~" substr(cw, length(home) + 1)
+      lbl = (sid in L) ? L[sid] : "-"
+      if (ti == "") ti = "(untitled)"
+      printf "%s\t%s\t%-4s %s %-58s %s%s\n", sid, lbl, a, (wn == "1" ? "!" : " "), ti, cw,
+             (lbl == "-" ? "" : "  [live " lbl "]")
+    }' "$work.live" -
+  rm -f "$work".*
+}
+
+pick_header() {
+  local state="${1:-}" scope="cwd" here
+  [ -n "$state" ] && [ -f "$state" ] && scope="$(head -1 "$state" 2>/dev/null)"
+  here="$(tildify "$PWD")"
+  if [ "$scope" = "cwd" ]; then
+    printf 'scope: %s   (tab: all projects)   ! = 200K downgrade' "$here"
+  else
+    printf 'scope: all projects   (tab: %s only)   ! = 200K downgrade' "$here"
+  fi
+}
+
+pick_toggle() {
+  local state="${1:-}" scope="cwd"
+  [ -n "$state" ] || return 0
+  [ -f "$state" ] && scope="$(head -1 "$state" 2>/dev/null)"
+  if [ "$scope" = "cwd" ]; then printf 'all\n' > "$state"; else printf 'cwd\n' > "$state"; fi
+}
+
+pick_preview() {
+  local sid="${1:-}" path row cwd model
+  [ -n "$sid" ] || return 0
+  path="$(transcript_for_session "$sid")"
+  if [ -z "$path" ]; then echo "(no transcript on disk)"; return 0; fi
+  row="$(session_index | awk -F'\t' -v s="$sid" '$1 == s { print; exit }')"
+  cwd="$(printf '%s' "$row" | cut -f5)"
+  model="$(session_model "$sid")"
+  echo "session : $sid"
+  echo "cwd     : $(tildify "$cwd")"
+  [ -n "$model" ] && echo "resumes : $model"
+  echo "size    : $(printf '%s' "$row" | cut -f4) bytes"
+  echo "---"
+  # The user's typed prompts are the plain-string user records; tool traffic
+  # carries an array instead, so this shows what the human actually asked. The
+  # whole file is scanned, not the tail: on a tool-heavy session every typed
+  # prompt can sit in the first few percent of a multi-MB transcript.
+  # {1,250}, not more: BSD grep refuses a bounded repeat above 255
+  # ("maximum repetition exceeds 255") while GNU grep accepts it, so a larger
+  # bound works on Linux and silently returns nothing on macOS.
+  grep -oE '"role":"user","content":"[^"]{1,250}' "$path" 2>/dev/null \
+    | sed -e 's/^.*content":"//' -e 's/\\n/ /g' -e 's/\\t/ /g' \
+    | tail -n 6 \
+    | cut -c1-300
+}
+
+# The picker. Prints the chosen session id, nothing when cancelled.
+#
+# fzf does no filtering of its own (--disabled): the query is a ripgrep search
+# over transcript CONTENT, which is what makes a half-remembered phrase from
+# inside a session findable, and rows stay in last-active order rather than
+# being reordered by match score. Scope lives in a file because reload and
+# transform-header actions run as separate processes and have to agree.
+pick() {
+  local query="${1:-}" state out self="$0"
+  if ! command -v fzf >/dev/null 2>&1; then
+    echo "claude-rescue pick: fzf not found" >&2
+    return 2
+  fi
+  mkdir -p "$CLAUDE_RESCUE_CACHE_HOME" 2>/dev/null
+  state="$CLAUDE_RESCUE_CACHE_HOME/.pick-scope.$$"
+  printf 'cwd\n' > "$state"
+  out="$("$self" pick-rows --state "$state" ${query:+"$query"} \
+    | fzf --ansi --reverse --no-multi --disabled \
+          --delimiter="$(printf '\t')" --with-nth=3.. \
+          --prompt='search transcripts> ' \
+          --query="$query" \
+          --header="$("$self" pick-header "$state")" \
+          --footer='enter resume · tab scope · ctrl-y copy id · esc cancel' \
+          --preview "'$self' pick-preview {1}" \
+          --preview-window=right:52%:wrap \
+          --bind "change:reload('$self' pick-rows --state '$state' {q})" \
+          --bind "tab:execute-silent('$self' pick-toggle '$state')+reload('$self' pick-rows --state '$state' {q})+transform-header('$self' pick-header '$state')" \
+          --bind "ctrl-y:execute-silent('$self' pick-copy {1})" \
+          --bind "enter:transform:if [ {2} = - ]; then echo accept; else echo 'change-header(this session is live in {2} — switch to that pane instead of resuming it twice)'; fi" \
+    )"
+  rm -f "$state"
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | cut -f1
+}
+
+# ---------------------------------------------------------------------------
 # Entry — dispatch subcommands or pop the picker.
 
 cmd="${1:-}"
 case "$cmd" in
-  list-windows)       list_windows_tsv ;;
-  list-sessions)      shift; list_sessions_tsv "$@" ;;
-  preview-window)     shift; preview_window "$@" ;;
-  preview-session)    shift; preview_session "$@" ;;
   find-sessions)      shift; find_sessions "$@" ;;
   print)              shift; print_capture "$@" ;;
   model)              shift; session_model "$@" ;;
   latest)             shift; latest_session "$@" ;;
   resume-dir)         shift; resume_dir_for_session "$@" ;;
+  index)              session_index ;;
+  pick)               shift; pick "$@" ;;
+  pick-rows)          shift; pick_rows "$@" ;;
+  pick-header)        shift; pick_header "$@" ;;
+  pick-toggle)        shift; pick_toggle "$@" ;;
+  pick-preview)       shift; pick_preview "$@" ;;
+  pick-copy)          shift; action_copy_uuid "$@" ;;
+  live-sessions)      live_session_labels ;;
   '')
     if [ -z "${TMUX:-}" ]; then
-      echo "claude-rescue must be run inside tmux" >&2
+      echo "claude-rescue: not inside tmux — 'claude-rescue pick' prints a session id," >&2
+      echo "               and 'clr' resumes one directly." >&2
       exit 1
     fi
     if [ -z "${CLAUDE_RESCUE_IN_POPUP:-}" ]; then
@@ -962,7 +748,6 @@ case "$cmd" in
       # pane id ends up in this server's global env). Query tmux directly
       # for the active client's active pane — reliable regardless of how
       # claude-rescue was invoked.
-      local orig_pane
       orig_pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
       [ -z "$orig_pane" ] && orig_pane="${TMUX_PANE:-}"
       exec tmux display-popup -E -h 80% -w 90% \
@@ -973,7 +758,9 @@ case "$cmd" in
             CLAUDE_RESCUE_ORIG_PANE="$orig_pane" \
             "$0"
     fi
-    popup_picker
+    picked="$(pick)" || exit $?
+    [ -n "$picked" ] || exit 0
+    action_resume_here "$picked"
     ;;
   *)
     echo "unknown subcommand: $cmd" >&2

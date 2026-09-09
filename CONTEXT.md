@@ -147,6 +147,21 @@ or a file, add it here.
   `--model` on the `clr` resume path. Best-effort by contract: it sits in the
   Pre-fill path, so every failure is empty stdout and exit 0, and the caller
   resumes exactly as it did before the repair existed.
+- **Session index** — the picker's row source:
+  `$CACHE/session-index.tsv`, one line per resumable transcript
+  (`session_id`, path, mtime, size, launch cwd, downgrade flag, title). Keyed
+  by `(path, mtime, size)` so reopening the picker rescans only what changed —
+  a cold build walks gigabytes, a warm one is a single `stat` call. Titles come
+  from the newest `/rename`, else the newest auto-generated title, else the
+  first user message. Extraction patterns are anchored on record *shape*, and
+  every corpus read is one `rg` pass over many files rather than a fork per
+  file; both rules exist because the corpus is large and quotes itself.
+- **Live-session block** — a session a live pane still holds is labelled in the
+  picker with that pane (`session:window.pane`, from a `tmux list-panes` join
+  against the Active session files) and cannot be selected: two claudes on one
+  transcript corrupt it. tmux is the authority, never the active file alone,
+  because those files outlive the panes that wrote them — so outside tmux
+  nothing is labelled and nothing is blocked.
 - **Resume dir** — the directory a session belongs to, i.e. the one whose slug
   holds its jsonl (`resume_dir_for_session`, exposed as `resume-dir`). A
   resumed session runs with the *shell's* cwd, so resuming from elsewhere

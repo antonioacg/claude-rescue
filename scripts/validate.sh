@@ -914,14 +914,6 @@ fi
 assert "watcher exits on TERM" "yes" "$S17_WATCHER_STOPPED"
 
 # ---------------------------------------------------------------------------
-echo "[picker] data subcommands return well-formed TSV/JSON"
-WIN_TSV=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" list-windows | head -1)
-assert_nonempty "picker: list-windows returns at least one row" "$WIN_TSV"
-TOP_UUID=$(printf '%s' "$WIN_TSV" | cut -f1)
-PREVIEW=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/cache "$REPO/bin/claude-rescue" preview-window "$TOP_UUID" | head -1)
-assert_nonempty "picker: preview-window returns content" "$PREVIEW"
-
-# ---------------------------------------------------------------------------
 echo "[corpus] model repair reads the transcript, not the settings default"
 # Fixture corpus: the model records are what `claude-rescue model` must reason
 # over, so they are written by hand rather than mined from a real session.
@@ -942,6 +934,8 @@ FX_D=dddddddd-0000-4000-8000-000000000004   # in-session switch after a [1m] run
 fx_model $FX_D 'claude-opus-5[1m]'; fx_model $FX_D 'claude-fable-5-1'
 FX_E=eeeeeeee-0000-4000-8000-000000000005   # never 1m: nothing to repair
 fx_model $FX_E 'claude-sonnet-5'
+FX_F=ffffffff-0000-4000-8000-000000000006   # left downgraded: [1m] then bare
+fx_model $FX_F 'claude-opus-5[1m]'; fx_model $FX_F 'claude-opus-5'
 cr_model() { CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" model "$1"; }
 assert "model: re-adds the dropped [1m]"          "claude-opus-5[1m]"    "$(cr_model $FX_A)"
 assert "model: silent when no record exists"      ""                     "$(cr_model $FX_B)"
@@ -950,11 +944,60 @@ assert "model: keeps the last base, adds suffix"  "claude-fable-5-1[1m]" "$(cr_m
 assert "model: never meddles without a [1m]"      ""                     "$(cr_model $FX_E)"
 assert "model: silent on an unknown session"      ""                     "$(cr_model deadbeef-0000-4000-8000-000000000000)"
 assert "model: silent on a path-shaped arg"       ""                     "$(cr_model ../../etc/passwd)"
+assert "model: repairs a session left downgraded" "claude-opus-5[1m]"    "$(cr_model $FX_F)"
 CR_LATEST=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /fx/proj)
-assert "latest: newest session for a cwd slug"    "$FX_E"                "$CR_LATEST"
+assert "latest: newest session for a cwd slug"    "$FX_F"                "$CR_LATEST"
 assert "latest: silent for an unknown cwd"        ""                     "$(CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /nope)"
 CR_RDIR=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" resume-dir $FX_A)
 assert "resume-dir: silent when no dir resolves"  ""                     "$CR_RDIR"
+
+# ---------------------------------------------------------------------------
+echo "[picker] data plane over the fixture corpus"
+# Reuses the corpus built above. The interactive fzf layer is not exercised
+# here (see FOLLOWUPS.md); everything the picker renders from is.
+cr_pick() { CLAUDE_PROJECTS_DIR="$CORPUS" CLAUDE_RESCUE_DATA_HOME=$HOME_DIR \
+            CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/pickcache "$REPO/bin/claude-rescue" "$@"; }
+# Counted, not hardcoded: earlier scenarios also write transcripts into this
+# corpus, and the invariant under test is "one row per resumable transcript".
+PK_EXPECT=$(ls "$CORPUS"/*/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
+PK_IDX=$(cr_pick index | wc -l | tr -d ' ')
+assert "picker: index has one row per transcript" "$PK_EXPECT" "$PK_IDX"
+PK_FIELDS=$(cr_pick index | awk -F'\t' 'NF!=7 {n++} END {print n+0}')
+assert "picker: every index row is 7 fields" "0" "$PK_FIELDS"
+PK_ORDER=$(cr_pick index | awk -F'\t' 'NR>1 && $3 > prev {bad++} {prev=$3} END {print bad+0}')
+assert "picker: index is ordered newest-first" "0" "$PK_ORDER"
+PK_WARN=$(cr_pick index | awk -F'\t' -v s="$FX_F" '$1==s {print $6}')
+assert "picker: flags a session left downgraded" "1" "$PK_WARN"
+PK_OK=$(cr_pick index | awk -F'\t' -v s="$FX_A" '$1==s {print $6}')
+assert "picker: does not flag an already-repaired one" "" "$PK_OK"
+PK_ROWS=$(cd / && cr_pick pick-rows --scope all | wc -l | tr -d ' ')
+assert "picker: renders a row per session" "$PK_EXPECT" "$PK_ROWS"
+PK_LIVE=$(cd / && cr_pick pick-rows --scope all | awk -F'\t' '$2!="-" {n++} END {print n+0}')
+assert "picker: nothing is live in a fixture corpus" "0" "$PK_LIVE"
+PK_SCOPED=$(cd / && cr_pick pick-rows --scope cwd | wc -l | tr -d ' ')
+assert "picker: cwd scope excludes other projects" "0" "$PK_SCOPED"
+assert_nonempty "picker: preview names the session" "$(cr_pick pick-preview "$FX_A" | grep "$FX_A")"
+PK_STATE=$HOME_DIR/pick-scope
+printf 'cwd\n' > "$PK_STATE"
+cr_pick pick-toggle "$PK_STATE" ; PK_T1=$(cat "$PK_STATE")
+cr_pick pick-toggle "$PK_STATE" ; PK_T2=$(cat "$PK_STATE")
+assert "picker: tab toggles scope out"  "all" "$PK_T1"
+assert "picker: tab toggles scope back" "cwd" "$PK_T2"
+assert_nonempty "picker: header states the active scope" "$(cr_pick pick-header "$PK_STATE" | grep scope)"
+if command -v rg >/dev/null 2>&1; then
+  # Title extraction and content search both go through ripgrep; without it
+  # the index still lists every session, just without titles.
+  PK_TITLE=$(cr_pick index | awk -F'\t' -v s="$FX_B" '$1==s {print $7}')
+  assert "picker: falls back to the first user message as a title" "hi" "$PK_TITLE"
+  PK_SHORT=$(cd / && cr_pick pick-rows --scope all hi | wc -l | tr -d ' ')
+  assert "picker: a 2-char query does not trigger a scan" "$PK_EXPECT" "$PK_SHORT"
+  PK_HIT=$(cd / && cr_pick pick-rows --scope all fable | wc -l | tr -d ' ')
+  assert "picker: content search narrows to matching sessions" "1" "$PK_HIT"
+  PK_MISS=$(cd / && cr_pick pick-rows --scope all zzz-no-such-content | wc -l | tr -d ' ')
+  assert "picker: content search with no match yields nothing" "0" "$PK_MISS"
+else
+  echo "  (ripgrep absent — skipping title/content-search assertions)"
+fi
 
 # ---------------------------------------------------------------------------
 echo "[install.sh] dry-run accounts for every binary in bin/"

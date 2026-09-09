@@ -124,13 +124,16 @@ panes across a tmux crash + resurrect-restore.
 
 ## 5. Interactive picker UX testing
 
-`scripts/validate.sh` exercises the picker's data plane (list-windows,
-list-sessions, preview-window, preview-session) but not the actual fzf
-popup interaction (drill-down, exit keys: enter / ctrl-n / ctrl-w / ctrl-y).
+`scripts/validate.sh` exercises the picker's data plane (index, pick-rows
+with both scopes, content search, pick-preview, pick-header, pick-toggle)
+against a fixture corpus, but not the fzf layer itself (typing to search,
+tab to widen scope, enter to resume, ctrl-y to copy).
 
 Status: untested in interactive mode. Will likely surface small ergonomic
 issues (column widths, color contrast, header text) that need a real
-human at the keyboard to identify.
+human at the keyboard to identify. Note the content-search and title
+assertions are skipped where ripgrep is absent — including the Docker
+image — so a green run there proves less than a green run on a dev box.
 
 `scripts/staging.sh` provides the environment to do this — bind `prefix + R`
 already wired in staging.conf.

@@ -13,69 +13,50 @@ system where applicable.
 
 ## Picker
 
-The two-stage drill-down (`bin/claude-rescue`, bound to `prefix + R`) is
-the most-used surface. Most of the deferred items below cluster here.
+The picker (`bin/claude-rescue`, bound to `prefix + R`) was rewritten: the
+two-stage window→session drill-down over our event log is gone, replaced by a
+flat, ripgrep-backed search over claude's own transcript corpus, ordered by
+last-active, scoped to the current project with `tab` to widen. Most of the
+items that used to live here were about the old surface. What that rewrite
+settled:
 
-- **Human-readable local-time timestamps** *(#19)*. The picker preview
-  prints raw ISO timestamps (`2026-05-12T01:15:20Z`). For "when did this
-  happen" reasoning the operator's brain has to add timezone offset and
-  parse a 20-char string. A relative-time column (`2h ago`, `yesterday
-  14:30`) on the row list plus local-time annotation in previews would
-  make the picker feel an order of magnitude faster to scan.
-  Implementation hint: `format_session_rows` already calls `humanize_age`
-  for the age column; same path could feed local-time conversion.
+- ~~**Human-readable local-time timestamps** *(#19)*~~ — done, rows carry a
+  relative age column (`7m`, `16h`, `2d`), computed in the render pass.
+- ~~**Clarify "scrollback" / "(no metadata)" labels** *(#20)*~~ — obsolete,
+  those preview paths (`preview_window` / `preview_session`) are gone. The new
+  preview shows the session id, cwd, the model it resumes with, and the last
+  few prompts the human actually typed.
+- ~~**Arrow key navigation** *(#22)*~~ — done, the active keys are rendered in
+  `--footer` and the scope in `--header`.
+- ~~**Fork-on-conflict when resuming an active session** *(#30)*~~ — done, and
+  without needing a `ps` scan: a session held by a live pane is labelled with
+  that pane (`session:window.pane`, from a `tmux list-panes` join against the
+  active files) and cannot be selected at all. Offering a fork instead of a
+  block is still open if it ever feels too strict.
 
-- **Clarify "scrollback" / "(no metadata)" labels** *(#20)*. Some preview
-  paths fall back to placeholder labels that aren't meaningful to a user
-  trying to decide which session to resume. Audit the empty-state strings
-  in `preview_window` and `preview_session` and replace with text that
-  describes *why* nothing is showing (e.g., "no title events captured —
-  pane never had @claude-pane-id minted" beats "(no metadata)").
+Still open, re-pointed at what exists now:
 
-- **Surface session/window/pane provenance** *(#21)*. Right now the
-  picker shows session_id and cwd but not how the entry got into the
-  event log (live SessionStart hook vs `session_start_backfill` from a
-  saved `-r` argv vs `session_meta_backfill` from a transcript). The
-  `source` field is captured in the events but not displayed. A small
-  annotation column would help debug picker entries that don't behave as
-  expected.
+- **Surface session provenance** *(#21)*. Rows show title, cwd and age but not
+  how the session got here. Less useful than it was — the corpus is claude's
+  own, so there is no backfill-vs-hook distinction to show — but a marker for
+  sessions that only exist in the event log (no transcript) may be worth it.
 
-- **Arrow key navigation** *(#22)*. fzf already supports arrow keys, but
-  the picker's two-stage flow has its own keybinds for level transitions
-  (tab/shift-tab to cycle filter mode, ↩ to drill in, esc to back out).
-  Worth verifying that the configured keys are intuitive — particularly
-  ctrl-w (resume in new tmux session) is non-obvious. A `--header`
-  with the active keybinds rendered would help.
+- **Title formatter plugin point — verify end-to-end** *(#29)*. Now narrower
+  than it was: the bash `format_title` is gone with the old picker, so
+  `CLAUDE_RESCUE_TITLE_FORMATTER` is honoured only by
+  `state_owner/watcher.py` for status labels. A validator scenario pointing the
+  env var at a stub and asserting the label flows through would still catch a
+  silent break.
 
-- **Title formatter plugin point — verify end-to-end** *(#29)*.
-  `CLAUDE_RESCUE_TITLE_FORMATTER` is documented in `format_title()` and
-  exercised on every preview render, but no validator scenario covers it.
-  Risk: an upstream change to title encoding silently breaks the
-  formatter integration. A `scripts/validate.sh` scenario that points
-  the env var at a stub script and asserts the output flows through
-  would catch regressions.
+- **Resume action: open in new pane** *(#36)*. The old ctrl-n (new window) and
+  ctrl-w (new session) actions were dropped as unused; `enter` types the resume
+  into the pane the picker was opened from. If a second target is ever wanted,
+  a split-window action is the one to add.
 
-- **Fork-on-conflict when resuming an active session** *(#30)*. If you
-  pick a session_id that's already running in another live claude pane,
-  the picker happily fires `clr <sid>` and you end up with two claudes
-  writing the same transcript on disk — undefined behavior. The picker
-  should detect this (`ps -A | grep -- "-r <sid>"`) and offer to fork
-  (`claude --resume-fork-session` semantics) or open a new pane.
-
-- **Window preview shows multiple cwds when applicable** *(#32)*. A
-  single tmux window can have panes in different cwds. The picker's
-  window preview shows one `primary_cwd`. For multi-cwd windows, list
-  all cwds (or at least surface that there are N).
-
-- **Last-known window_index in preview** *(#33)*. Operator selecting an
-  old session wants to know "which window number was this in last
-  time?" — useful for muscle memory after a restore. Currently
-  preview omits the index.
-
-- **Resume action: open in new pane** *(#36)*. Current resume actions
-  are: ↩ in-place, ctrl-n new window, ctrl-w new session. Missing: new
-  pane (split-window). Add as another action key. The implementation is
-  3 lines in `action_resume_*` patterns.
+- **Multi-cwd and last-window-index in preview** *(#32, #33)*. Both were about
+  the window-level preview, which no longer exists. A session's own cwd is now
+  a row column; "which window was this in last time" would have to come from
+  the event log if it is still wanted.
 
 - **cwd+branch filter mode** *(#39)*. The filter scope cycle currently
   exposes `all / window / pane / cwd`. Adding `cwd+git-branch` (filter
