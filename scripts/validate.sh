@@ -922,6 +922,41 @@ PREVIEW=$(CLAUDE_RESCUE_DATA_HOME=$HOME_DIR CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/c
 assert_nonempty "picker: preview-window returns content" "$PREVIEW"
 
 # ---------------------------------------------------------------------------
+echo "[corpus] model repair reads the transcript, not the settings default"
+# Fixture corpus: the model records are what `claude-rescue model` must reason
+# over, so they are written by hand rather than mined from a real session.
+CORPUS="$HOME_DIR/projects"
+mkdir -p "$CORPUS/-fx-proj"
+fx_model() {
+  printf '{"type":"attachment","attachment":{"type":"model","identity":{"modelId":"%s"}}}\n' \
+    "$2" >> "$CORPUS/-fx-proj/$1.jsonl"
+}
+FX_A=aaaaaaaa-0000-4000-8000-000000000001   # [1m] -> bare -> [1m]: the damage
+fx_model $FX_A 'claude-opus-5[1m]'; fx_model $FX_A 'claude-opus-5'; fx_model $FX_A 'claude-opus-5[1m]'
+FX_B=bbbbbbbb-0000-4000-8000-000000000002   # no model record (every old transcript)
+printf '{"type":"user","message":{"role":"user","content":"hi"}}\n' > "$CORPUS/-fx-proj/$FX_B.jsonl"
+FX_C=cccccccc-0000-4000-8000-000000000003   # only a JSON-escaped MENTION of the key
+printf '{"type":"user","message":{"content":"grep \\"modelId\\":\\"claude-opus-5\\""}}\n' \
+  > "$CORPUS/-fx-proj/$FX_C.jsonl"
+FX_D=dddddddd-0000-4000-8000-000000000004   # in-session switch after a [1m] run
+fx_model $FX_D 'claude-opus-5[1m]'; fx_model $FX_D 'claude-fable-5-1'
+FX_E=eeeeeeee-0000-4000-8000-000000000005   # never 1m: nothing to repair
+fx_model $FX_E 'claude-sonnet-5'
+cr_model() { CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" model "$1"; }
+assert "model: re-adds the dropped [1m]"          "claude-opus-5[1m]"    "$(cr_model $FX_A)"
+assert "model: silent when no record exists"      ""                     "$(cr_model $FX_B)"
+assert "model: ignores a mention of the key"      ""                     "$(cr_model $FX_C)"
+assert "model: keeps the last base, adds suffix"  "claude-fable-5-1[1m]" "$(cr_model $FX_D)"
+assert "model: never meddles without a [1m]"      ""                     "$(cr_model $FX_E)"
+assert "model: silent on an unknown session"      ""                     "$(cr_model deadbeef-0000-4000-8000-000000000000)"
+assert "model: silent on a path-shaped arg"       ""                     "$(cr_model ../../etc/passwd)"
+CR_LATEST=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /fx/proj)
+assert "latest: newest session for a cwd slug"    "$FX_E"                "$CR_LATEST"
+assert "latest: silent for an unknown cwd"        ""                     "$(CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /nope)"
+CR_RDIR=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" resume-dir $FX_A)
+assert "resume-dir: silent when no dir resolves"  ""                     "$CR_RDIR"
+
+# ---------------------------------------------------------------------------
 echo "[install.sh] dry-run accounts for every binary in bin/"
 # Counts both "ln -s" (would link) and "already linked" (idempotent skip).
 EXPECTED_BINS=$(find "$REPO/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')

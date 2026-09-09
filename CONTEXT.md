@@ -124,3 +124,34 @@ or a file, add it here.
 - **Busy marker** — `$CACHE/busy/<pane_uuid>`, mtime-freshness file
   maintained by Claude Code hooks (UserPromptSubmit/Pre|PostToolUse/Stop);
   `is_busy` gates hibernation so a mid-task claude isn't suspended.
+
+## Transcript corpus
+
+- **Transcript corpus** — claude's *own* session files, at
+  `$CLAUDE_PROJECTS_DIR/<slug>/<session_id>.jsonl` (slug per
+  `encode_cwd_for_projects`). Distinct from our History Events: the corpus is
+  written by claude, covers sessions we never observed, and is the only place a
+  session's model is recorded. Read it through the `model` / `latest` /
+  `resume-dir` subcommands, never by re-deriving paths at the call site.
+  Only `<slug>/<sid>.jsonl` is resumable — subagent transcripts live at
+  `<slug>/<sid>/subagents/agent-*.jsonl` and `claude --resume` rejects their
+  `agent-*` stems, so every corpus glob is deliberately single-level.
+- **Model repair** — re-adding the `[1m]` suffix that `--resume` drops behind a
+  non-first-party `ANTHROPIC_BASE_URL` when the session model differs from
+  settings.json's `model` (upstream anthropics/claude-code#93021): the session
+  silently returns with a 200K context window instead of 1M. `claude-rescue
+  model <sid>` takes the LAST `attachment.type=model` record's id, so an
+  in-session switch is honoured, and re-adds `[1m]` only if some record for
+  that session carried it — the suffix is the only thing ever added, so the
+  repair can restore a 1M window but never force a different model. It feeds
+  `--model` on the `clr` resume path. Best-effort by contract: it sits in the
+  Pre-fill path, so every failure is empty stdout and exit 0, and the caller
+  resumes exactly as it did before the repair existed.
+- **Resume dir** — the directory a session belongs to, i.e. the one whose slug
+  holds its jsonl (`resume_dir_for_session`, exposed as `resume-dir`). A
+  resumed session runs with the *shell's* cwd, so resuming from elsewhere
+  points it at the wrong project — wrong CLAUDE.md, wrong relative paths.
+  Resolution is not at stake: verified on claude 2.1.257, `claude -r <sid>`
+  finds a session from any directory. A candidate is only ever accepted when
+  the session's jsonl exists under its slug, which is what makes the lossy
+  reverse of `encode_cwd_for_projects` unnecessary.

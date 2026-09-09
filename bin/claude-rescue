@@ -17,6 +17,12 @@
 #                                   pane via @claude-pane-id). Reads from
 #                                   $DATA/captures/<pane_uuid>.{txt,json}.
 #
+# Transcript-corpus subcommands (claude's own jsonl under ~/.claude/projects,
+# not our event log):
+#   model <sid>                     Model id to resume <sid> with, or empty.
+#   latest [--cwd DIR]              Newest session id for DIR (default $PWD).
+#   resume-dir <sid>                Directory `claude -r <sid>` resolves from.
+#
 # Exit keys (level 2):
 #   enter     resume in the originating pane
 #   ctrl-n    resume in a new tmux window in the originating session
@@ -795,6 +801,144 @@ print_capture() {
 }
 
 # ---------------------------------------------------------------------------
+# Transcript corpus — claude's own jsonl files, at
+# $CLAUDE_PROJECTS_DIR/<slug>/<session_id>.jsonl (slug per
+# encode_cwd_for_projects). Distinct from this repo's event log: the corpus is
+# written by claude itself, covers sessions we never observed, and is the only
+# place a session's model is recorded.
+
+projects_root() {
+  printf '%s' "${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+}
+
+# Path to a session's transcript, searching every slug dir. Empty when absent.
+# Only <slug>/<sid>.jsonl is a resumable session: subagent transcripts live in
+# <slug>/<sid>/subagents/ and `claude --resume` rejects their agent-* stems,
+# so the single-level glob is deliberate.
+transcript_for_session() {
+  local sid="${1:-}" root
+  # Guard the glob: a slash or empty arg must never expand into a wider match.
+  case "$sid" in ''|*/*) return 0 ;; esac
+  root="$(projects_root)"
+  shopt -s nullglob
+  local hits=("$root"/*/"$sid.jsonl")
+  shopt -u nullglob
+  [ ${#hits[@]} -gt 0 ] && printf '%s\n' "${hits[0]}"
+  return 0
+}
+
+# Model id a session must be resumed with, or empty when there is nothing to
+# repair.
+#
+# Claude Code appends an attachment.type=model record on every process start
+# (the fresh run and each resume), carrying identity.modelId — the only
+# on-disk record of the model a session actually ran with.
+#
+# Upstream bug anthropics/claude-code#93021: when ANTHROPIC_BASE_URL is not a
+# first-party Anthropic host AND the session model differs from settings.json's
+# `model`, --resume restores the API-echoed id instead, which never carries the
+# `[1m]` suffix. The session comes back with a 200,000-token context window
+# instead of 1,000,000 and auto-compacts 5x early, silently. Both preconditions
+# hold permanently wherever a gateway fronts the API. Passing --model
+# explicitly on resume restores the window; that is what this feeds.
+#
+# The repair takes the LAST record's id, so an in-session model switch is
+# honoured, and re-adds `[1m]` only if SOME record for this session carried it.
+# The suffix is the only thing ever added back: this can restore a 1M window,
+# but it can never force a different model than the session last used.
+#
+# Best-effort by contract. This runs in the crash-restore pre-fill path (the
+# resume recipe in CONTEXT.md), so every failure mode — no such session, file
+# unreadable, malformed lines, no model record at all (true of every transcript
+# written before the record existed) — is empty stdout and exit 0. The caller
+# then resumes with no --model, exactly as it did before this existed.
+#
+# grep rather than rg: one file, and the Docker test image ships no ripgrep.
+# The pattern is anchored on the record shape, not on the bare key name, so
+# transcript text that merely mentions modelId can never be mistaken for the
+# record. (Measured equal on today's corpus — tool output is JSON-escaped, so
+# an embedded key reads as \"modelId\" and cannot match — but the anchor costs
+# nothing and holds if that escaping ever changes.)
+session_model() {
+  local sid="${1:-}" path ids
+  path="$(transcript_for_session "$sid")"
+  [ -n "$path" ] && [ -r "$path" ] || return 0
+  ids="$(grep -oE '"type":"model","identity":\{"modelId":"[^"]*"' "$path" 2>/dev/null \
+         | sed -e 's/.*"modelId":"//' -e 's/"$//')" || return 0
+  [ -n "$ids" ] || return 0
+  printf '%s\n' "$ids" | awk '
+    $0 != "" { last = $0; if ($0 ~ /\[1m\]$/) any = 1 }
+    END {
+      if (!any || last == "") exit 0
+      base = last; sub(/\[1m\]$/, "", base)
+      print base "[1m]"
+    }'
+  return 0
+}
+
+# Directory from which `claude -r <sid>` actually resolves this session, or
+# empty when no directory does.
+#
+# claude resolves a resumed session's transcript against $PWD's slug, so
+# resuming from the wrong directory does not resume it. This mirrors the
+# cwd-rescue guard in claude-rescue-resume: a candidate is accepted only when
+# the session's jsonl really exists under that candidate's slug, so a lossy
+# de-slug can never send the caller somewhere the resume would fail.
+#
+# $PWD is tried first, which makes the common `clr <sid>` case a no-op. The
+# fallbacks are the cwd values the session recorded on its own events; the
+# launch cwd is the one that fixed the slug, but a session can change
+# directory mid-run, so each distinct value is offered and the jsonl test
+# decides. Bounded to the head of the file: the launch cwd is on an early
+# record, and transcripts run to tens of MB.
+resume_dir_for_session() {
+  local sid="${1:-}" root path cand
+  case "$sid" in ''|*/*) return 0 ;; esac
+  root="$(projects_root)"
+  if [ -f "$root/$(encode_cwd_for_projects "$PWD")/$sid.jsonl" ]; then
+    printf '%s\n' "$PWD"
+    return 0
+  fi
+  path="$(transcript_for_session "$sid")"
+  [ -n "$path" ] && [ -r "$path" ] || return 0
+  while IFS= read -r cand; do
+    [ -n "$cand" ] && [ -d "$cand" ] || continue
+    if [ -f "$root/$(encode_cwd_for_projects "$cand")/$sid.jsonl" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done <<EOF
+$(head -n 200 "$path" 2>/dev/null \
+  | grep -oE '"cwd":"[^"]*"' 2>/dev/null \
+  | sed -e 's/^"cwd":"//' -e 's/"$//' \
+  | awk '!seen[$0]++')
+EOF
+  return 0
+}
+
+# Newest session id for a directory — what `claude -c` approximates. Empty
+# when that directory has no transcripts. Single-level glob for the same
+# reason as transcript_for_session.
+latest_session() {
+  local dir="$PWD" root slug newest
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cwd) dir="${2:-}"; shift 2 ;;
+      *) echo "latest: unknown arg: $1" >&2; return 2 ;;
+    esac
+  done
+  [ -n "$dir" ] || return 0
+  root="$(projects_root)"
+  slug="$(encode_cwd_for_projects "$dir")"
+  [ -d "$root/$slug" ] || return 0
+  newest="$(ls -t "$root/$slug"/*.jsonl 2>/dev/null | head -1)"
+  [ -n "$newest" ] || return 0
+  newest="${newest##*/}"
+  printf '%s\n' "${newest%.jsonl}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Entry — dispatch subcommands or pop the picker.
 
 cmd="${1:-}"
@@ -805,6 +949,9 @@ case "$cmd" in
   preview-session)    shift; preview_session "$@" ;;
   find-sessions)      shift; find_sessions "$@" ;;
   print)              shift; print_capture "$@" ;;
+  model)              shift; session_model "$@" ;;
+  latest)             shift; latest_session "$@" ;;
+  resume-dir)         shift; resume_dir_for_session "$@" ;;
   '')
     if [ -z "${TMUX:-}" ]; then
       echo "claude-rescue must be run inside tmux" >&2
