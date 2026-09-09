@@ -319,48 +319,60 @@ transcript_for_session() {
 # Model id a session must be resumed with, or empty when there is nothing to
 # repair.
 #
-# Claude Code appends an attachment.type=model record on every process start
-# (the fresh run and each resume), carrying identity.modelId — the only
-# on-disk record of the model a session actually ran with.
-#
 # Upstream bug anthropics/claude-code#93021: when ANTHROPIC_BASE_URL is not a
 # first-party Anthropic host AND the session model differs from settings.json's
-# `model`, --resume restores the API-echoed id instead, which never carries the
+# `model`, --resume restores the API-echoed model id, which never carries the
 # `[1m]` suffix. The session comes back with a 200,000-token context window
 # instead of 1,000,000 and auto-compacts 5x early, silently. Both preconditions
 # hold permanently wherever a gateway fronts the API. Passing --model
 # explicitly on resume restores the window; that is what this feeds.
 #
-# The repair takes the LAST record's id, so an in-session model switch is
-# honoured, and re-adds `[1m]` only if SOME record for this session carried it.
-# The suffix is the only thing ever added back: this can restore a 1M window,
-# but it can never force a different model than the session last used.
+# Three places in a transcript name a model, and they disagree on purpose:
+#   attachment.type=model  identity.modelId — the configured id at process
+#                          start, suffix intact. Authoritative, but NEW: only
+#                          the most recent claude versions write it, so
+#                          essentially every older session lacks it entirely.
+#   attachment.*.model     e.g. batching_reminder_sent — the configured id at
+#                          that moment, suffix intact. Present throughout the
+#                          history, which is what makes older sessions
+#                          repairable at all.
+#   message.model          the API echo on each assistant message. Gives the
+#                          chronological last model, but the API strips the
+#                          suffix, so it can never prove a 1M window on its own.
+# All three are read together in file order.
+#
+# The repair: base comes from the LAST id, so an in-session /model switch is
+# honoured, and `[1m]` is re-added only when THAT SAME base was seen carrying
+# it somewhere in this session. Per-base evidence, not "any [1m] anywhere":
+# a session that ran opus[1m] and then switched to a model never seen with the
+# suffix gets nothing rather than a guess, because an invalid model id would
+# fail the resume outright — worse than the 200K it was trying to fix.
+#
+# So this can restore a window the session demonstrably had, and can never
+# change which model it runs.
 #
 # Best-effort by contract. This runs in the crash-restore pre-fill path (the
 # resume recipe in CONTEXT.md), so every failure mode — no such session, file
-# unreadable, malformed lines, no model record at all (true of every transcript
-# written before the record existed) — is empty stdout and exit 0. The caller
-# then resumes with no --model, exactly as it did before this existed.
+# unreadable, malformed lines, no model field at all — is empty stdout and
+# exit 0. The caller then resumes with no --model, exactly as it did before
+# this existed.
 #
 # grep rather than rg: one file, and the Docker test image ships no ripgrep.
-# The pattern is anchored on the record shape, not on the bare key name, so
-# transcript text that merely mentions modelId can never be mistaken for the
-# record. (Measured equal on today's corpus — tool output is JSON-escaped, so
-# an embedded key reads as \"modelId\" and cannot match — but the anchor costs
-# nothing and holds if that escaping ever changes.)
+# Values are constrained to claude ids, and transcript text that merely
+# mentions a model key is JSON-escaped (\"model\") and cannot match.
 session_model() {
   local sid="${1:-}" path ids
   path="$(transcript_for_session "$sid")"
   [ -n "$path" ] && [ -r "$path" ] || return 0
-  ids="$(grep -oE '"type":"model","identity":\{"modelId":"[^"]*"' "$path" 2>/dev/null \
-         | sed -e 's/.*"modelId":"//' -e 's/"$//')" || return 0
+  ids="$(grep -oE '"(modelId|model)":"claude[^"]*"' "$path" 2>/dev/null \
+         | sed -e 's/^"[A-Za-z]*":"//' -e 's/"$//')" || return 0
   [ -n "$ids" ] || return 0
   printf '%s\n' "$ids" | awk '
-    $0 != "" { last = $0; if ($0 ~ /\[1m\]$/) any = 1 }
+    $0 != "" { last = $0; seen[$0] = 1 }
     END {
-      if (!any || last == "") exit 0
+      if (last == "") exit 0
       base = last; sub(/\[1m\]$/, "", base)
-      print base "[1m]"
+      if ((base "[1m]") in seen) print base "[1m]"
     }'
   return 0
 }

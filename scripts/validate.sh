@@ -936,17 +936,25 @@ FX_E=eeeeeeee-0000-4000-8000-000000000005   # never 1m: nothing to repair
 fx_model $FX_E 'claude-sonnet-5'
 FX_F=ffffffff-0000-4000-8000-000000000006   # left downgraded: [1m] then bare
 fx_model $FX_F 'claude-opus-5[1m]'; fx_model $FX_F 'claude-opus-5'
+# The shape of every session older than the attachment.type=model record: the
+# API echo on assistant messages strips the suffix, while another attachment
+# records the configured id with it. Repair has to read both.
+FX_G=99999999-0000-4000-8000-000000000007
+printf '{"type":"assistant","message":{"model":"claude-fable-5-1","id":"m1"}}\n' >> "$CORPUS/-fx-proj/$FX_G.jsonl"
+printf '{"type":"attachment","attachment":{"type":"batching_reminder_sent","text":"x","model":"claude-fable-5-1[1m]"}}\n' >> "$CORPUS/-fx-proj/$FX_G.jsonl"
+printf '{"type":"assistant","message":{"model":"claude-fable-5-1","id":"m2"}}\n' >> "$CORPUS/-fx-proj/$FX_G.jsonl"
 cr_model() { CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" model "$1"; }
 assert "model: re-adds the dropped [1m]"          "claude-opus-5[1m]"    "$(cr_model $FX_A)"
 assert "model: silent when no record exists"      ""                     "$(cr_model $FX_B)"
 assert "model: ignores a mention of the key"      ""                     "$(cr_model $FX_C)"
-assert "model: keeps the last base, adds suffix"  "claude-fable-5-1[1m]" "$(cr_model $FX_D)"
+assert "model: no suffix for a base never seen with one" "" "$(cr_model $FX_D)"
 assert "model: never meddles without a [1m]"      ""                     "$(cr_model $FX_E)"
 assert "model: silent on an unknown session"      ""                     "$(cr_model deadbeef-0000-4000-8000-000000000000)"
 assert "model: silent on a path-shaped arg"       ""                     "$(cr_model ../../etc/passwd)"
 assert "model: repairs a session left downgraded" "claude-opus-5[1m]"    "$(cr_model $FX_F)"
+assert "model: repairs from the API echo plus a configured-id record" "claude-fable-5-1[1m]" "$(cr_model $FX_G)"
 CR_LATEST=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /fx/proj)
-assert "latest: newest session for a cwd slug"    "$FX_F"                "$CR_LATEST"
+assert "latest: newest session for a cwd slug"    "$FX_G"                "$CR_LATEST"
 assert "latest: silent for an unknown cwd"        ""                     "$(CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" latest --cwd /nope)"
 CR_RDIR=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" resume-dir $FX_A)
 assert "resume-dir: silent when no dir resolves"  ""                     "$CR_RDIR"
@@ -991,7 +999,7 @@ if command -v rg >/dev/null 2>&1; then
   assert "picker: falls back to the first user message as a title" "hi" "$PK_TITLE"
   PK_SHORT=$(cd / && cr_pick pick-rows --scope all hi | wc -l | tr -d ' ')
   assert "picker: a 2-char query does not trigger a scan" "$PK_EXPECT" "$PK_SHORT"
-  PK_HIT=$(cd / && cr_pick pick-rows --scope all fable | wc -l | tr -d ' ')
+  PK_HIT=$(cd / && cr_pick pick-rows --scope all sonnet | wc -l | tr -d ' ')
   assert "picker: content search narrows to matching sessions" "1" "$PK_HIT"
   PK_MISS=$(cd / && cr_pick pick-rows --scope all zzz-no-such-content | wc -l | tr -d ' ')
   assert "picker: content search with no match yields nothing" "0" "$PK_MISS"

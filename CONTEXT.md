@@ -140,10 +140,19 @@ or a file, add it here.
   non-first-party `ANTHROPIC_BASE_URL` when the session model differs from
   settings.json's `model` (upstream anthropics/claude-code#93021): the session
   silently returns with a 200K context window instead of 1M. `claude-rescue
-  model <sid>` takes the LAST `attachment.type=model` record's id, so an
-  in-session switch is honoured, and re-adds `[1m]` only if some record for
-  that session carried it — the suffix is the only thing ever added, so the
-  repair can restore a 1M window but never force a different model. It feeds
+  model <sid>` reads every model a transcript names — `attachment.type=model`
+  (the configured id at process start, but NEW, so older sessions lack it),
+  `attachment.*.model` such as `batching_reminder_sent` (the configured id,
+  suffix intact, present throughout the history), and `message.model` (the API
+  echo, which gives the chronological last model but always strips the suffix).
+  Base comes from the LAST id, so an in-session switch is honoured, and `[1m]`
+  is re-added only when THAT SAME base was seen carrying it — per-base
+  evidence, because an invalid model id fails the resume outright, which is
+  worse than the 200K it was fixing. The suffix is the only thing ever added,
+  so the repair can restore a window the session demonstrably had but never
+  changes which model it runs. Only sessions whose model differs from
+  settings.json's `model` are affected at all: with the two equal, resume keeps
+  the window (measured). It feeds
   `--model` on the `clr` resume path. Best-effort by contract: it sits in the
   Pre-fill path, so every failure is empty stdout and exit 0, and the caller
   resumes exactly as it did before the repair existed.
