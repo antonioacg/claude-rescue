@@ -23,11 +23,22 @@ chmod 600 "$CLR_SEED/.credentials.json"
 [ -s "$CLR_SEED/.credentials.json" ] || { echo "FATAL: could not extract claude token from Keychain" >&2; exit 1; }
 
 D=/opt/claude-rescue/test/docker
+
+# Pin the compose project. Without -p, compose takes the project name from
+# $COMPOSE_PROJECT_NAME, which on a dev machine may already name an unrelated
+# local service stack — the harness would then join that project, create its
+# network, and report the developer's own containers as orphans. Worse, any
+# later `docker compose down` here would reach them. -p wins over the
+# environment (flag > COMPOSE_PROJECT_NAME > compose-file `name:` > directory),
+# and orchestrate.py already pins one project per scenario. The image name is
+# fixed in docker-compose.yml, so pinning this does not invalidate a built image.
+DC=(docker compose -p clr-rt-run)
+
 case "${1:-test}" in
-  build)          exec docker compose build ;;
-  test)           exec docker compose run --rm harness ;;
-  multisession)   exec docker compose run --rm harness bash "$D/harness-multisession.sh" ;;     # #2 regression
-  wrapper-resume) exec docker compose run --rm harness bash "$D/harness-wrapper-resume.sh" ;;   # #9 regression
-  shell)          exec docker compose run --rm harness zsh -i ;;
+  build)          exec "${DC[@]}" build ;;
+  test)           exec "${DC[@]}" run --rm harness ;;
+  multisession)   exec "${DC[@]}" run --rm harness bash "$D/harness-multisession.sh" ;;     # #2 regression
+  wrapper-resume) exec "${DC[@]}" run --rm harness bash "$D/harness-wrapper-resume.sh" ;;   # #9 regression
+  shell)          exec "${DC[@]}" run --rm harness zsh -i ;;
   *) echo "usage: $0 [build|test|multisession|wrapper-resume|shell]" >&2; exit 2 ;;
 esac
