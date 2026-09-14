@@ -814,7 +814,11 @@ cmd_resurrect_restore() {
         continue
       fi
 
-      sid="$(capture_meta_field "$pane_uuid" session_id)"
+      # Resolve through the db-backed resolver, not capture meta directly:
+      # meta only exists for panes that have hibernated at least once, so
+      # reading it alone silently skipped every never-hibernated (i.e.
+      # actively-used) session. See resolve_resume_session_id in common.sh.
+      sid="$(resolve_resume_session_id "$pane_uuid")"
       [ -n "$sid" ] || continue
 
       # Idempotency claim: atomic mkdir; the loser of a concurrent race skips.
@@ -1379,7 +1383,7 @@ cmd_hibernate_arm() {
     # Pre-fill `clr <session_id>` at the shell prompt (no Enter — user hits
     # Enter when ready).
     local resume_sid
-    resume_sid="$(capture_meta_field "$_puuid" session_id)"
+    resume_sid="$(resolve_resume_session_id "$_puuid")"
     if [ -n "$resume_sid" ]; then
       # C-u first, mirroring the post-restore pre-fill: clears any stray text
       # the shell may have on the line before typing the resume recipe. No cwd

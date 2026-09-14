@@ -195,6 +195,12 @@ capture_meta_path() {
   printf '%s/captures/%s.json' "$CLAUDE_RESCUE_DATA_HOME" "${1:-}"
 }
 
+# The state-owner daemon's SQLite index (WAL). Read-only for every consumer
+# except the daemon itself.
+state_db_path() {
+  printf '%s/state/state.db' "$CLAUDE_RESCUE_DATA_HOME"
+}
+
 # Args: $1 pane_uuid, $2 field name (e.g. session_id, cwd), $3 default
 # (optional, ""). Missing file, missing field, or jq failure all yield the
 # default.
@@ -204,6 +210,63 @@ capture_meta_field() {
   if [ ! -f "$f" ]; then printf '%s' "${3:-}"; return 0; fi
   jq -r --arg d "${3:-}" ".${2:?field required} // \$d" "$f" 2>/dev/null \
     || printf '%s' "${3:-}"
+}
+
+# --- Resume-session resolution ------------------------------------------------
+# Args: $1 pane_uuid. Echoes the session id `clr` should resume for that pane,
+# or nothing. Source order: state.db `events` first, capture meta second.
+#
+# Why the db leads: captures/<pane_uuid>.json has exactly one writer —
+# cmd_hibernate_arm — so a pane whose claude never hibernated has no meta at
+# all, and every consumer reading meta alone silently skips it. That is the
+# crash-recovery hole: the sessions being actively worked in are precisely the
+# ones that never go idle long enough to hibernate, so recovery covered the
+# panes that mattered least. `events` is written on every
+# session_start/title/hibernated/unhibernated, so it sees live sessions the
+# capture meta has never heard of.
+#
+# Why not windows/*.jsonl: those carry only session_start, so a session begun
+# via a path that skips our SessionStart hook (/resume from another session, a
+# find-sessions fallback) leaves the newest row stale — observed on
+# platform-mcpg-ucs:6, whose newest logged row was five days older than the
+# session actually live at crash time. The db ingests title/hibernated too,
+# which is what keeps it current.
+#
+# Cost: one indexed seek on events(pane_uuid, sequence), ~16ms including
+# process spawn. Deliberately NOT a filesystem scan — the transcript corpus is
+# thousands of files and gigabytes, and on a managed Mac every stat crosses an
+# endpoint-security extension; doing that per pane during a restore, while
+# dozens of shells are already spawning, is the worst possible moment for it.
+resolve_resume_session_id() {
+  local pane_uuid="${1:-}" db sid=""
+  [ -n "$pane_uuid" ] || return 0
+  # Interpolated into the SQL below, so accept only a literal UUID shape: a
+  # surprising tmux option value must never become a statement.
+  case "$pane_uuid" in
+    [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]-*-*-*-*) : ;;
+    *) return 0 ;;
+  esac
+  db="$(state_db_path)"
+  if [ -r "$db" ] && command -v sqlite3 >/dev/null 2>&1; then
+    # Read-only, plus a busy_timeout: readers do not block writers in WAL
+    # mode, but a checkpoint can briefly contend. Recovery must never hang.
+    #
+    # The PRAGMA emits its own result row ("2000"), so the output is filtered
+    # to a literal UUID rather than just whitespace-stripped — that both drops
+    # the pragma row and validates the value, which gets typed into a shell.
+    sid="$(sqlite3 "file:$db?mode=ro" \
+      "PRAGMA busy_timeout=2000;
+       SELECT session_id FROM events
+        WHERE pane_uuid='$pane_uuid'
+          AND session_id IS NOT NULL AND session_id <> ''
+        ORDER BY sequence DESC LIMIT 1;" 2>/dev/null \
+      | grep -oE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
+      | head -n 1)"
+  fi
+  # Fall back to the pre-existing source, so this is strictly additive: if the
+  # db is missing, unreadable, or has no row for the pane, behave as before.
+  [ -n "$sid" ] || sid="$(capture_meta_field "$pane_uuid" session_id)"
+  printf '%s' "$sid"
 }
 
 # Logged wrapper around `tmux send-keys` for every internal injection we
