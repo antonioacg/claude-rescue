@@ -573,6 +573,75 @@ tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
 sleep 1
 [ -f "$S13_MARKER" ] && S13_RAN_UNLOCKED=ran || S13_RAN_UNLOCKED=bailed
 assert "scenario 13d: save-guarded.sh runs when lock absent" "ran" "$S13_RAN_UNLOCKED"
+
+# ---------------------------------------------------------------------------
+# Structural validation of the produced snapshot. tmux-resurrect's save_all()
+# rotates `last` onto whatever it just wrote without inspecting it, so a save
+# that catches the server mid-teardown -- dump_panes succeeding, dump_windows
+# returning nothing -- silently becomes the next restore source. Restoring from
+# one is the worst case: panes come back, so it looks like it worked, but with
+# default layouts, no pane processes and no active-window state.
+#
+# Every pane belongs to a window, so panes > 0 with windows == 0 cannot describe
+# a real server. save-guarded.sh must reject that snapshot and put `last` back.
+#
+# Same mocking seam as 13b/13d: CLAUDE_RESCUE_RESURRECT_SAVE stands in for the
+# inner save, here writing a snapshot of a chosen shape and rotating `last` onto
+# it exactly as save_all() would.
+
+S13_GOOD="tmux_resurrect_20260101T000000.txt"
+printf 'pane\ts\t1\t0\t:##\t1\t\t:/tmp\t1\tzsh\t:\nwindow\ts\t1\t:zsh\t1\t:##\tabcd,80x24,0,0,0\t:\nstate\ts\t\n' \
+  > "$S13_DIR/$S13_GOOD"
+ln -fs "$S13_GOOD" "$S13_DIR/last"
+
+# (e) a gutted snapshot (panes, no windows) is rejected and `last` rolls back.
+S13_BAD="tmux_resurrect_20260102T000000.txt"
+cat > "$S13_MOCK" <<EOF
+#!/bin/sh
+printf 'pane\ts\t1\t0\t:##\t1\t\t:/tmp\t1\tzsh\t:\npane\ts\t1\t0\t:##\t2\t\t:/tmp\t0\tzsh\t:\nstate\t\t\n' \
+  > "$S13_DIR/$S13_BAD"
+ln -fs "$S13_BAD" "$S13_DIR/last"
+EOF
+chmod +x "$S13_MOCK"
+tmux -L "$SOCK" set-environment -g CLAUDE_RESCUE_RESURRECT_SAVE "$S13_MOCK"
+tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
+sleep 1
+assert "scenario 13e: gutted snapshot does not become last" "$S13_GOOD" "$(readlink "$S13_DIR/last" 2>/dev/null)"
+[ -f "$S13_DIR/$S13_BAD.rejected" ] && S13_QUAR=quarantined || S13_QUAR=missing
+assert "scenario 13e: gutted snapshot is quarantined, not deleted" "quarantined" "$S13_QUAR"
+
+# (f) a well-formed snapshot is left alone -- the check must not reject health.
+S13_OK2="tmux_resurrect_20260103T000000.txt"
+cat > "$S13_MOCK" <<EOF
+#!/bin/sh
+printf 'pane\ts\t1\t0\t:##\t1\t\t:/tmp\t1\tzsh\t:\nwindow\ts\t1\t:zsh\t1\t:##\tabcd,80x24,0,0,0\t:\nstate\ts\t\n' \
+  > "$S13_DIR/$S13_OK2"
+ln -fs "$S13_OK2" "$S13_DIR/last"
+EOF
+chmod +x "$S13_MOCK"
+tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
+sleep 1
+assert "scenario 13f: healthy snapshot is accepted as last" "$S13_OK2" "$(readlink "$S13_DIR/last" 2>/dev/null)"
+
+# (g) gutted snapshot with no valid predecessor: drop `last` entirely. A restore
+# that finds nothing is strictly better than one that lays a gutted layout over
+# a live server.
+S13_DIR_G="$HOME_DIR/resurrect-scenario13g"
+mkdir -p "$S13_DIR_G"
+tmux -L "$SOCK" set-option -g @resurrect-dir "$S13_DIR_G"
+S13_BAD_G="tmux_resurrect_20260104T000000.txt"
+cat > "$S13_MOCK" <<EOF
+#!/bin/sh
+printf 'pane\ts\t1\t0\t:##\t1\t\t:/tmp\t1\tzsh\t:\nstate\t\t\n' \
+  > "$S13_DIR_G/$S13_BAD_G"
+ln -fs "$S13_BAD_G" "$S13_DIR_G/last"
+EOF
+chmod +x "$S13_MOCK"
+tmux -L "$SOCK" run-shell "$REPO/scripts/save-guarded.sh quiet"
+sleep 1
+if [ -L "$S13_DIR_G/last" ] || [ -e "$S13_DIR_G/last" ]; then S13_LAST_G=present; else S13_LAST_G=absent; fi
+assert "scenario 13g: no predecessor means last is dropped, not left broken" "absent" "$S13_LAST_G"
+
 tmux -L "$SOCK" set-environment -gu CLAUDE_RESCUE_RESURRECT_SAVE
 
 # Reset @resurrect-dir to the test fixture's default for downstream scenarios.
