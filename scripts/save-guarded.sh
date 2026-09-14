@@ -67,4 +67,63 @@ if [ ! -x "$REAL_SAVE" ]; then
   exit 1
 fi
 
-exec "$REAL_SAVE" "$@"
+# Remember what `last` points at before the save. tmux-resurrect's save_all()
+# writes the new snapshot and then unconditionally rotates `last` onto it — it
+# never inspects what it just wrote. If a dump came back empty, the broken file
+# silently becomes the next restore source.
+prev_last=""
+if [ -n "$RESURRECT_DIR" ] && [ -L "$RESURRECT_DIR/last" ]; then
+  prev_last="$(readlink "$RESURRECT_DIR/last" 2>/dev/null || true)"
+fi
+
+"$REAL_SAVE" "$@"
+save_rc=$?
+
+# Structural validation, post-rotation.
+#
+# Every pane belongs to a window, so a snapshot carrying pane lines and zero
+# window lines cannot describe a real server — it is a save that caught the
+# server mid-teardown, with dump_panes succeeding and dump_windows returning
+# nothing. Restoring from one produces the worst possible outcome: the panes
+# come back, so it *looks* like it worked, but with default layouts, no pane
+# processes, and no active-window state. That is not hypothetical; it is what
+# a 2026-09-14 Ghostty kill produced (61 panes, 0 windows, empty state line,
+# every full_command blank), and the restore silently used it.
+#
+# The test is deliberately narrow so it cannot reject a healthy save: an empty
+# server yields zero panes AND zero windows and is left alone. Cost is a grep
+# over a file of a few KB that was just written and is still in page cache —
+# this runs on every auto-save, so it must stay that cheap.
+if [ -n "$RESURRECT_DIR" ] && [ -L "$RESURRECT_DIR/last" ]; then
+  now_last="$(readlink "$RESURRECT_DIR/last" 2>/dev/null || true)"
+  snapshot="$RESURRECT_DIR/$now_last"
+  if [ -n "$now_last" ] && [ "$now_last" != "$prev_last" ] && [ -f "$snapshot" ]; then
+    # `grep -c` exits 1 when the count is zero, so `|| echo 0` would append a
+    # second line and yield "0\n0" — breaking the integer test on precisely the
+    # zero-window case this exists to catch. Swallow the status, keep stdout.
+    pane_lines="$(grep -c '^pane' "$snapshot" 2>/dev/null || true)"
+    window_lines="$(grep -c '^window' "$snapshot" 2>/dev/null || true)"
+    [ -n "$pane_lines" ] || pane_lines=0
+    [ -n "$window_lines" ] || window_lines=0
+    if [ "$pane_lines" -gt 0 ] && [ "$window_lines" -eq 0 ]; then
+      # Quarantine rather than delete: the file is the only evidence of what
+      # the dying server reported, and it is wanted for diagnosis.
+      mv -f "$snapshot" "$snapshot.rejected" 2>/dev/null || true
+      sidecar="${snapshot%.txt}.claude-userops.tsv"
+      [ -f "$sidecar" ] && mv -f "$sidecar" "$sidecar.rejected" 2>/dev/null
+      if [ -n "$prev_last" ] && [ -f "$RESURRECT_DIR/$prev_last" ]; then
+        ln -fs "$prev_last" "$RESURRECT_DIR/last"
+        echo "save-guarded: rejected structurally invalid snapshot $now_last" \
+             "($pane_lines panes, 0 windows); kept $prev_last as last" >&2
+      else
+        # No good predecessor. A dangling `last` makes restore a no-op, which
+        # is strictly better than restoring a gutted layout over a live server.
+        rm -f "$RESURRECT_DIR/last"
+        echo "save-guarded: rejected structurally invalid snapshot $now_last" \
+             "($pane_lines panes, 0 windows); no valid predecessor to fall back to" >&2
+      fi
+    fi
+  fi
+fi
+
+exit $save_rc
