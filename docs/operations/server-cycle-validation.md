@@ -135,9 +135,10 @@ a crash.
 - `@resurrect-strategy-nvim` not in `dot_tmux.conf`; needs to be set
   manually on the test server for each run. If repeated validations
   confirm nvim restore works, promote it to chezmoi.
-- `@resurrect-processes` pattern is `claude->claude-rescue-resume *`. The
-  `*` keeps original argv. For a fresh claude (no args) this becomes
-  `claude-rescue-resume` only — which uses `@claude-pane-id` to find the
+- `@resurrect-processes` pattern is `claude->claude-rescue-resume` (no `*`).
+  The original argv reaches the wrapper through `@claude-rescue-resume-cmd`,
+  set by the restore hook, never through the shell. A fresh claude (no args)
+  leaves it empty, and the wrapper uses `@claude-pane-id` to find the
   session. We trust that path; each run verifies it again.
 - Simulated hibernated state vs. real hibernation diverge in one way: real
   hibernation has the SOFT (Ctrl+Z) phase first, leaving claude in a `T`

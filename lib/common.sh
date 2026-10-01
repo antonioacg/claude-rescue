@@ -182,6 +182,15 @@ hibernated_marker_field() {
     || printf '%s' "${3:-}"
 }
 
+# True when tmux-resurrect will relaunch a saved pane through the resume
+# wrapper. Mirrors resurrect's own test for our @resurrect-processes entry: the
+# bare word `claude` (no `~`) matches `^claude( |$)` against the saved full
+# command (snapshot field 11, leading `:` stripped). Keep in step with that
+# mapping in tmux.conf.
+is_claude_relaunch_cmd() {
+  [[ "${1:-}" =~ ^claude( |$) ]]
+}
+
 # --- Capture access -----------------------------------------------------------
 # The hibernation-time pane snapshot: $DATA/captures/<pane_uuid>.txt (ANSI
 # scrollback) + .json (meta: session_id, cwd — LAST-ACTIVE, not launch —

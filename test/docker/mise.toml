@@ -7,5 +7,5 @@
 [tools]
 tmux   = "3.6a"
 neovim = "0.12.0"
-claude = "2.1.170"
+claude = "2.1.280"
 node   = "24.14.1"

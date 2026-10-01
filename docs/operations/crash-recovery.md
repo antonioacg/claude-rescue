@@ -27,12 +27,32 @@ pane processes, otherwise `claude-rescue-resume` would not see
 `@claude-pane-id` and would fall back to a fresh session). This handler does:
 
 1. **Re-apply** `@claude-window-id` / `@claude-pane-id` from the sidecar TSV.
-2. **Auto-promote** any `mode=soft` markers to `mode=hard` with
-   `hard_source: "crash-promote"`. Rationale: a soft-hibernated claude died
-   with the crash; treating it as still-soft would trigger a spurious
-   `fg<Enter>` send-keys to a fresh shell on the user's next focus-in.
-3. **Clean** stale `*.arm.pid` files (pids belonged to the dead server).
-4. **Spawn** a backgrounded subshell that, after 5s (lets resurrect finish
+2. **Note the relaunches.** For every snapshot pane whose saved full command
+   resurrect will relaunch through the wrapper (`^claude( |$)`,
+   `is_claude_relaunch_cmd`), stash that command line on the pane as
+   `@claude-rescue-resume-cmd`. The wrapper reads its args from there (see
+   below), so no saved arg is ever parsed by a shell. Each such pane is also
+   flagged `@claude-rescue-relaunch`. A pane already running claude existed
+   before the restore and is left alone, and so is one already flagged: an
+   earlier pass on the same boot (dual trigger) set it up, and touching it
+   again would race its wrapper. The flag is a pane option, so it never
+   outlives the server.
+3. **Re-decide every marker** against this restore:
+   - pane is being relaunched → `mode=hard`, `hard_source: "crash-promote"`.
+     A relaunching pane with no marker gets one too: it stops `arm-sweep`
+     reading a failed relaunch (shell, no claude, no marker) as a voluntary
+     exit and wiping the pane's identity.
+   - anything else → plain `mode=hard`, no `hard_source`, so step 5 pre-fills
+     it. That includes a soft marker whose claude the snapshot does not show
+     (a claude suspended under a nested shell is saved as `-zsh`, which
+     resurrect never relaunches) and a crash-promote left over from an earlier
+     restore whose session never came back.
+   A soft claude died with the crash either way; treating it as still-soft
+   would trigger a spurious `fg<Enter>` send-keys to a fresh shell on the
+   user's next focus-in. Any `relaunch_pid` is from the dead server and is
+   dropped.
+4. **Clean** stale `*.arm.pid` files (pids belonged to the dead server).
+5. **Spawn** a backgrounded subshell that, after 5s (lets resurrect finish
    launching pane processes), iterates panes with `mode=hard` markers and:
    - if `hard_source == "crash-promote"` — skip (the resurrect wrapper is
      restoring claude via `shell → claude-rescue-resume → claude`;
@@ -55,6 +75,20 @@ pane processes, otherwise `claude-rescue-resume` would not see
      before the user presses Enter would lose the recipe. Marker survives
      until `cmd_session_start` (user pressed Enter or typed `cl` for a new
      session) or `cmd_pane_died` (pane closed without resuming).
+6. **Watch the relaunches.** The same subshell then polls the crash-promoted
+   panes (up to `CLAUDE_RESCUE_RELAUNCH_WATCH_SECONDS`, default 180). The
+   wrapper writes `relaunch_pid` into the marker just before it execs claude.
+   If that pid is gone while the marker is still there, the relaunch ended
+   before claude's SessionStart cleared it (claude rejected a flag, crashed on
+   resume). Once the pane is back at a shell with no claude under it, the
+   marker is demoted to plain hard and the pane gets the same print + pre-fill
+   (`relaunch-failed-*` reasons in `send-keys.log`). A pane whose wrapper never
+   started keeps its marker and gets no keys.
+
+The pre-fill resolves the session in the wrapper's spirit: the db-backed
+resolver, then the active session file, then the newest resumable session
+find-sessions has for the pane. A relaunch that died before SessionStart
+leaves no db row and no capture, so only the last two reach it.
 
 ## Wrapper resume-target priority
 
@@ -88,21 +122,28 @@ flushed yet.
 
 tmux-resurrect saves each pane's process via `pane_current_command` (field 10)
 **and** the full command line (field 11). On restore, it consults the
-`@resurrect-processes` mapping. The pattern `claude->claude-rescue-resume *`
+`@resurrect-processes` mapping. The pattern `claude->claude-rescue-resume`
 is keyed on the **first word of the full command line** (after stripping the
-leading `:`). The leading `~` (substring-regex form) is deliberately **omitted**
+leading `:`). It deliberately has no `*`: resurrect would type the saved args
+after it, unquoted, and the shell would re-parse them, so a saved
+`--model claude-opus-5[1m]` failed with zsh's `no matches found` and the
+wrapper never ran (2026-10-01). The restore hook hands the saved command line
+to the wrapper through `@claude-rescue-resume-cmd` instead. The leading `~` (substring-regex form) is deliberately **omitted**
 — with it, anything whose full command contained `claude` anywhere (e.g.
 `nvim /tmp/file-claude.md`) would match and get wrapped, which is wrong. So:
 
 | Save-time state | Field 10 | Field 11 begins with | Restore behavior |
 |---|---|---|---|
-| Claude actively running (foreground) | `claude` | `claude --add-dir ...` | wrapper applied → `claude-rescue-resume --add-dir ...` → `claude -r <found_sid>` |
+| Claude actively running (foreground) | `claude` | `claude --add-dir ...` | wrapper applied → `claude-rescue-resume` (args from `@claude-rescue-resume-cmd`) → `claude --add-dir ... -r <found_sid>` |
 | Soft-hibernated (claude in T, shell foreground) | `zsh` | `claude --add-dir ...` | **wrapper still applied** (matches on first word of full cmd) → claude resumes the session |
 | Hard-hibernated (claude exited, fresh shell) | `zsh` | `:` (empty) | resurrect launches default shell, no wrapper, no claude |
 | Pane with no claude history | `zsh` | `:` | default shell, no wrapper |
 
-So **soft-hibernated panes auto-resume claude on restore via the wrapper**.
-The post-restore-keys subshell skips them. Hard-hibernated panes reach the
+So **soft-hibernated panes auto-resume claude on restore via the wrapper**,
+as long as claude is a direct child of the pane's shell. A claude suspended
+under a nested shell is saved as `-zsh` and is not relaunched; step 3 above
+gives those a plain hard marker so they are pre-filled instead. The
+post-restore-keys subshell skips the relaunched ones. Hard-hibernated panes reach the
 post-restore subshell and get `claude-rescue print` + `clr <sid>` pre-fill.
 
 ## Find-sessions transcript filter

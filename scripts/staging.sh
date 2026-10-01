@@ -181,7 +181,7 @@ set -g @continuum-save-interval '1'
 # IMPORTANT: do not put backticks in this heredoc — the heredoc delimiter
 # below ('TMUX' would be ideal but \$HOME is used too) is unquoted, so
 # backticks trigger command substitution at script-run time.
-set -g @resurrect-processes "\"claude->claude-rescue-resume *\""
+set -g @resurrect-processes "\"claude->claude-rescue-resume\""
 
 # Distinguishable status hint so you can tell staging from your main at a glance.
 set -ag status-right ' [staging]'

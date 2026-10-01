@@ -22,7 +22,7 @@ the container) with full isolation from the live stack.
 Everything matches the host so the version-sensitive restore hooks behave
 identically:
 
-- **tmux 3.6a, neovim 0.12.0, claude 2.1.170, node 24.14.1** — installed via
+- **tmux 3.6a, neovim 0.12.0, claude 2.1.280, node 24.14.1** — installed via
   mise, pinned in `mise.toml` (mirrors the host's `~/.config/mise/config.toml`).
   The image runs `mise activate zsh` (like the host `~/.zshrc`) so commands
   resolve to their install bins and process **argv stays bare** (`nvim`, not the
@@ -52,6 +52,7 @@ portability. Keep the host `scripts/validate-*.sh` for that.
 | `harness.sh` | Default scenario: N hard-hibernated panes → dual/single idempotency + nvim restore. Emits `RESULT_JSON:` |
 | `harness-multisession.sh` | #2 regression: ≥2 sessions in one pane → pre-fill anchors the *captured* session's cwd (not find-sessions `head -1`) |
 | `harness-wrapper-resume.sh` | #9 regression: soft-hibernate + force restore into `$HOME` → the `@resurrect-processes` wrapper cd-rescues and resumes the *same* session |
+| `harness-relaunch.sh` | 2026-10-01 regression: a glob char in saved argv still relaunches; a relaunch that dies gets pre-filled and keeps its pane identity; a claude soft-hibernated under a nested shell is pre-filled, not crash-promoted |
 | `run.sh` | Single run / scenario / interactive shell |
 | `orchestrate.py` | Parallel scenario matrix over isolated compose projects |
 | `docker-compose.yml` | Service wiring (build, mounts, env) |
@@ -68,6 +69,8 @@ CLR_MODE=single test/docker/run.sh
 # review follow-up regression scenarios (each is a self-contained run)
 test/docker/run.sh multisession     # #2 — multi-session-per-pane cwd disambiguation
 test/docker/run.sh wrapper-resume   # #9 — wrapper-resume cd-rescue into the right dir
+test/docker/run.sh relaunch         # 2026-10-01 — relaunch through the wrapper
+CLR_MODE=single test/docker/run.sh relaunch   # same, restore-wrapper as the sole trigger
 
 # interactive zsh in the wired container — cl/clr are ready
 test/docker/run.sh shell

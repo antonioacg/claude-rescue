@@ -39,6 +39,7 @@ case "${1:-test}" in
   test)           exec "${DC[@]}" run --rm harness ;;
   multisession)   exec "${DC[@]}" run --rm harness bash "$D/harness-multisession.sh" ;;     # #2 regression
   wrapper-resume) exec "${DC[@]}" run --rm harness bash "$D/harness-wrapper-resume.sh" ;;   # #9 regression
+  relaunch)       exec "${DC[@]}" run --rm harness bash "$D/harness-relaunch.sh" ;;         # 2026-10-01 regression
   shell)          exec "${DC[@]}" run --rm harness zsh -i ;;
-  *) echo "usage: $0 [build|test|multisession|wrapper-resume|shell]" >&2; exit 2 ;;
+  *) echo "usage: $0 [build|test|multisession|wrapper-resume|relaunch|shell]" >&2; exit 2 ;;
 esac

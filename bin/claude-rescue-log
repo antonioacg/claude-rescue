@@ -708,19 +708,89 @@ cmd_resurrect_restore() {
   done < "$sidecar"
   log_err "resurrect-restore: applied window=$applied_window pane=$applied_pane skipped=$skipped"
 
-  # === Crash-promote: any pane that was soft-hibernated when the server died
-  # is effectively hard-hibernated now (claude died with the crash). Rewrite
-  # the marker so hibernate-resume on next focus-in is a no-op (no spurious
-  # `fg<Enter>` to a fresh shell with no suspended job).
-  local marker current_mode
+  # === Relaunch bookkeeping: which panes is resurrect about to bring back
+  # through the resume wrapper? This hook fires just before restore.sh types
+  # each pane's process back in, from the same snapshot. For each such pane:
+  #   - stash the saved claude command line as @claude-rescue-resume-cmd. The
+  #     @resurrect-processes entry types a BARE `claude-rescue-resume` (no `*`)
+  #     because resurrect sends keys unquoted: with `*`, a saved arg like
+  #     `--model claude-opus-5[1m]` hit zsh's nomatch and the wrapper never ran
+  #     (2026-10-01, 5 panes). The wrapper reads its args from this option, so
+  #     nothing saved is ever parsed by a shell.
+  #   - remember its pane UUID for the marker pass below.
+  # A pane already running claude existed before this restore (restore.sh
+  # does not relaunch those); leave it alone. So is a pane flagged
+  # @claude-rescue-relaunch: an earlier restore pass on this same boot (the
+  # dual-trigger case) already set it up, and its wrapper may be mid-flight —
+  # re-stashing the args or rewriting its marker would race the wrapper's
+  # relaunch_pid write. The flag is a pane option, so it dies with the server
+  # and can only mean "handled in this Epoch".
+  local relaunch_uuids=" " handled_uuids=" " r_sess r_win r_pane r_cmd r_target r_pid r_uuid
+  while IFS=$'\t' read -r r_sess r_win r_pane r_cmd; do
+    r_cmd="${r_cmd#:}"
+    is_claude_relaunch_cmd "$r_cmd" || continue
+    r_target="$r_sess:$r_win.$r_pane"
+    r_pid="$(tmux display-message -p -t "$r_target" '#{pane_pid}' 2>/dev/null)" || continue
+    [ -n "$r_pid" ] || continue
+    r_uuid="$(tmux show-options -pqv -t "$r_target" @claude-pane-id 2>/dev/null)"
+    if [ -n "$(tmux show-options -pqv -t "$r_target" @claude-rescue-relaunch 2>/dev/null)" ]; then
+      [ -n "$r_uuid" ] && handled_uuids+="$r_uuid "
+      continue
+    fi
+    [ -z "$(subtree_pids "$r_pid" claude)" ] || continue
+    tmux set-option -pt "$r_target" @claude-rescue-relaunch 1 2>/dev/null || true
+    tmux set-option -pt "$r_target" @claude-rescue-resume-cmd "$r_cmd" 2>/dev/null || true
+    [ -n "$r_uuid" ] && relaunch_uuids+="$r_uuid "
+  done < <(awk -F'\t' '$1=="pane" {print $2 "\t" $3 "\t" $6 "\t" $11}' "$state_file")
+
+  # === Crash-promote: re-decide every marker against what this restore does.
+  #   - Pane is being relaunched → hard + hard_source "crash-promote": the
+  #     wrapper, not keystrokes, brings it back, so the pre-fill pass must not
+  #     type into it. A relaunching pane with NO marker gets one too. It is the
+  #     crash-restore insurance that stops arm-sweep reading a failed relaunch
+  #     (shell, no claude, no marker) as a voluntary exit and wiping the pane's
+  #     identity, which happened to 3 panes on 2026-10-01.
+  #   - Anything else → plain hard, so the pre-fill pass paints it and types
+  #     the resume recipe. That covers a soft marker whose claude the snapshot
+  #     does not show (a claude suspended under a nested shell is saved as
+  #     `-zsh`, which resurrect never relaunches; crash-promoting those left 3
+  #     panes blank on 2026-10-01), and a crash-promote left over from an
+  #     earlier restore whose session never came back.
+  # Either way the marker is hard now (claude died with the server), so
+  # hibernate-resume on focus-in is a no-op — no `fg<Enter>` into a fresh
+  # shell. relaunch_pid belongs to the dead server; drop it.
+  # Panes an earlier pass on this boot already handled keep their marker
+  # untouched: demoting one whose claude is back would get keys typed into it.
+  local marker m_uuid now
+  now="$(now_iso)"
+  mkdir -p "$CLAUDE_RESCUE_CACHE_HOME/hibernated" 2>/dev/null || true
   for marker in "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.json; do
     [ -f "$marker" ] || continue
-    current_mode="$(jq -r '.mode // empty' "$marker" 2>/dev/null)"
-    if [ "$current_mode" = "soft" ]; then
-      jq --arg mode "hard" --arg ts "$(now_iso)" \
-         '. + {mode:$mode, hard_ts:$ts, hard_source:"crash-promote"}' \
-         "$marker" > "$marker.tmp" && mv "$marker.tmp" "$marker"
-    fi
+    m_uuid="$(basename "$marker" .json)"
+    case "$handled_uuids" in *" $m_uuid "*) continue ;; esac
+    case "$relaunch_uuids" in
+      *" $m_uuid "*)
+        jq --arg ts "$now" \
+           '(if .mode == "soft" then . + {hard_ts:$ts} else . end)
+            + {mode:"hard", hard_source:"crash-promote"} | del(.relaunch_pid)' \
+           "$marker" > "$marker.tmp" && mv "$marker.tmp" "$marker"
+        ;;
+      *)
+        jq --arg ts "$now" \
+           '(if .mode == "soft" then . + {hard_ts:$ts} else . end)
+            + {mode:"hard"} | del(.hard_source, .relaunch_pid)' \
+           "$marker" > "$marker.tmp" && mv "$marker.tmp" "$marker"
+        ;;
+    esac
+  done
+  for r_uuid in $relaunch_uuids; do
+    marker="$(hibernated_marker_path "$r_uuid")"
+    [ -f "$marker" ] && continue
+    r_target="$(tmux list-panes -aF $'#{@claude-pane-id}\t#{pane_id}' 2>/dev/null \
+                  | awk -F'\t' -v u="$r_uuid" '$1==u {print $2; exit}')"
+    jq -n --arg p "$r_target" --arg u "$r_uuid" --arg ts "$now" \
+       '{pane_id:$p, pane_uuid:$u, ts:$ts, mode:"hard", forced:false, pids:[],
+         hard_ts:$ts, hard_source:"crash-promote"}' > "$marker"
   done
   # Stale arm pid files refer to processes from the dead server.
   rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid
@@ -793,100 +863,165 @@ cmd_resurrect_restore() {
         ! -name "${server_pid}__*" -exec rm -rf {} + 2>/dev/null || true
     fi
 
-    local pane_id pane_uuid hib_marker mode hard_source sid
-    local claim row launch_cwd prefill cur_cmd
+    local pane_id pane_uuid mode hard_source
     while IFS=$'\t' read -r pane_id pane_uuid; do
       [ -n "$pane_uuid" ] || continue
-      hib_marker="$(hibernated_marker_path "$pane_uuid")"
-      [ -f "$hib_marker" ] || continue
+      [ -f "$(hibernated_marker_path "$pane_uuid")" ] || continue
       mode="$(hibernated_marker_field "$pane_uuid" mode)"
       [ "$mode" = "hard" ] || continue
 
       # Discriminate by INTENT, not by current state. A crash-promoted marker
-      # means a soft-hibernated pane that resurrect is bringing back via the
-      # wrapper — the foreground process is racing through
+      # means resurrect is bringing the pane back via the wrapper — the
+      # foreground process is racing through
       # shell → claude-rescue-resume → claude, and pane_current_command could
       # report any of those depending on timing. Sending keys into that pipeline
       # corrupts the resume. Skip; marker will be cleaned up by cmd_session_start
-      # when the wrapper-launched claude fires its SessionStart hook.
+      # when the wrapper-launched claude fires its SessionStart hook, and the
+      # failed-relaunch watch below handles a relaunch that dies first.
       hard_source="$(hibernated_marker_field "$pane_uuid" hard_source)"
       if [ "$hard_source" = "crash-promote" ]; then
         continue
       fi
 
-      # Resolve through the db-backed resolver, not capture meta directly:
-      # meta only exists for panes that have hibernated at least once, so
-      # reading it alone silently skipped every never-hibernated (i.e.
-      # actively-used) session. See resolve_resume_session_id in common.sh.
-      sid="$(resolve_resume_session_id "$pane_uuid")"
-      [ -n "$sid" ] || continue
-
-      # Idempotency claim: atomic mkdir; the loser of a concurrent race skips.
-      # Only the winning pass falls through to send keys. (If we couldn't read
-      # a server PID, fall through unguarded rather than never resuming.)
-      if [ -n "$server_pid" ]; then
-        claim="$claims_dir/${server_pid}__${pane_uuid}"
-        if ! mkdir "$claim" 2>/dev/null; then
-          # A failed mkdir is only a "skip" if it's EEXIST — i.e. a concurrent
-          # pass already claimed this pane. Any OTHER failure (claims_dir
-          # unwritable, ENOSPC) must NOT silently skip every pane; fall through
-          # and pre-fill, matching the empty-server_pid path. Distinguish by
-          # whether the claim dir now actually exists.
-          [ -d "$claim" ] && continue
-        fi
-      fi
-
-      # Resolve the LAUNCH cwd (where `claude -r <sid>` finds the transcript).
-      # Pin to THIS session: a pane that hosted more than one session yields
-      # multiple find-sessions rows, so match col1 == $sid rather than taking
-      # head -1 (which could surface a *different* session's cwd and silently
-      # defeat the anchoring for the multi-copy case). col 6 is the
-      # jsonl-validated launch cwd; the capture json cwd is last-active and only
-      # a fallback. Never emit a `cd` to a dir that no longer exists.
-      launch_cwd=""
-      row="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null \
-              | awk -v FS=$'\x1f' -v s="$sid" '$1==s {print; exit}')"
-      [ -n "$row" ] && launch_cwd="$(printf '%s' "$row" | awk -v FS=$'\x1f' '{print $6}')"
-      [ -z "$launch_cwd" ] && launch_cwd="$(capture_meta_field "$pane_uuid" cwd)"
-
-      # Repaint the capture so the reborn (blank) pane shows what the session
-      # looked like — the peek that lets the user decide whether to resume
-      # WITHOUT resuming. Safe under the Enter discipline above: C-u + command
-      # + Enter travel in ONE atomic send-keys call, so no matter how a twin
-      # pass interleaves, this Enter can only execute the bare read-only print
-      # (worst unguarded case: the capture paints twice — cosmetic). Also gated
-      # on the live foreground being a shell: if the user manually resumed
-      # inside our 5s grace, the Enter would otherwise submit the text into
-      # claude as a prompt. (Intent gating above decides WHO gets keys; this
-      # last-moment state check only shrinks the blast radius of the one
-      # Enter we send.)
-      cur_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
-      if is_shell_cmd "$cur_cmd"; then
-        send_enter_burst "post-restore-print" "$pane_id" "claude-rescue print"
-        # Let print finish so the pre-fill lands on a fresh prompt line
-        # rather than echoing into the paint.
-        sleep 1
-      fi
-
-      # Build the pre-fill. %q-quote the cwd: it is typed into a shell, so a dir
-      # with a space or shell metachar would otherwise produce a broken `cd`.
-      # The sid is a UUID (no special chars), left bare so `clr <sid>` reads
-      # naturally. Mirrors the picker's resume_command quoting.
-      prefill="clr $sid"
-      if [ -n "$launch_cwd" ] && [ -d "$launch_cwd" ]; then
-        prefill="$(printf 'cd %q && clr %s' "$launch_cwd" "$sid")"
-      fi
-
-      # C-u clears any raced/leftover readline input, then pre-fill (no Enter).
-      send_keys_logged "post-restore-clr" "$pane_id" C-u "$prefill"
-
-      # Marker NOT deleted here. The pre-fill is live readline input (not
-      # captured by tmux-resurrect), so a second crash before the user presses
-      # Enter would lose the recipe. cmd_session_start cleans it up when claude
-      # actually restarts; cmd_pane_died handles orphans.
+      post_restore_prefill post-restore "$pane_id" "$pane_uuid" "$claims_dir" "$server_pid" || true
     done < <(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}' 2>/dev/null)
+
+    # === Failed-relaunch watch. The pass above leaves crash-promoted panes to
+    # the wrapper. If the relaunch dies before claude's SessionStart clears the
+    # marker (claude rejecting a flag, a crash on resume), nothing else would
+    # ever pre-fill the pane: it would sit at a bare shell. The wrapper records
+    # relaunch_pid in the marker just before it execs claude, so "that pid is
+    # gone and the marker is still here" means the relaunch ran and ended
+    # without claude coming back. Only then, with the pane back at a shell and
+    # no claude under it, demote the marker to plain hard and paint + pre-fill
+    # like any hard pane: the typed `claude-rescue-resume` line was consumed
+    # when the wrapper started, so nothing pending can swallow our keys. A pane
+    # whose wrapper never started keeps its marker (identity safe) and gets no
+    # keys, since without the pid "not started yet" and "never will" look the
+    # same.
+    local pending still rpid cur_cmd pane_pid hib_marker
+    local watch_deadline=$((SECONDS + ${CLAUDE_RESCUE_RELAUNCH_WATCH_SECONDS:-180}))
+    pending="$(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}' 2>/dev/null \
+      | while IFS=$'\t' read -r pane_id pane_uuid; do
+          [ -n "$pane_uuid" ] || continue
+          [ "$(hibernated_marker_field "$pane_uuid" hard_source)" = "crash-promote" ] \
+            && printf '%s\t%s\n' "$pane_id" "$pane_uuid"
+        done)"
+    while [ -n "$pending" ] && [ "$SECONDS" -lt "$watch_deadline" ]; do
+      sleep 2
+      still=""
+      while IFS=$'\t' read -r pane_id pane_uuid; do
+        [ -n "$pane_uuid" ] || continue
+        hib_marker="$(hibernated_marker_path "$pane_uuid")"
+        [ -f "$hib_marker" ] || continue                  # claude came back
+        rpid="$(hibernated_marker_field "$pane_uuid" relaunch_pid)"
+        if [ -z "$rpid" ] || kill -0 "$rpid" 2>/dev/null; then
+          still+="$pane_id"$'\t'"$pane_uuid"$'\n'       # not started / running
+          continue
+        fi
+        cur_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
+        pane_pid="$(tmux display-message -p -t "$pane_id" -F '#{pane_pid}' 2>/dev/null || echo '')"
+        is_shell_cmd "$cur_cmd" || continue
+        [ -z "$(subtree_pids "$pane_pid" claude)" ] || continue
+        log_err "resurrect-restore: relaunch died in $pane_id (pid $rpid, marker still crash-promote) — pre-filling"
+        jq 'del(.hard_source, .relaunch_pid)' "$hib_marker" > "$hib_marker.tmp" \
+          && mv "$hib_marker.tmp" "$hib_marker"
+        post_restore_prefill relaunch-failed "$pane_id" "$pane_uuid" "$claims_dir" "$server_pid" || true
+      done <<< "$pending"
+      pending="$still"
+    done
   ) &
   disown 2>/dev/null || true
+}
+
+# Paint a restored hard pane's capture and pre-fill its resume recipe.
+# Shared by the post-restore pass and its failed-relaunch watch; the caller
+# has already decided by intent that this pane gets keys.
+# Args: $1 send-keys log reason prefix, $2 pane_id, $3 pane_uuid,
+#       $4 post-restore claims dir, $5 tmux server pid (may be empty).
+# Returns 1 when skipped (no resumable session, or a twin pass claimed it).
+post_restore_prefill() {
+  local reason="$1" pane_id="$2" pane_uuid="$3" claims_dir="$4" server_pid="$5"
+  local sid claim row launch_cwd prefill cur_cmd
+
+  # Resolve through the db-backed resolver, not capture meta directly:
+  # meta only exists for panes that have hibernated at least once, so
+  # reading it alone silently skipped every never-hibernated (i.e.
+  # actively-used) session. See resolve_resume_session_id in common.sh.
+  # Then the resume wrapper's own lookup order: the active session file, then
+  # the newest resumable session find-sessions has for the pane. A pane that
+  # never hibernated and has no db row (one whose relaunch died before
+  # SessionStart) is only reachable through these.
+  sid="$(resolve_resume_session_id "$pane_uuid")"
+  [ -n "$sid" ] || sid="$(read_active_session "$pane_uuid" 2>/dev/null || true)"
+  [ -n "$sid" ] || sid="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null \
+                            | head -1 | awk -v FS=$'\x1f' '{print $1}')"
+  # Typed bare into a shell below: accept only a literal UUID.
+  [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
+
+  # Idempotency claim: atomic mkdir; the loser of a concurrent race skips.
+  # Only the winning pass falls through to send keys. (If we couldn't read
+  # a server PID, fall through unguarded rather than never resuming.)
+  if [ -n "$server_pid" ]; then
+    claim="$claims_dir/${server_pid}__${pane_uuid}"
+    if ! mkdir "$claim" 2>/dev/null; then
+      # A failed mkdir is only a "skip" if it's EEXIST — i.e. a concurrent
+      # pass already claimed this pane. Any OTHER failure (claims_dir
+      # unwritable, ENOSPC) must NOT silently skip every pane; fall through
+      # and pre-fill, matching the empty-server_pid path. Distinguish by
+      # whether the claim dir now actually exists.
+      [ -d "$claim" ] && return 1
+    fi
+  fi
+
+  # Resolve the LAUNCH cwd (where `claude -r <sid>` finds the transcript).
+  # Pin to THIS session: a pane that hosted more than one session yields
+  # multiple find-sessions rows, so match col1 == $sid rather than taking
+  # head -1 (which could surface a *different* session's cwd and silently
+  # defeat the anchoring for the multi-copy case). col 6 is the
+  # jsonl-validated launch cwd; the capture json cwd is last-active and only
+  # a fallback. Never emit a `cd` to a dir that no longer exists.
+  launch_cwd=""
+  row="$("$REPO/bin/claude-rescue" find-sessions --pane-uuid "$pane_uuid" 2>/dev/null \
+          | awk -v FS=$'\x1f' -v s="$sid" '$1==s {print; exit}')"
+  [ -n "$row" ] && launch_cwd="$(printf '%s' "$row" | awk -v FS=$'\x1f' '{print $6}')"
+  [ -z "$launch_cwd" ] && launch_cwd="$(capture_meta_field "$pane_uuid" cwd)"
+
+  # Repaint the capture so the reborn (blank) pane shows what the session
+  # looked like — the peek that lets the user decide whether to resume
+  # WITHOUT resuming. Safe under the Enter discipline (cmd_resurrect_restore):
+  # C-u + command + Enter travel in ONE atomic send-keys call, so no matter
+  # how a twin pass interleaves, this Enter can only execute the bare
+  # read-only print (worst unguarded case: the capture paints twice —
+  # cosmetic). Also gated on the live foreground being a shell: if the user
+  # manually resumed inside our 5s grace, the Enter would otherwise submit the
+  # text into claude as a prompt. (The caller's intent gating decides WHO gets
+  # keys; this last-moment state check only shrinks the blast radius of the
+  # one Enter we send.)
+  cur_cmd="$(tmux display-message -p -t "$pane_id" -F '#{pane_current_command}' 2>/dev/null || echo '')"
+  if is_shell_cmd "$cur_cmd"; then
+    send_enter_burst "$reason-print" "$pane_id" "claude-rescue print"
+    # Let print finish so the pre-fill lands on a fresh prompt line
+    # rather than echoing into the paint.
+    sleep 1
+  fi
+
+  # Build the pre-fill. %q-quote the cwd: it is typed into a shell, so a dir
+  # with a space or shell metachar would otherwise produce a broken `cd`.
+  # The sid is a UUID (no special chars), left bare so `clr <sid>` reads
+  # naturally. Mirrors the picker's resume_command quoting.
+  prefill="clr $sid"
+  if [ -n "$launch_cwd" ] && [ -d "$launch_cwd" ]; then
+    prefill="$(printf 'cd %q && clr %s' "$launch_cwd" "$sid")"
+  fi
+
+  # C-u clears any raced/leftover readline input, then pre-fill (no Enter).
+  send_keys_logged "$reason-clr" "$pane_id" C-u "$prefill"
+
+  # Marker NOT deleted here. The pre-fill is live readline input (not
+  # captured by tmux-resurrect), so a second crash before the user presses
+  # Enter would lose the recipe. cmd_session_start cleans it up when claude
+  # actually restarts; cmd_pane_died handles orphans.
 }
 
 # --- Busy markers (deterministic claude-busy state, hook-driven) ------------

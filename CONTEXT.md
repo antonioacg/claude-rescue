@@ -68,10 +68,14 @@ or a file, add it here.
   soft→hard timers and executes the hibernation pipeline. Its pid lives in
   `$CACHE/hibernated/<sanitized_pane_id>.arm.pid`; it re-verifies its own
   authority (`arm_still_authoritative`) before every side effect.
-- **Crash-promote** — on restore after a server death, soft markers are
-  rewritten to hard with `hard_source: "crash-promote"`: the suspended
-  claude died with the server, and the resurrect wrapper (not keystrokes)
-  brings it back. Crash-promoted panes must never receive injected keys.
+- **Crash-promote** — on restore after a server death, every pane the
+  snapshot shows resurrect relaunching through the wrapper gets a hard marker
+  with `hard_source: "crash-promote"` (a soft marker is promoted; a pane with
+  none gets one). The wrapper, not keystrokes, brings it back, so
+  crash-promoted panes must never receive injected keys while the relaunch is
+  in flight. Every other marker becomes plain hard and is pre-filled. If the
+  relaunch dies before SessionStart clears the marker (the wrapper's
+  `relaunch_pid` is gone), the restore's watch demotes it and pre-fills it.
 
 ## Capture & peek
 

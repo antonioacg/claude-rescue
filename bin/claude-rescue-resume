@@ -71,6 +71,31 @@ if [ "${1:-}" = "--debug" ]; then
 fi
 [ "${CLAUDE_RESCUE_RESUME_DEBUG:-}" = "1" ] && debug=1
 
+# --- Saved args from the restore hook --------------------------------------
+# On restore, @resurrect-processes types a BARE `claude-rescue-resume`. With
+# the old `claude-rescue-resume *` form tmux-resurrect typed the saved args
+# too, unquoted, so the shell re-parsed them: `--model claude-opus-5[1m]` hit
+# zsh's nomatch and the wrapper never ran (2026-10-01). Instead the
+# resurrect-restore hook stashes the saved claude command line on the pane as
+# @claude-rescue-resume-cmd. Read it once and unset it, so a later hand-run
+# doesn't pick up stale args. `read -a` splits on whitespace without globbing
+# or evaluating anything; the rebuild below re-glues values that held spaces,
+# exactly as it did for the `*` form.
+if [ "$#" -eq 0 ] && [ -n "${TMUX_PANE:-}" ]; then
+  saved_cmd="$(tmux show-options -pqv -t "$TMUX_PANE" @claude-rescue-resume-cmd 2>/dev/null || true)"
+  if [ -n "$saved_cmd" ]; then
+    tmux set-option -pu -t "$TMUX_PANE" @claude-rescue-resume-cmd 2>/dev/null || true
+    saved_args=()
+    case "$saved_cmd" in
+      *' '*) read -r -a saved_args <<< "${saved_cmd#* }" ;;
+    esac
+    __rescue_log "saved-args pid=$$ pane=$TMUX_PANE argc=${#saved_args[@]} from @claude-rescue-resume-cmd"
+    if [ "${#saved_args[@]}" -gt 0 ]; then
+      set -- "${saved_args[@]}"
+    fi
+  fi
+fi
+
 # --- Rebuild args ---------------------------------------------------------
 # Two jobs:
 #   1. Glue multi-word flag values back together. tmux-resurrect's send-keys
@@ -274,6 +299,22 @@ if [ -n "${target_uuid:-}" ]; then
         break
       fi
     done
+  fi
+fi
+
+# --- Relaunch handshake ----------------------------------------------------
+# A crash-promoted marker means the restore hook expects THIS wrapper to bring
+# the pane back. Record our pid (claude keeps it across exec) so the restore
+# hook's failed-relaunch watch can tell "relaunch still running" from
+# "relaunch ran and died before SessionStart cleared the marker"; the latter
+# gets the resume recipe pre-filled instead of a bare shell.
+if [ -n "$pane_uuid" ] \
+   && [ "$(hibernated_marker_field "$pane_uuid" hard_source)" = "crash-promote" ]; then
+  __marker="$(hibernated_marker_path "$pane_uuid")"
+  if jq --argjson p "$$" '. + {relaunch_pid:$p}' "$__marker" > "$__marker.tmp.$$" 2>/dev/null; then
+    mv "$__marker.tmp.$$" "$__marker"
+  else
+    rm -f "$__marker.tmp.$$"
   fi
 fi
 
