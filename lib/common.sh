@@ -191,6 +191,29 @@ is_claude_relaunch_cmd() {
   [[ "${1:-}" =~ ^claude( |$) ]]
 }
 
+# --- Transcript corpus -------------------------------------------------------
+# Claude Code's own transcripts: $CLAUDE_PROJECTS_DIR/<slug>/<session_id>.jsonl.
+
+projects_root() {
+  printf '%s' "${CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+}
+
+# Path to a session's transcript, searching every slug dir. Empty when absent.
+# Only <slug>/<sid>.jsonl is a resumable session: subagent transcripts live in
+# <slug>/<sid>/subagents/ and `claude --resume` rejects their agent-* stems,
+# so the single-level glob is deliberate.
+transcript_for_session() {
+  local sid="${1:-}" root
+  # Guard the glob: a slash or empty arg must never expand into a wider match.
+  case "$sid" in ''|*/*) return 0 ;; esac
+  root="$(projects_root)"
+  shopt -s nullglob
+  local hits=("$root"/*/"$sid.jsonl")
+  shopt -u nullglob
+  [ ${#hits[@]} -gt 0 ] && printf '%s\n' "${hits[0]}"
+  return 0
+}
+
 # --- Capture access -----------------------------------------------------------
 # The hibernation-time pane snapshot: $DATA/captures/<pane_uuid>.txt (ANSI
 # scrollback) + .json (meta: session_id, cwd — LAST-ACTIVE, not launch —

@@ -62,6 +62,7 @@ class WatcherConfig:
     pace_seconds: float = 0.05
     owner_check_seconds: int = 60
     continuum_check_seconds: int = 60
+    purge_guard_check_seconds: int = 3600
     tick_seconds: float = 1.0
     title_formatter: Path | None = None
     continuum_save: Path | None = None
@@ -102,6 +103,10 @@ class WatcherConfig:
             ),
             continuum_check_seconds=integer(
                 "CLAUDE_RESCUE_CONTINUUM_CHECK_S", defaults.continuum_check_seconds
+            ),
+            purge_guard_check_seconds=integer(
+                "CLAUDE_RESCUE_PURGE_GUARD_CHECK_S",
+                defaults.purge_guard_check_seconds,
             ),
             tick_seconds=defaults.tick_seconds,
             title_formatter=Path(formatter) if formatter else None,
@@ -277,6 +282,7 @@ class Watcher:
         self.stop_requested = False
         self.next_owner_check = 0.0
         self.next_continuum_check = 0.0
+        self.next_purge_guard_check = 0.0
 
         self.outdir.mkdir(parents=True, exist_ok=True)
         paths.cache_home.mkdir(parents=True, exist_ok=True)
@@ -575,6 +581,25 @@ class Watcher:
         )
         self.children.append(child)
 
+    def _run_purge_guard_if_due(self, now: float) -> None:
+        # Archive a pane's conversation before Claude Code's cleanup deletes it
+        # (bin/claude-rescue-purge-guard). Default server only: its archive
+        # window opens there, where the user can jump into it.
+        interval = self.config.purge_guard_check_seconds
+        if interval <= 0 or self.server_name != "default":
+            return
+        if now < self.next_purge_guard_check:
+            return
+        self.next_purge_guard_check = now + interval
+        self._reap_children()
+        child = subprocess.Popen(
+            [str(self.repository / "bin/claude-rescue-purge-guard"), "run"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.children.append(child)
+
     def _repair_owner_if_due(self, now: float) -> None:
         if now < self.next_owner_check:
             return
@@ -613,6 +638,7 @@ class Watcher:
         current = self._list_panes()
         self._update_window_labels(current)
         self._run_continuum_if_due(now)
+        self._run_purge_guard_if_due(now)
         plan = plan_tick(
             self.previous,
             current,

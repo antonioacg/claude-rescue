@@ -1064,6 +1064,98 @@ assert "labels: SessionStart clears them with the marker" "" "$(lb_opt @claude-s
 tmux -L "$SOCK" kill-pane -t "$LB_P"
 
 # ---------------------------------------------------------------------------
+echo "[purge guard] a pane's conversation is archived before Claude Code deletes it"
+# bin/claude-rescue-purge-guard against a throwaway Claude Code home: a
+# hard-hibernated pane whose transcript is 80 days old (cleanup 90, lead 14).
+# A fake claude (python, so the pane's foreground is not a shell) writes the
+# summary the prompt asks for, appends a turn to the transcript like the real
+# summary would, and waits for /exit.
+PG_SOCKPATH=$(tmux -L "$SOCK" display-message -p '#{socket_path}')
+PG_ROOT="$HOME_DIR/purge"
+PG_HOME="$PG_ROOT/claude-home"
+PG_CWD="$PG_ROOT/work"
+mkdir -p "$PG_HOME/sessions" "$PG_CWD" "$PG_ROOT/bin"
+printf '{"cleanupPeriodDays": 90}\n' > "$PG_HOME/settings.json"
+PG_SLUG=$(bash -c ". '$REPO/lib/common.sh'; encode_cwd_for_projects '$PG_CWD'")
+mkdir -p "$PG_HOME/projects/$PG_SLUG"
+pg_age() { python3 -c 'import os,sys,time; t=time.time()-int(sys.argv[2])*86400; os.utime(sys.argv[1],(t,t))' "$1" "$2"; }
+pg_conversation() {  # $1 pane uuid, $2 session id, $3 age in days → pane id
+  local t="$PG_HOME/projects/$PG_SLUG/$2.jsonl" p
+  printf '{"type":"user","cwd":"%s","sessionId":"%s"}\n' "$PG_CWD" "$2" > "$t"
+  pg_age "$t" "$3"
+  p=$(tmux -L "$SOCK" new-window -d -P -F '#{pane_id}' -t t1)
+  tmux -L "$SOCK" set-option -pt "$p" @claude-pane-id "$1"
+  printf '%s\n' "$2" > "$HOME_DIR/active/$1"
+  printf '{"pane_id":"%s","pane_uuid":"%s","mode":"hard","pids":[]}\n' "$p" "$1" \
+    > "$HOME_DIR/cache/hibernated/$1.json"
+  printf '%s\n' "$p"
+}
+cat > "$PG_ROOT/bin/fake-claude" <<PYEOF
+#!/usr/bin/env python3
+import glob, re, sys
+args = sys.argv[1:]
+sid = args[args.index("-r") + 1]
+m = re.search(r"(\S+/summary\.md)", args[-1])
+if m and "$PG_ROOT/bin/silent" not in sys.argv[0]:
+    open(m.group(1), "w").write("# Goal\nfake summary\n")
+    for t in glob.glob("$PG_HOME/projects/*/" + sid + ".jsonl"):
+        open(t, "a").write('{"type":"assistant","message":"Archived."}\n')
+for line in sys.stdin:
+    if line.strip() == "/exit":
+        break
+PYEOF
+chmod +x "$PG_ROOT/bin/fake-claude"
+cp "$PG_ROOT/bin/fake-claude" "$PG_ROOT/bin/silent"
+pg_run() { TMUX="$PG_SOCKPATH,0,0" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+             CLAUDE_CONFIG_DIR="$PG_HOME" CLAUDE_PROJECTS_DIR="$PG_HOME/projects" \
+             CLAUDE_RESCUE_PURGE_POLL_S=1 CLAUDE_RESCUE_PURGE_SETTLE_S=1 \
+             CLAUDE_RESCUE_PURGE_CLAUDE="${PG_FAKE:-$PG_ROOT/bin/fake-claude}" \
+             CLAUDE_RESCUE_PURGE_TIMEOUT_S="${PG_TIMEOUT:-30}" \
+             "$REPO/bin/claude-rescue-purge-guard" "$@"; }
+pg_windows() { tmux -L "$SOCK" list-windows -t rescue-archive -F '#{window_name}' 2>/dev/null; }
+
+PG_U1=aaaaaaaa-1111-4111-8111-111111111111; PG_S1=bbbbbbbb-2222-4222-8222-222222222222
+PG_P1=$(pg_conversation "$PG_U1" "$PG_S1" 80)
+PG_T1="$PG_HOME/projects/$PG_SLUG/$PG_S1.jsonl"
+cp "$PG_T1" "$PG_ROOT/before.jsonl"
+assert "purge guard: an 80-day-old conversation in a hard pane is due" \
+  "$PG_S1" "$(pg_run due | cut -f1)"
+# A live Claude Code on the conversation (a process named claude, and its record).
+# A symlink, not a copy: macOS kills a copied system binary (its signature).
+ln -sf /bin/sleep "$PG_ROOT/bin/claude"
+"$PG_ROOT/bin/claude" 60 &
+PG_LIVE=$!
+printf '{"pid":%s,"sessionId":"%s"}\n' "$PG_LIVE" "$PG_S1" > "$PG_HOME/sessions/$PG_LIVE.json"
+assert "purge guard: a conversation a live Claude Code holds is not due" "" "$(pg_run due)"
+kill "$PG_LIVE" 2>/dev/null; wait "$PG_LIVE" 2>/dev/null
+rm -f "$PG_HOME/sessions/$PG_LIVE.json"
+
+pg_run run
+PG_A1="$HOME_DIR/session-archive/$PG_S1"
+assert "purge guard: the transcript is copied as it was found" "same" \
+  "$(cmp -s "$PG_ROOT/before.jsonl" "$PG_A1/transcript.jsonl" && echo same || echo differs)"
+assert "purge guard: Claude's summary is in the archive" "fake summary" "$(grep -o 'fake summary' "$PG_A1/summary.md" 2>/dev/null)"
+assert "purge guard: meta says archived" "archived" "$(jq -r .status "$PG_A1/meta.json" 2>/dev/null)"
+assert "purge guard: the archive window closes when done" "" "$(pg_windows | grep -F "archive-${PG_S1:0:8}")"
+assert "purge guard: an archived conversation is not due again" "" "$(pg_run due)"
+assert "purge guard: a finished run releases its lock" "no" \
+  "$([ -e "$HOME_DIR/session-archive/.lock" ] && echo yes || echo no)"
+
+# A run that never gets a summary: stalled, its window left open, not retried.
+PG_U2=cccccccc-3333-4333-8333-333333333333; PG_S2=dddddddd-4444-4444-8444-444444444444
+PG_P2=$(pg_conversation "$PG_U2" "$PG_S2" 85)
+PG_FAKE="$PG_ROOT/bin/silent" PG_TIMEOUT=4 pg_run run
+PG_A2="$HOME_DIR/session-archive/$PG_S2"
+assert "purge guard: no summary in time → stalled" "stalled" "$(jq -r .status "$PG_A2/meta.json" 2>/dev/null)"
+assert "purge guard: a stalled run's window stays open" "archive-${PG_S2:0:8}" \
+  "$(pg_windows | grep -F "archive-${PG_S2:0:8}")"
+assert "purge guard: a stalled conversation is not retried while unchanged" "" "$(pg_run due)"
+tmux -L "$SOCK" kill-session -t rescue-archive 2>/dev/null
+tmux -L "$SOCK" kill-pane -t "$PG_P1" 2>/dev/null
+tmux -L "$SOCK" kill-pane -t "$PG_P2" 2>/dev/null
+rm -f "$HOME_DIR/cache/hibernated/$PG_U1.json" "$HOME_DIR/cache/hibernated/$PG_U2.json"
+
+# ---------------------------------------------------------------------------
 echo "[install.sh] dry-run accounts for every binary in bin/"
 # Counts both "ln -s" (would link) and "already linked" (idempotent skip).
 EXPECTED_BINS=$(find "$REPO/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')

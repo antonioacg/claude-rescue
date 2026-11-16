@@ -176,3 +176,17 @@ or a file, add it here.
   finds a session from any directory. A candidate is only ever accepted when
   the session's jsonl exists under its slug, which is what makes the lossy
   reverse of `encode_cwd_for_projects` unnecessary.
+- **Purge guard** — `bin/claude-rescue-purge-guard`, started hourly by the
+  default server's Watcher Adapter. Claude Code deletes a transcript nobody
+  has written to for its `cleanupPeriodDays`, and a hard-hibernated pane never
+  writes to its conversation. So a conversation a hard pane holds is *due*
+  `CLAUDE_RESCUE_PURGE_LEAD_DAYS` (14) before that, unless a live Claude Code
+  holds it. Due conversations are archived one at a time: the transcript is
+  copied, then resumed in place in a window of tmux session `rescue-archive`
+  (Opus, 1M, default effort) with a prompt that writes a summary.
+- **Session archive** — `$DATA/session-archive/<sid>/`: `transcript.jsonl` (the
+  copy, as found), `session-files/`, `summary.md`, `meta.json` (`status`:
+  copied, summarizing, archived, stalled, failed, no-resume-dir). Its
+  `transcript_mtime` is the transcript as the archive last left it; while the
+  transcript still matches, the conversation is never due again, so the
+  cleanup deletes it with the archive kept.

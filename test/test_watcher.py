@@ -242,6 +242,31 @@ class WatcherStatusTests(unittest.TestCase):
             watcher._update_window_labels({current.pane_id: current})
             run.assert_not_called()
 
+    def test_purge_guard_runs_once_per_interval_on_the_default_server_only(self) -> None:
+        def watcher_on(server: str) -> Watcher:
+            watcher = object.__new__(Watcher)
+            watcher.config = WatcherConfig(purge_guard_check_seconds=3600)
+            watcher.server_name = server
+            watcher.repository = Path("/repo")
+            watcher.next_purge_guard_check = 0
+            watcher.children = []
+            return watcher
+
+        default, other = watcher_on("default"), watcher_on("claude-rescue-staging")
+        with (
+            patch("state_owner.watcher.subprocess.Popen", return_value=Mock()) as popen,
+            patch.object(Watcher, "_reap_children"),
+        ):
+            default._run_purge_guard_if_due(100)
+            default._run_purge_guard_if_due(101)
+            other._run_purge_guard_if_due(100)
+
+        popen.assert_called_once()
+        self.assertEqual(
+            ["/repo/bin/claude-rescue-purge-guard", "run"], popen.call_args.args[0]
+        )
+        self.assertEqual(3700, default.next_purge_guard_check)
+
     def test_continuum_due_check_runs_at_most_once_per_interval(self) -> None:
         watcher = object.__new__(Watcher)
         watcher.config = WatcherConfig(continuum_check_seconds=60)
