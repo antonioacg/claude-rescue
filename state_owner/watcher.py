@@ -122,10 +122,17 @@ def parse_tmux_snapshot(
     clean_title: Callable[[str, str, str], str],
 ) -> dict[str, PaneState]:
     panes: dict[str, PaneState] = {}
-    for line in output.splitlines():
+    # Rows end at "\n" only. tmux strips control characters from titles and
+    # names, but U+0085 and U+2028 pass through, and str.splitlines() broke a
+    # row on them: the tick failed with "malformed tmux pane row".
+    for line in output.split("\n"):
+        if not line:
+            continue
         fields = line.split(_FIELD_SEPARATOR)
         if len(fields) != len(_TMUX_FIELDS):
-            raise ValueError(f"malformed tmux pane row with {len(fields)} fields")
+            raise ValueError(
+                f"malformed tmux pane row with {len(fields)} fields: {line[:300]!r}"
+            )
         (
             epoch,
             pane_id,

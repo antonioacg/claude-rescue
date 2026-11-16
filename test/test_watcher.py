@@ -121,6 +121,27 @@ class TmuxSnapshotTests(unittest.TestCase):
                 clean_title=lambda _window, _command, title: title,
             )
 
+    def test_snapshot_keeps_a_row_whose_title_holds_unicode_line_breaks(self) -> None:
+        # tmux passes U+0085 and U+2028 through in titles; they are not row ends.
+        row = self.row().replace("✳ Working", "✳ Work\u2028ing\u0085 now")
+        panes = parse_tmux_snapshot(
+            row + "\n",
+            expected_epoch="1",
+            previous={},
+            clean_title=lambda _window, _command, title: title,
+        )
+        self.assertEqual(["%1"], list(panes))
+        self.assertEqual("✳ Work\u2028ing\u0085 now", panes["%1"].raw_title)
+
+    def test_malformed_row_error_shows_the_row(self) -> None:
+        with self.assertRaisesRegex(ValueError, r"2 fields: 'too\\x1ffew'"):
+            parse_tmux_snapshot(
+                "too\x1ffew",
+                expected_epoch="1",
+                previous={},
+                clean_title=lambda _window, _command, title: title,
+            )
+
     def test_snapshot_rejects_malformed_rows_instead_of_inventing_deaths(self) -> None:
         with self.assertRaisesRegex(ValueError, "malformed tmux pane row"):
             parse_tmux_snapshot(
