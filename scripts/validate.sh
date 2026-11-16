@@ -1100,6 +1100,11 @@ echo "$out" >> runs.log
 case "$(basename "$0")" in
   silent) exit 1 ;;
   hang) sleep 300 ;;
+  apierror) # ends on an API error, unless run by the fallback
+    if [ -z "${FAKE_FALLBACK:-}" ]; then
+      echo "API Error: 400 the request could not be processed"
+      exit 1
+    fi ;;
 esac
 case $out in
   part-*) printf '# %s\nfake notes\n' "$out" > "$out" ;;
@@ -1110,7 +1115,15 @@ SHEOF
 chmod +x "$PG_ROOT/bin/fake-claude"
 ln -sf fake-claude "$PG_ROOT/bin/silent"
 ln -sf fake-claude "$PG_ROOT/bin/hang"
+ln -sf fake-claude "$PG_ROOT/bin/apierror"
+# A fallback command: claude's place, its own model.
+printf '#!/usr/bin/env bash\nFAKE_FALLBACK=1 exec "%s/bin/apierror" --model fallback-model "$@"\n' "$PG_ROOT" \
+  > "$PG_ROOT/bin/fallback"
+chmod +x "$PG_ROOT/bin/fallback"
+# Its own config folder: the user's config.sh (a fallback, say) stays out of it.
+mkdir -p "$PG_ROOT/config"
 pg_run() { TMUX="$PG_SOCKPATH,0,0" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+             CLAUDE_RESCUE_CONFIG_HOME="$PG_ROOT/config" \
              CLAUDE_CONFIG_DIR="$PG_HOME" CLAUDE_PROJECTS_DIR="$PG_HOME/projects" \
              CLAUDE_RESCUE_PURGE_CLAUDE="${PG_FAKE:-$PG_ROOT/bin/fake-claude}" \
              CLAUDE_RESCUE_PURGE_TIMEOUT_S="${PG_TIMEOUT:-30}" \
@@ -1159,6 +1172,24 @@ assert "purge guard: nothing is due afterwards" "" "$(pg_run due)"
 PG_FAKE="$PG_ROOT/bin/silent" pg_run summarize "$PG_S1"
 assert "purge guard: a failed re-summary keeps the previous one" "fake summary" "$(grep -o 'fake summary' "$PG_A1/summary.md" 2>/dev/null)"
 assert "purge guard: meta says failed" "failed" "$(pg_meta "$PG_S1" .status)"
+
+# An API error: failed without a fallback; with one (opted into in config.sh),
+# run once more with it; any other failure is not retried.
+pg_runs() { cat "$PG_A1/runs.log" 2>/dev/null | wc -l | tr -d ' '; }
+rm -f "$PG_A1/runs.log"
+PG_FAKE="$PG_ROOT/bin/apierror" pg_run summarize "$PG_S1"
+assert "purge guard: an API error, no fallback → failed, not retried" "failed/1" "$(pg_meta "$PG_S1" .status)/$(pg_runs)"
+printf 'CLAUDE_RESCUE_PURGE_FALLBACK="%s"\n' "$PG_ROOT/bin/fallback" > "$PG_ROOT/config/config.sh"
+rm -f "$PG_A1/runs.log"
+PG_FAKE="$PG_ROOT/bin/apierror" pg_run summarize "$PG_S1"
+assert "purge guard: an API error → run again with the fallback" "archived/2" "$(pg_meta "$PG_S1" .status)/$(pg_runs)"
+assert "purge guard: meta lists what fell back" "summary.md" "$(pg_meta "$PG_S1" '.fallback | join(",")')"
+assert "purge guard: the fallback picks its own model" "fallback-model" \
+  "$(grep -A1 -x -- '--model' "$PG_A1/args.txt" | grep -v -- '^--' | tr '\n' ' ' | sed 's/ $//')"
+rm -f "$PG_A1/runs.log"
+PG_FAKE="$PG_ROOT/bin/silent" pg_run summarize "$PG_S1"
+assert "purge guard: another failure does not fall back" "failed/1" "$(pg_meta "$PG_S1" .status)/$(pg_runs)"
+rm -f "$PG_ROOT/config/config.sh"
 
 # archive <sid>: a conversation not due yet, archived on demand; its pane closed.
 PG_U2=cccccccc-3333-4333-8333-333333333333; PG_S2=dddddddd-4444-4444-8444-444444444444

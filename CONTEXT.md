@@ -186,9 +186,12 @@ or a file, add it here.
   read-only tools plus writing `summary.md`) reads the copy and writes the
   summary, and the pane is closed. A conversation longer than one run should
   read (`CLAUDE_RESCUE_PURGE_PART_CHARS`, ~400k tokens) is read in parts, one
-  run each, and a last run merges their notes. The conversation itself is never
-  touched, and Claude Code deletes it on schedule. `archive <sid>` does the
-  same on demand; `summarize <sid>` rewrites a summary from the archive's copy.
+  run each, and a last run merges their notes. A run that ends on an API error
+  is run once more with `CLAUDE_RESCUE_PURGE_FALLBACK`, if set: a command in
+  claude's place, for another model or backend. The conversation itself is
+  never touched, and Claude Code deletes it on schedule. `archive <sid>` does
+  the same on demand; `summarize <sid>` rewrites a summary from the archive's
+  copy.
 - **Session archive** — `$DATA/session-archive/<sid>/`: `transcript.jsonl` (the
   copy, as found), `session-files/` (subagents, saved tool results),
   `summary.md`, `part-K.md` (a long one's notes per part), `run.log`,

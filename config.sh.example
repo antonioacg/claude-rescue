@@ -64,3 +64,14 @@
 #   cat > "$CLAUDE_RESCUE_CONFIG_HOME/session-config-defaults.json" <<'JSON'
 #   { "editor_on_edits": true, "editor_command": "code -g" }
 #   JSON
+
+# --- Purge guard (bin/claude-rescue-purge-guard) ------------------------------
+# When a summarizing run ends on an API error, run it once more with this
+# command in claude's place. It gets the same arguments but --model, so it
+# brings its own model, backend or system prompt. Off when unset, or when it is
+# not executable.
+#
+# CLAUDE_RESCUE_PURGE_FALLBACK="$HOME/.config/claude-rescue/purge-fallback"
+#   e.g.  #!/usr/bin/env bash
+#         export ANTHROPIC_BASE_URL=... ANTHROPIC_AUTH_TOKEN=...
+#         exec claude --model <its model> "$@"

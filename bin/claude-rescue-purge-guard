@@ -32,6 +32,12 @@
 # reading and to writing summary.md, its working directory the archive. On
 # success the pane is closed: the thread is done, and its archive stays.
 #
+# API errors: a run that ends on one, instead of its notes, is run once more
+# with CLAUDE_RESCUE_PURGE_FALLBACK (config.sh), if set: a command run in
+# claude's place, with the same arguments but --model, so it brings its own
+# model or backend. Off by default; meta.json's `fallback` lists the runs that
+# used it.
+#
 # Long conversations: no run reads more than CLAUDE_RESCUE_PURGE_PART_CHARS
 # (1.5M) rendered characters, ~400k tokens of Opus's 1M. A longer transcript is
 # cut into parts at lines; one run per part writes part-K.md (the same sections,
@@ -271,13 +277,16 @@ parts_of() { # $1 render.jq, $2 transcript
 }
 
 # One headless claude in the archive: prompt $3, allowed to write only $2.
-# Its exit status; stopped after TIMEOUT_S. Output appended to run.log.
+# Its exit status; stopped after TIMEOUT_S. Output appended to run.log. With
+# $4, the fallback (CLAUDE_RESCUE_PURGE_FALLBACK) runs in claude's place, given
+# the same arguments but --model: it picks its own.
 run_summarizer() {
-  local dir="$1" out="$2" prompt="$3" pid started
-  printf '=== %s %s\n' "$(now_iso)" "$out" >> "$dir/run.log"
+  local dir="$1" out="$2" prompt="$3" fallback="${4:-}" pid started
+  printf '=== %s %s%s\n' "$(now_iso)" "$out" "${fallback:+ (fallback)}" >> "$dir/run.log"
   (
     cd "$dir" || exit 1
-    exec "$CLAUDE_CMD" -p --safe-mode --no-session-persistence --model 'opus[1m]' \
+    if [ -n "$fallback" ]; then set -- "$fallback"; else set -- "$CLAUDE_CMD" --model 'opus[1m]'; fi
+    exec "$@" -p --safe-mode --no-session-persistence \
       --tools "Read Grep Glob Write Bash" \
       --allowedTools "Read Grep Glob Edit(./$out) Bash(jq *) Bash(wc *) Bash(head *) Bash(tail *) Bash(ls *)" \
       --permission-mode dontAsk "$prompt"
@@ -295,6 +304,33 @@ run_summarizer() {
   wait "$pid" 2>/dev/null
 }
 
+# The fallback is opted into (config.sh), and is there to run.
+fallback_ready() {
+  [ -n "${CLAUDE_RESCUE_PURGE_FALLBACK:-}" ] && [ -x "$CLAUDE_RESCUE_PURGE_FALLBACK" ]
+}
+
+# One summarizing run that has to write $2. When it ends on an API error (the
+# one claude prints, in this run's part of run.log) and the fallback is opted
+# into, it runs once more on the fallback. Any other failure is not retried.
+# 0 when $2 was written; FALLBACK_USED lists what fell back.
+FALLBACK_USED=""
+run_one() {
+  local dir="$1" out="$2" prompt="$3" rc=0 mark
+  mark="$(wc -c < "$dir/run.log" 2>/dev/null | tr -d ' ')"
+  run_summarizer "$dir" "$out" "$prompt" || rc=$?
+  [ -s "$dir/$out" ] && return 0
+  if fallback_ready \
+     && tail -c +$(( ${mark:-0} + 1 )) "$dir/run.log" | grep -q '^API Error'; then
+    log_err "purge-guard: $(basename "$dir"): $out ended on an API error; again with the fallback"
+    FALLBACK_USED="$FALLBACK_USED $out"
+    rc=0
+    run_summarizer "$dir" "$out" "$prompt" "$CLAUDE_RESCUE_PURGE_FALLBACK" || rc=$?
+    [ -s "$dir/$out" ] && return 0
+  fi
+  [ "$rc" -ne 0 ] || rc=1
+  return "$rc"
+}
+
 # The summarizing run over the archive's copy: fresh, headless claudes write
 # summary.md. A conversation whose rendering fits PART_CHARS is read by one; a
 # longer one is read in parts, each writing part-K.md, and a last run merges
@@ -310,17 +346,18 @@ summarize_archive() {
   rm -f "$dir"/part-*.md "$dir/run.log"
   parts="$(parts_of "$dir/render.jq" "$dir/transcript.jsonl")"
   n="$(printf '%s\n' "$parts" | grep -c .)"
+  FALLBACK_USED=""
   if [ "$n" -le 1 ]; then
-    run_summarizer "$dir" summary.md "$(summary_prompt)" || rc=$?
+    run_one "$dir" summary.md "$(summary_prompt)" || rc=$?
   else
     log_err "purge-guard: $sid: too long for one run; reading it in $n parts"
     while read -r from to; do
       k=$((k + 1))
-      run_summarizer "$dir" "part-$k.md" "$(part_prompt "$k" "$n" "$from" "$to")" || rc=$?
-      [ -s "$dir/part-$k.md" ] || { [ "$rc" -ne 0 ] || rc=1; break; }
+      run_one "$dir" "part-$k.md" "$(part_prompt "$k" "$n" "$from" "$to")" || { rc=$?; break; }
     done <<<"$parts"
-    [ "$rc" -eq 0 ] && { run_summarizer "$dir" summary.md "$(merge_prompt "$n")" || rc=$?; }
+    [ "$rc" -eq 0 ] && { run_one "$dir" summary.md "$(merge_prompt "$n")" || rc=$?; }
   fi
+  meta_set "$meta" --arg f "$FALLBACK_USED" '.fallback = ($f | split(" ") | map(select(. != "")))'
   rm -f "$dir/render.jq"
   if [ ! -s "$dir/summary.md" ]; then
     [ -f "$dir/summary.previous.md" ] && mv "$dir/summary.previous.md" "$dir/summary.md"
