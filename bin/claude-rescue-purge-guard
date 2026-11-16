@@ -1,40 +1,42 @@
 #!/usr/bin/env bash
 # claude-rescue-purge-guard — archive a conversation a pane holds before Claude
-# Code's cleanup deletes it.
+# Code's cleanup deletes it, then close the pane.
 #
 # Claude Code deletes a transcript nobody has written to for cleanupPeriodDays
 # (its settings.json; 30 when unset). A hard-hibernated pane never writes to its
 # conversation, so a thread left asleep that long loses it: 19 panes did on
 # 2026-11-16. Before that happens, the guard copies the transcript into the
-# Session archive and has Claude write down what the conversation knows.
+# Session archive and has a fresh Claude write down what it alone knew.
 #
-#   run              Archive the oldest due conversation, if any. What the
-#                    watcher starts every CLAUDE_RESCUE_PURGE_GUARD_CHECK_S on the
-#                    default server. One run at a time (a lock).
-#   due              The due conversations, oldest first:
-#                    session_id TAB pane_uuid TAB days since last write
-#   summarize <sid> <archive_dir>
-#                    Typed into the archive window by `run`: execs claude on the
-#                    conversation with the summary prompt.
+#   run   Archive the oldest due conversation, if any. What the watcher starts
+#         every CLAUDE_RESCUE_PURGE_GUARD_CHECK_S on the default server. One run
+#         at a time (a lock).
+#   due   The due conversations, oldest first:
+#         session_id TAB pane_uuid TAB days since last write
+#   archive <sid>    Archive one conversation now, whatever its age, and close
+#                    the pane holding it, if one does.
+#   summarize <sid>  Write summary.md again from the archive's copy (a better
+#                    prompt, a newer model). The previous one is kept if it fails.
 #
 # Due: a hard-hibernated pane holds it (its marker, resolved the way its
 # `clr <sid>` pre-fill is), its transcript is older than cleanupPeriodDays
 # minus CLAUDE_RESCUE_PURGE_LEAD_DAYS (14), no live Claude Code holds it, and
 # the archive has not already seen this exact transcript (meta.json's
-# transcript_mtime: an archived or stalled conversation waits until it changes).
+# transcript_mtime).
 #
-# Summarize: the conversation is resumed in place, in a window of tmux session
-# `rescue-archive`, on Opus with 1M context at its default effort. The summary
-# turn writes to the transcript, which restarts its cleanup clock once; meta.json
-# records the transcript as it was left, so the next check does not archive it
-# again, and the cleanup then deletes it with the archive kept. When summary.md
-# is written, claude exits and the window closes. A run that fails or stalls
-# leaves its window open to jump into.
+# Summarize: a headless `claude -p` with a clean context reads the archived copy
+# (never the conversation itself, which stays untouched and is deleted on
+# schedule) and writes summary.md. Opus with 1M context at its default effort;
+# --safe-mode (no CLAUDE.md, hooks, MCP, skills); --no-session-persistence
+# (nothing of it is saved, so it is never archived itself); its tools limited to
+# reading and to writing summary.md, its working directory the archive. On
+# success the pane is closed: the thread is done, and its archive stays.
 #
 # Archive: $CLAUDE_RESCUE_DATA_HOME/session-archive/<sid>/
-#   transcript.jsonl   the transcript as found, before the summary turn
+#   transcript.jsonl   the transcript as found
 #   session-files/     the conversation's own dir (subagents, tool results), if any
-#   summary.md         Claude's knowledge dump
+#   summary.md         the knowledge dump
+#   run.log            the summarizing run's output
 #   meta.json          sid, pane, folder, ages, status, timestamps
 set -uo pipefail
 
@@ -51,11 +53,8 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 . "$REPO/lib/common.sh"
 
 ARCHIVE_DIR="$CLAUDE_RESCUE_DATA_HOME/session-archive"
-ARCHIVE_SESSION="rescue-archive"
 LEAD_DAYS="${CLAUDE_RESCUE_PURGE_LEAD_DAYS:-14}"
 TIMEOUT_S="${CLAUDE_RESCUE_PURGE_TIMEOUT_S:-3600}"
-POLL_S="${CLAUDE_RESCUE_PURGE_POLL_S:-10}"
-SETTLE_S="${CLAUDE_RESCUE_PURGE_SETTLE_S:-20}"
 CLAUDE_CMD="${CLAUDE_RESCUE_PURGE_CLAUDE:-claude}"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
@@ -113,131 +112,197 @@ cmd_due() {
 # meta.json update: jq filter + args, applied in place.
 meta_set() {
   local meta="$1"; shift
-  local tmp="$meta.tmp"
-  jq "$@" "$meta" > "$tmp" && mv "$tmp" "$meta"
+  jq "$@" "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
 }
 
 summary_prompt() {
-  local dir="$1"
-  cat <<EOF
-This conversation is about to be deleted: Claude Code removes a conversation nobody has touched for its cleanup period, and this one has been asleep in a tmux pane that long. Before it goes, write down everything worth keeping from it, for whoever picks this thread up later (a person, or another Claude session with no access to this conversation).
+  cat <<'PROMPT'
+You are archiving a Claude Code conversation that is about to be deleted. It sat untouched for months, and Claude Code removes such conversations. The code, the commits, the PRs and the tickets keep the outcomes of the work. What usually exists only in the conversation is everything else: the details, the open items, and the contradictions. Your job is to find those and write them down, so whoever picks this thread up later (a person, or another Claude session with no access to it) loses nothing that mattered.
 
-Write it to $dir/summary.md with the Write tool, in one go, as your last step. Markdown, with these sections:
+## What you have (read-only copies, in the current directory)
 
-- **Goal**: what this conversation set out to do, and for whom.
-- **What happened**: the work done, in order, briefly.
-- **Decisions**: each decision taken and why, including approaches rejected.
-- **State**: where things were left: what is done, what is in progress, uncommitted or unpushed work, open PRs, branches, worktrees.
-- **Open loops**: what was still to do, waiting on someone, or unanswered.
-- **Knowledge**: facts, gotchas, commands, and things learned that are worth keeping on their own.
-- **References**: files, repos, branches, PRs, tickets, links, and people involved.
+- `transcript.jsonl`: the whole conversation, one JSON object per line, oldest first. Messages have `type` "user" or "assistant"; `message.content` is a string or a list of blocks: `text` (what was said), `thinking`, `tool_use` (the tool and its input: commands run, files edited) and `tool_result` (their output). Other line types carry little or no content.
+- Compactions: when the context filled up, Claude Code wrote a summary of everything so far and the conversation carried on from that summary. The summary is a "user" line with `"isCompactSummary": true`, right after a "system" line with `"subtype": "compact_boundary"`. Nothing before a compaction was deleted: the full earlier history is still in the file. Read both. The summary is what the conversation believed it knew from then on; the history is what actually happened. Details a summary dropped are exactly what to recover, and where the two disagree, that is a contradiction to report.
+- Summarized messages of other kinds count too: recaps Claude gave the user, TLDRs, status reports, handoff notes. Check them against the history the same way.
+- `session-files/` (if present): the conversation's subagents (`subagents/agent-*.jsonl`, same format) and saved tool results. Read what the subagents found and reported back.
+- `render.jq`: renders a range of lines as readable text. Messages in full; tool calls, tool results and thinking clipped to 1,500 characters; compactions marked.
 
-Write it from this conversation only. Don't run commands or read files to refresh it: the point is what this conversation knew. When the file is written, reply with one line: Archived.
-EOF
+## How to read it
+
+Read all of it, start to end, in order, including the middle. Not a sample, and not only the beginning and the end. Page through it:
+
+    wc -l transcript.jsonl
+    jq -r --argjson from 1 --argjson to 300 -f render.jq transcript.jsonl
+    jq -r --argjson from 301 --argjson to 600 -f render.jq transcript.jsonl
+    ...
+
+Use smaller ranges if a page is too long. To read one line whole (a clipped tool result that matters): `jq -c 'select(input_line_number == N)' transcript.jsonl`. Subagent files render the same way: `jq -r --argjson from 1 --argjson to 300 -f render.jq session-files/subagents/agent-XXXX.jsonl`.
+
+## What to write: `summary.md`, in this directory
+
+Markdown, with these sections, in this order:
+
+1. **Overview**: what the conversation was about and for whom; when (dates, from the timestamps); the folders, repos and branches it worked in; and how it ended (done, abandoned, waiting on something, cut off).
+2. **Open items**: everything left unresolved. Unfinished work; to-dos; follow-ups either side promised; questions asked and never answered (by the user or by Claude); things waiting on someone or something; claims never verified; plans never carried out; work left uncommitted, unpushed or unmerged; anything said to be done "later". For each: what it is, what was known about it, and the next step. Be exhaustive: this is the most valuable section.
+3. **Contradictions**: places where the conversation contradicts itself. Claims later corrected; the user correcting Claude; Claude's statements that the history contradicts; a compaction summary or recap that disagrees with what happened, or drops something that mattered; requirements or plans that changed; assumptions that proved wrong; findings that conflict. For each: both versions, when, and which one stood at the end, or that it was never settled.
+4. **Details**: the specifics that would be hard to find again. Exact commands, file paths, branches, commit SHAs, PR and ticket numbers, error messages, config values, numbers, URLs, names. Quote them exactly; never paraphrase an identifier.
+5. **Decisions**: each decision, why, who made it (the user or Claude), and the alternatives rejected.
+6. **Knowledge**: what was learned that is worth keeping on its own: how a system really behaves, gotchas, workarounds, and the user's preferences and corrections to how Claude works.
+7. **Timeline**: what happened, in order, with dates. Brief.
+
+## Rules
+
+- Use only these files. Don't look up the current state of repos, PRs or tickets: the point is what this conversation knew.
+- Say who said what when it matters: "the user asked", "Claude claimed".
+- Never invent. Mark anything uncertain as uncertain. A section with nothing in it says "None found."
+- Completeness over brevity in Open items, Contradictions and Details.
+- Write `summary.md` once, at the end, with the Write tool. Then reply with one line: Archived.
+PROMPT
 }
 
-cmd_summarize() {
-  local sid="${1:?sid}" dir="${2:?archive dir}"
-  # exec: claude must be the pane shell's own child, like any resumed pane.
-  exec "$CLAUDE_CMD" -r "$sid" --model 'opus[1m]' --add-dir "$dir" \
-    --permission-mode bypassPermissions "$(summary_prompt "$dir")"
+# Close the pane that held the conversation, if it still does: hard-hibernated,
+# at a shell, on this conversation. The watcher sees it go and clears its marker.
+close_pane() {
+  local pane_uuid="$1" sid="$2" pane cur held
+  pane="$(tmux list-panes -aF $'#{@claude-pane-id}\t#{pane_id}' 2>/dev/null \
+            | awk -F'\t' -v u="$pane_uuid" '$1==u {print $2; exit}')"
+  [ -n "$pane" ] || return 1
+  [ "$(hibernated_marker_field "$pane_uuid" mode)" = "hard" ] || return 1
+  cur="$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)"
+  is_shell_cmd "$cur" || return 1
+  held="$(resolve_resume_session_id "$pane_uuid")"
+  [ -n "$held" ] || held="$(read_active_session "$pane_uuid" 2>/dev/null || true)"
+  [ "$held" = "$sid" ] || return 1
+  tmux kill-pane -t "$pane" 2>/dev/null
 }
 
-# The archive window's claude still running: something other than the pane's
-# shell holds its foreground (claude, or a tool claude runs).
-pane_claude_alive() {
-  local cur
-  cur="$(tmux display-message -p -t "$1" '#{pane_current_command}' 2>/dev/null)" || return 1
-  [ -n "$cur" ] && ! is_shell_cmd "$cur"
-}
-
-cmd_run() {
-  local lock="$ARCHIVE_DIR/.lock" row sid pane_uuid age path dir meta cwd pane started
-  mkdir -p "$ARCHIVE_DIR"
-  if ! mkdir "$lock" 2>/dev/null; then
-    # A run is going, or one died holding the lock: take over only from a dead one.
-    kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null && return 0
-    rm -rf "$lock"; mkdir "$lock" 2>/dev/null || return 0
+# The summarizing run over the archive's copy: a fresh, headless claude writes
+# summary.md. 0 when it did; meta.json says how it went either way.
+summarize_archive() {
+  local sid="$1" dir="$ARCHIVE_DIR/$1" pid started rc
+  local meta="$dir/meta.json"
+  [ -s "$dir/transcript.jsonl" ] && [ -f "$meta" ] || { echo "no archive for $sid" >&2; return 1; }
+  meta_set "$meta" --arg ts "$(now_iso)" '.status="summarizing" | .summarize_started_at=$ts'
+  cp "$REPO/lib/transcript-render.jq" "$dir/render.jq"
+  [ -f "$dir/summary.md" ] && mv "$dir/summary.md" "$dir/summary.previous.md"
+  (
+    cd "$dir" || exit 1
+    exec "$CLAUDE_CMD" -p --safe-mode --no-session-persistence --model 'opus[1m]' \
+      --tools "Read Grep Glob Write Bash" \
+      --allowedTools "Read Grep Glob Edit(./summary.md) Bash(jq *) Bash(wc *) Bash(head *) Bash(tail *) Bash(ls *)" \
+      --permission-mode dontAsk "$(summary_prompt)"
+  ) </dev/null > "$dir/run.log" 2>&1 &
+  pid=$!
+  started="$(date +%s)"
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ $(( $(date +%s) - started )) -ge "$TIMEOUT_S" ]; then
+      kill "$pid" 2>/dev/null
+      log_err "purge-guard: $sid: no summary after ${TIMEOUT_S}s; stopped"
+      break
+    fi
+    sleep 5
+  done
+  wait "$pid" 2>/dev/null; rc=$?
+  rm -f "$dir/render.jq"
+  if [ ! -s "$dir/summary.md" ]; then
+    [ -f "$dir/summary.previous.md" ] && mv "$dir/summary.previous.md" "$dir/summary.md"
+    meta_set "$meta" --arg ts "$(now_iso)" --argjson rc "$rc" '.status="failed" | .ended_at=$ts | .exit=$rc'
+    log_err "purge-guard: $sid: no summary (exit $rc); see $dir/run.log"
+    return 1
   fi
-  echo $$ > "$lock/pid"
-  # Expanded now: the trap fires after this function's locals are gone.
-  trap "rm -rf '$lock'" EXIT
+  rm -f "$dir/summary.previous.md"
+  meta_set "$meta" --arg ts "$(now_iso)" '.status="archived" | .archived_at=$ts'
+}
 
-  row="$(cmd_due | head -n 1)"
-  [ -n "$row" ] || return 0
-  IFS=$'\t' read -r sid pane_uuid age <<<"$row"
+# Copy a conversation into the archive, summarize it, and close the pane that
+# held it ($2, may be empty). The copy comes first: whatever happens to the
+# summary, nothing is lost.
+archive_conversation() {
+  local sid="$1" pane_uuid="${2:-}" age="${3:-0}" path dir meta cwd
   path="$(transcript_for_session "$sid")"
-  [ -n "$path" ] || return 0
+  [ -n "$path" ] || { echo "no transcript for $sid" >&2; return 1; }
   dir="$ARCHIVE_DIR/$sid"
   meta="$dir/meta.json"
   mkdir -p "$dir"
-
-  # The copy first: whatever happens to the summary, nothing is lost.
   cp -p "$path" "$dir/transcript.jsonl" || { log_err "purge-guard: copy of $path failed"; return 1; }
+  rm -rf "$dir/session-files"
   [ -d "${path%.jsonl}" ] && cp -Rp "${path%.jsonl}" "$dir/session-files"
   cwd="$("$REPO/bin/claude-rescue" resume-dir "$sid" 2>/dev/null)"
   jq -n --arg sid "$sid" --arg pu "$pane_uuid" --arg tr "$path" --arg cwd "$cwd" \
         --argjson age "$age" --arg ts "$(now_iso)" --arg mt "$(mtime_of "$path")" \
      '{session_id:$sid, pane_uuid:$pu, transcript:$tr, cwd:$cwd, age_days:$age,
        copied_at:$ts, transcript_mtime:$mt, status:"copied"}' > "$meta"
-  log_err "purge-guard: $sid (pane $pane_uuid, ${age}d) copied to $dir"
-
-  if [ -z "$cwd" ] || [ ! -d "$cwd" ]; then
-    meta_set "$meta" '.status="no-resume-dir"'
-    log_err "purge-guard: $sid has no folder to resume in; copy only"
-    return 0
+  log_err "purge-guard: $sid (pane ${pane_uuid:-none}, ${age}d) copied to $dir"
+  summarize_archive "$sid" || return 1
+  if [ -n "$pane_uuid" ] && close_pane "$pane_uuid" "$sid"; then
+    meta_set "$meta" '.pane_closed=true'
+    log_err "purge-guard: $sid archived; its pane closed"
+  else
+    meta_set "$meta" '.pane_closed=false'
+    log_err "purge-guard: $sid archived; no pane holding it was closed"
   fi
+}
 
-  tmux has-session -t "=$ARCHIVE_SESSION" 2>/dev/null \
-    || tmux new-session -d -s "$ARCHIVE_SESSION" -c "$HOME" 2>/dev/null
-  local -a env_args=()
-  [ -n "${CLAUDE_RESCUE_PURGE_CLAUDE:-}" ] && env_args=(-e "CLAUDE_RESCUE_PURGE_CLAUDE=$CLAUDE_RESCUE_PURGE_CLAUDE")
-  pane="$(tmux new-window -d ${env_args[@]+"${env_args[@]}"} -t "$ARCHIVE_SESSION:" -n "archive-${sid:0:8}" -c "$cwd" \
-            -P -F '#{pane_id}' 2>/dev/null)" || { meta_set "$meta" '.status="no-window"'; return 1; }
-  # Typed into the window's shell, not run as its command: claude must be the
-  # pane shell's own child, or tmux-resurrect saves the wrapper and a restart
-  # loses the run.
-  tmux send-keys -t "$pane" "$(printf '%q ' "$REPO/bin/claude-rescue-purge-guard" summarize "$sid" "$dir")" Enter
-  meta_set "$meta" --arg p "$pane" --arg ts "$(now_iso)" '.status="summarizing" | .pane_id=$p | .started_at=$ts'
-
-  started="$(date +%s)"
-  local summary="$dir/summary.md" seen_claude=no
-  while :; do
-    sleep "$POLL_S"
-    if [ -s "$summary" ] && [ $(( $(date +%s) - $(mtime_of "$summary") )) -ge "$SETTLE_S" ]; then
-      break
-    fi
-    if pane_claude_alive "$pane"; then
-      seen_claude=yes
-    elif [ "$seen_claude" = yes ] || [ $(( $(date +%s) - started )) -ge 120 ]; then
-      # claude ended (or never started) without writing the summary.
-      meta_set "$meta" --arg ts "$(now_iso)" '.status="failed" | .ended_at=$ts'
-      log_err "purge-guard: $sid: claude ended without a summary; window $pane left open"
-      return 1
-    fi
-    if [ $(( $(date +%s) - started )) -ge "$TIMEOUT_S" ]; then
-      meta_set "$meta" --arg ts "$(now_iso)" '.status="stalled" | .ended_at=$ts'
-      log_err "purge-guard: $sid: no summary after ${TIMEOUT_S}s; window $pane left open"
-      return 1
-    fi
+# The pane holding a conversation, by the same resolution as `due`. Empty if none.
+pane_holding() {
+  local sid="$1" pane_uuid held
+  tmux list-panes -aF '#{@claude-pane-id}' 2>/dev/null | while IFS= read -r pane_uuid; do
+    [ -n "$pane_uuid" ] || continue
+    [ "$(hibernated_marker_field "$pane_uuid" mode)" = "hard" ] || continue
+    held="$(resolve_resume_session_id "$pane_uuid")"
+    [ -n "$held" ] || held="$(read_active_session "$pane_uuid" 2>/dev/null || true)"
+    [ "$held" = "$sid" ] && { printf '%s\n' "$pane_uuid"; break; }
   done
+}
 
-  # Plain text and a separate Enter: claude's extended-keys mode garbles control
-  # keys sent with it.
-  tmux send-keys -t "$pane" "/exit"
-  sleep 1
-  tmux send-keys -t "$pane" Enter
-  local _
-  for _ in $(seq 1 30); do pane_claude_alive "$pane" || break; sleep 1; done
-  meta_set "$meta" --arg ts "$(now_iso)" --arg mt "$(mtime_of "$path")" \
-    '.status="archived" | .archived_at=$ts | .transcript_mtime=$mt'
-  pane_claude_alive "$pane" || tmux kill-window -t "$pane" 2>/dev/null
-  log_err "purge-guard: $sid archived"
+# One run at a time, across run, archive and summarize.
+take_lock() {
+  local lock="$ARCHIVE_DIR/.lock"
+  mkdir -p "$ARCHIVE_DIR"
+  if ! mkdir "$lock" 2>/dev/null; then
+    # A run is going, or one died holding the lock: take over only from a dead one.
+    kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null && return 1
+    rm -rf "$lock"; mkdir "$lock" 2>/dev/null || return 1
+  fi
+  echo $$ > "$lock/pid"
+  # Expanded now: the trap fires after the caller's locals are gone.
+  trap "rm -rf '$lock'" EXIT
+}
+
+valid_sid() {
+  [[ "${1:-}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || { echo "not a session id: ${1:-}" >&2; return 2; }
+}
+
+cmd_run() {
+  local row sid pane_uuid age
+  take_lock || return 0
+  row="$(cmd_due | head -n 1)"
+  [ -n "$row" ] || return 0
+  IFS=$'\t' read -r sid pane_uuid age <<<"$row"
+  archive_conversation "$sid" "$pane_uuid" "$age"
+}
+
+cmd_archive() {
+  local sid="${1:-}" path
+  valid_sid "$sid" || return 2
+  take_lock || { echo "another archive run is going" >&2; return 1; }
+  path="$(transcript_for_session "$sid")"
+  [ -n "$path" ] || { echo "no transcript for $sid" >&2; return 1; }
+  archive_conversation "$sid" "$(pane_holding "$sid")" $(( ($(date +%s) - $(mtime_of "$path")) / 86400 ))
+}
+
+cmd_summarize() {
+  local sid="${1:-}"
+  valid_sid "$sid" || return 2
+  take_lock || { echo "another archive run is going" >&2; return 1; }
+  summarize_archive "$sid"
 }
 
 case "${1:-}" in
   run)       shift; cmd_run "$@" ;;
   due)       shift; cmd_due "$@" ;;
+  archive)   shift; cmd_archive "$@" ;;
   summarize) shift; cmd_summarize "$@" ;;
-  *) echo "usage: claude-rescue-purge-guard run|due|summarize <sid> <dir>" >&2; exit 2 ;;
+  *) echo "usage: claude-rescue-purge-guard run | due | archive <sid> | summarize <sid>" >&2; exit 2 ;;
 esac

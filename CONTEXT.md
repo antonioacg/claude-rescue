@@ -182,11 +182,14 @@ or a file, add it here.
   writes to its conversation. So a conversation a hard pane holds is *due*
   `CLAUDE_RESCUE_PURGE_LEAD_DAYS` (14) before that, unless a live Claude Code
   holds it. Due conversations are archived one at a time: the transcript is
-  copied, then resumed in place in a window of tmux session `rescue-archive`
-  (Opus, 1M, default effort) with a prompt that writes a summary.
+  copied, a fresh headless `claude -p` (safe mode, no session saved, Opus 1M,
+  read-only tools plus writing `summary.md`) reads the copy and writes the
+  summary, and the pane is closed. The conversation itself is never touched,
+  and Claude Code deletes it on schedule. `archive <sid>` does the same on
+  demand; `summarize <sid>` rewrites a summary from the archive's copy.
 - **Session archive** — `$DATA/session-archive/<sid>/`: `transcript.jsonl` (the
-  copy, as found), `session-files/`, `summary.md`, `meta.json` (`status`:
-  copied, summarizing, archived, stalled, failed, no-resume-dir). Its
-  `transcript_mtime` is the transcript as the archive last left it; while the
-  transcript still matches, the conversation is never due again, so the
-  cleanup deletes it with the archive kept.
+  copy, as found), `session-files/` (subagents, saved tool results),
+  `summary.md`, `run.log`, `meta.json` (`status`: copied, summarizing,
+  archived, failed; `pane_closed`). Its `transcript_mtime` is the transcript as
+  copied; while the transcript still matches, the conversation is never due
+  again. `lib/transcript-render.jq` is how the summarizer pages through a copy.
