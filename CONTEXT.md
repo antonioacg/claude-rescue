@@ -177,19 +177,22 @@ or a file, add it here.
   the session's jsonl exists under its slug, which is what makes the lossy
   reverse of `encode_cwd_for_projects` unnecessary.
 - **Purge guard** — `bin/claude-rescue-purge-guard`, started hourly by the
-  default server's Watcher Adapter. Claude Code deletes a transcript nobody
-  has written to for its `cleanupPeriodDays`, and a hard-hibernated pane never
+  default server's Watcher Adapter. Claude Code deletes a transcript nobody has
+  written to for its `cleanupPeriodDays`, and a hard-hibernated pane never
   writes to its conversation. So a conversation a hard pane holds is *due*
   `CLAUDE_RESCUE_PURGE_LEAD_DAYS` (14) before that, unless a live Claude Code
   holds it. Due conversations are archived one at a time: the transcript is
   copied, a fresh headless `claude -p` (safe mode, no session saved, Opus 1M,
   read-only tools plus writing `summary.md`) reads the copy and writes the
-  summary, and the pane is closed. The conversation itself is never touched,
-  and Claude Code deletes it on schedule. `archive <sid>` does the same on
-  demand; `summarize <sid>` rewrites a summary from the archive's copy.
+  summary, and the pane is closed. A conversation longer than one run should
+  read (`CLAUDE_RESCUE_PURGE_PART_CHARS`, ~400k tokens) is read in parts, one
+  run each, and a last run merges their notes. The conversation itself is never
+  touched, and Claude Code deletes it on schedule. `archive <sid>` does the
+  same on demand; `summarize <sid>` rewrites a summary from the archive's copy.
 - **Session archive** — `$DATA/session-archive/<sid>/`: `transcript.jsonl` (the
   copy, as found), `session-files/` (subagents, saved tool results),
-  `summary.md`, `run.log`, `meta.json` (`status`: copied, summarizing,
-  archived, failed; `pane_closed`). Its `transcript_mtime` is the transcript as
-  copied; while the transcript still matches, the conversation is never due
-  again. `lib/transcript-render.jq` is how the summarizer pages through a copy.
+  `summary.md`, `part-K.md` (a long one's notes per part), `run.log`,
+  `meta.json` (`status`: copied, summarizing, archived, failed; `pane_closed`).
+  Its `transcript_mtime` is the transcript as copied; while the transcript
+  still matches, the conversation is never due again.
+  `lib/transcript-render.jq` is how the summarizer pages through a copy.

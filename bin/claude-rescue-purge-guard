@@ -32,11 +32,18 @@
 # reading and to writing summary.md, its working directory the archive. On
 # success the pane is closed: the thread is done, and its archive stays.
 #
+# Long conversations: no run reads more than CLAUDE_RESCUE_PURGE_PART_CHARS
+# (1.5M) rendered characters, ~400k tokens of Opus's 1M. A longer transcript is
+# cut into parts at lines; one run per part writes part-K.md (the same sections,
+# citing lines, with what each compaction summary and recap claims), and a last
+# run merges them into summary.md, checking those claims across the parts.
+#
 # Archive: $CLAUDE_RESCUE_DATA_HOME/session-archive/<sid>/
 #   transcript.jsonl   the transcript as found
 #   session-files/     the conversation's own dir (subagents, tool results), if any
 #   summary.md         the knowledge dump
-#   run.log            the summarizing run's output
+#   part-K.md          a long conversation's notes, one per part
+#   run.log            the summarizing runs' output
 #   meta.json          sid, pane, folder, ages, status, timestamps
 set -uo pipefail
 
@@ -55,6 +62,9 @@ REPO="$(cd "$(dirname "$__script")/.." && pwd)"
 ARCHIVE_DIR="$CLAUDE_RESCUE_DATA_HOME/session-archive"
 LEAD_DAYS="${CLAUDE_RESCUE_PURGE_LEAD_DAYS:-14}"
 TIMEOUT_S="${CLAUDE_RESCUE_PURGE_TIMEOUT_S:-3600}"
+# The most a summarizing run reads, as rendered characters (~4 per token): 1.5M
+# leaves room in Opus's 1M context for paging, tool output and its own notes.
+PART_CHARS="${CLAUDE_RESCUE_PURGE_PART_CHARS:-1500000}"
 CLAUDE_CMD="${CLAUDE_RESCUE_PURGE_CLAUDE:-claude}"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
@@ -115,18 +125,61 @@ meta_set() {
   jq "$@" "$meta" > "$meta.tmp" && mv "$meta.tmp" "$meta"
 }
 
-summary_prompt() {
+# The summarizer's prompts. One run reads the whole conversation and writes
+# summary.md; a conversation too long for one context is read in parts, each
+# run writing part-K.md, and a last run merges them. The text is shared.
+prompt_intro() {
   cat <<'PROMPT'
 You are archiving a Claude Code conversation that is about to be deleted. It sat untouched for months, and Claude Code removes such conversations. The code, the commits, the PRs and the tickets keep the outcomes of the work. What usually exists only in the conversation is everything else: the details, the open items, and the contradictions. Your job is to find those and write them down, so whoever picks this thread up later (a person, or another Claude session with no access to it) loses nothing that mattered.
+PROMPT
+}
 
+prompt_have() { # $1: with the session-files line (yes), or without
+  cat <<'PROMPT'
 ## What you have (read-only copies, in the current directory)
 
 - `transcript.jsonl`: the whole conversation, one JSON object per line, oldest first. Messages have `type` "user" or "assistant"; `message.content` is a string or a list of blocks: `text` (what was said), `thinking`, `tool_use` (the tool and its input: commands run, files edited) and `tool_result` (their output). Other line types carry little or no content.
 - Compactions: when the context filled up, Claude Code wrote a summary of everything so far and the conversation carried on from that summary. The summary is a "user" line with `"isCompactSummary": true`, right after a "system" line with `"subtype": "compact_boundary"`. Nothing before a compaction was deleted: the full earlier history is still in the file. Read both. The summary is what the conversation believed it knew from then on; the history is what actually happened. Details a summary dropped are exactly what to recover, and where the two disagree, that is a contradiction to report.
 - Summarized messages of other kinds count too: recaps Claude gave the user, TLDRs, status reports, handoff notes. Check them against the history the same way.
+PROMPT
+  [ "${1:-yes}" = yes ] && cat <<'PROMPT'
 - `session-files/` (if present): the conversation's subagents (`subagents/agent-*.jsonl`, same format) and saved tool results. Read what the subagents found and reported back.
+PROMPT
+  cat <<'PROMPT'
 - `render.jq`: renders a range of lines as readable text. Messages in full; tool calls, tool results and thinking clipped to 1,500 characters; compactions marked.
+PROMPT
+}
 
+prompt_sections() {
+  cat <<'PROMPT'
+Markdown, with these sections, in this order:
+
+1. **Overview**: what the conversation was about and for whom; when (dates, from the timestamps); the folders, repos and branches it worked in; and how it ended (done, abandoned, waiting on something, cut off).
+2. **Open items**: everything left unresolved. Unfinished work; to-dos; follow-ups either side promised; questions asked and never answered (by the user or by Claude); things waiting on someone or something; claims never verified; plans never carried out; work left uncommitted, unpushed or unmerged; anything said to be done "later". For each: what it is, what was known about it, and the next step. Be exhaustive: this is the most valuable section.
+3. **Contradictions**: places where the conversation contradicts itself. Claims later corrected; the user correcting Claude; Claude's statements that the history contradicts; a compaction summary or recap that disagrees with what happened, or drops something that mattered; requirements or plans that changed; assumptions that proved wrong; findings that conflict. For each: both versions, when, and which one stood at the end, or that it was never settled.
+4. **Details**: the specifics that would be hard to find again. Exact commands, file paths, branches, commit SHAs, PR and ticket numbers, error messages, config values, numbers, URLs, names. Quote them exactly; never paraphrase an identifier.
+5. **Decisions**: each decision, why, who made it (the user or Claude), and the alternatives rejected.
+6. **Knowledge**: what was learned that is worth keeping on its own: how a system really behaves, gotchas, workarounds, and the user's preferences and corrections to how Claude works.
+7. **Timeline**: what happened, in order, with dates. Brief.
+PROMPT
+}
+
+prompt_rules() { # $1 the file to write, $2 the one-line reply
+  cat <<'PROMPT'
+## Rules
+
+- Use only these files. Don't look up the current state of repos, PRs or tickets: the point is what this conversation knew.
+- Say who said what when it matters: "the user asked", "Claude claimed".
+- Never invent. Mark anything uncertain as uncertain. A section with nothing in it says "None found."
+- Completeness over brevity in Open items, Contradictions and Details.
+PROMPT
+  printf -- '- Write `%s` once, at the end, with the Write tool. Then reply with one line: %s\n' "$1" "$2"
+}
+
+# The whole conversation in one run.
+summary_prompt() {
+  prompt_intro; echo; prompt_have yes; echo
+  cat <<'PROMPT'
 ## How to read it
 
 Read all of it, start to end, in order, including the middle. Not a sample, and not only the beginning and the end. Page through it:
@@ -140,24 +193,51 @@ Use smaller ranges if a page is too long. To read one line whole (a clipped tool
 
 ## What to write: `summary.md`, in this directory
 
-Markdown, with these sections, in this order:
-
-1. **Overview**: what the conversation was about and for whom; when (dates, from the timestamps); the folders, repos and branches it worked in; and how it ended (done, abandoned, waiting on something, cut off).
-2. **Open items**: everything left unresolved. Unfinished work; to-dos; follow-ups either side promised; questions asked and never answered (by the user or by Claude); things waiting on someone or something; claims never verified; plans never carried out; work left uncommitted, unpushed or unmerged; anything said to be done "later". For each: what it is, what was known about it, and the next step. Be exhaustive: this is the most valuable section.
-3. **Contradictions**: places where the conversation contradicts itself. Claims later corrected; the user correcting Claude; Claude's statements that the history contradicts; a compaction summary or recap that disagrees with what happened, or drops something that mattered; requirements or plans that changed; assumptions that proved wrong; findings that conflict. For each: both versions, when, and which one stood at the end, or that it was never settled.
-4. **Details**: the specifics that would be hard to find again. Exact commands, file paths, branches, commit SHAs, PR and ticket numbers, error messages, config values, numbers, URLs, names. Quote them exactly; never paraphrase an identifier.
-5. **Decisions**: each decision, why, who made it (the user or Claude), and the alternatives rejected.
-6. **Knowledge**: what was learned that is worth keeping on its own: how a system really behaves, gotchas, workarounds, and the user's preferences and corrections to how Claude works.
-7. **Timeline**: what happened, in order, with dates. Brief.
-
-## Rules
-
-- Use only these files. Don't look up the current state of repos, PRs or tickets: the point is what this conversation knew.
-- Say who said what when it matters: "the user asked", "Claude claimed".
-- Never invent. Mark anything uncertain as uncertain. A section with nothing in it says "None found."
-- Completeness over brevity in Open items, Contradictions and Details.
-- Write `summary.md` once, at the end, with the Write tool. Then reply with one line: Archived.
 PROMPT
+  prompt_sections; echo; prompt_rules summary.md Archived.
+}
+
+# Part $1 of $2: transcript lines $3..$4, notes to part-$1.md.
+part_prompt() {
+  local k=$1 n=$2 from=$3 to=$4
+  prompt_intro; echo
+  printf 'This conversation is too long to read in one sitting, so it is read in %s parts, in order, each by a fresh session like you, and a last session merges what the parts found into the summary. You read part %s of %s: lines %s to %s of `transcript.jsonl`.\n\n' "$n" "$k" "$n" "$from" "$to"
+  prompt_have no; echo
+  cat <<'PROMPT'
+## How to read it
+
+Read all of your lines, start to end, in order, including the middle. Not a sample. Page through them a few hundred lines at a time, for example:
+
+PROMPT
+  printf '    jq -r --argjson from %s --argjson to %s -f render.jq transcript.jsonl\n\n' "$from" "$(( from + 299 < to ? from + 299 : to ))"
+  cat <<'PROMPT'
+Use smaller ranges if a page is too long. To read one line whole (a clipped tool result that matters): `jq -c 'select(input_line_number == N)' transcript.jsonl`. The other lines are other parts: read one only when a message in your part points back to it. The subagents in `session-files/` are read by the last session, not you.
+
+PROMPT
+  printf '## What to write: `part-%s.md`, in this directory\n\n' "$k"
+  printf 'Start it with the line `Part %s of %s: lines %s to %s.` ' "$k" "$n" "$from" "$to"
+  cat <<'PROMPT'
+Then your notes for the last session, on your part only. Cite the line number (#N) of everything you record, so it can find it. Record every compaction summary and recap in your part with what it claims, and say what the conversation believed at the end of your part (state, plans, open items): the last session checks them against the other parts.
+
+PROMPT
+  prompt_sections; echo; prompt_rules "part-$k.md" Done.
+}
+
+# The merge of $1 parts' notes into summary.md.
+merge_prompt() {
+  local n=$1
+  prompt_intro; echo
+  printf 'It was too long to read in one sitting, so %s sessions read it in parts, in order, and each wrote its notes: `part-1.md` to `part-%s.md` (each names the lines it covers, and cites them). You write the summary from those notes.\n\n' "$n" "$n"
+  prompt_have yes; echo
+  cat <<'PROMPT'
+## How to work
+
+Read every part's notes, in order. Merge them: one item per thing, not per part. An open item a later part closes is not open; say where it was closed. Check each compaction summary and recap the notes record against what the earlier parts say happened: where they disagree, or a summary dropped something that mattered, that is a contradiction. Where the notes are unclear or disagree, read the lines they cite: `jq -r --argjson from N --argjson to M -f render.jq transcript.jsonl`. Read the subagents in `session-files/` yourself, if present: `jq -r --argjson from 1 --argjson to 300 -f render.jq session-files/subagents/agent-XXXX.jsonl`.
+
+## What to write: `summary.md`, in this directory
+
+PROMPT
+  prompt_sections; echo; prompt_rules summary.md Archived.
 }
 
 # Close the pane that held the conversation, if it still does: hard-hibernated,
@@ -176,42 +256,81 @@ close_pane() {
   tmux kill-pane -t "$pane" 2>/dev/null
 }
 
-# The summarizing run over the archive's copy: a fresh, headless claude writes
-# summary.md. 0 when it did; meta.json says how it went either way.
-summarize_archive() {
-  local sid="$1" dir="$ARCHIVE_DIR/$1" pid started rc
-  local meta="$dir/meta.json"
-  [ -s "$dir/transcript.jsonl" ] && [ -f "$meta" ] || { echo "no archive for $sid" >&2; return 1; }
-  meta_set "$meta" --arg ts "$(now_iso)" '.status="summarizing" | .summarize_started_at=$ts'
-  cp "$REPO/lib/transcript-render.jq" "$dir/render.jq"
-  [ -f "$dir/summary.md" ] && mv "$dir/summary.md" "$dir/summary.previous.md"
+# The parts a transcript is read in: "from to" line ranges, each rendered (what
+# the summarizer reads, by render.jq) to no more than PART_CHARS, cut between
+# lines. One part is the whole conversation.
+parts_of() { # $1 render.jq, $2 transcript
+  local last
+  last="$(wc -l < "$2" | tr -d ' ')"
+  jq -r --argjson from 1 --argjson to "$last" -f "$1" "$2" 2>/dev/null \
+    | awk -v max="$PART_CHARS" -v last="$last" '
+        BEGIN { from = 1 }
+        /^#[0-9]+ / { n = substr($1, 2) + 0; if (size >= max && n > from) { print from, n - 1; from = n; size = 0 } }
+        { size += length($0) + 1 }
+        END { print from, last }'
+}
+
+# One headless claude in the archive: prompt $3, allowed to write only $2.
+# Its exit status; stopped after TIMEOUT_S. Output appended to run.log.
+run_summarizer() {
+  local dir="$1" out="$2" prompt="$3" pid started
+  printf '=== %s %s\n' "$(now_iso)" "$out" >> "$dir/run.log"
   (
     cd "$dir" || exit 1
     exec "$CLAUDE_CMD" -p --safe-mode --no-session-persistence --model 'opus[1m]' \
       --tools "Read Grep Glob Write Bash" \
-      --allowedTools "Read Grep Glob Edit(./summary.md) Bash(jq *) Bash(wc *) Bash(head *) Bash(tail *) Bash(ls *)" \
-      --permission-mode dontAsk "$(summary_prompt)"
-  ) </dev/null > "$dir/run.log" 2>&1 &
+      --allowedTools "Read Grep Glob Edit(./$out) Bash(jq *) Bash(wc *) Bash(head *) Bash(tail *) Bash(ls *)" \
+      --permission-mode dontAsk "$prompt"
+  ) </dev/null >> "$dir/run.log" 2>&1 &
   pid=$!
   started="$(date +%s)"
   while kill -0 "$pid" 2>/dev/null; do
     if [ $(( $(date +%s) - started )) -ge "$TIMEOUT_S" ]; then
       kill "$pid" 2>/dev/null
-      log_err "purge-guard: $sid: no summary after ${TIMEOUT_S}s; stopped"
+      log_err "purge-guard: $(basename "$dir"): no $out after ${TIMEOUT_S}s; stopped"
       break
     fi
     sleep 5
   done
-  wait "$pid" 2>/dev/null; rc=$?
+  wait "$pid" 2>/dev/null
+}
+
+# The summarizing run over the archive's copy: fresh, headless claudes write
+# summary.md. A conversation whose rendering fits PART_CHARS is read by one; a
+# longer one is read in parts, each writing part-K.md, and a last run merges
+# them, so no run holds more than a part. 0 when summary.md was written;
+# meta.json says how it went either way.
+summarize_archive() {
+  local sid="$1" dir="$ARCHIVE_DIR/$1" rc=0 parts n k=0 from to
+  local meta="$dir/meta.json"
+  [ -s "$dir/transcript.jsonl" ] && [ -f "$meta" ] || { echo "no archive for $sid" >&2; return 1; }
+  meta_set "$meta" --arg ts "$(now_iso)" '.status="summarizing" | .summarize_started_at=$ts'
+  cp "$REPO/lib/transcript-render.jq" "$dir/render.jq"
+  [ -f "$dir/summary.md" ] && mv "$dir/summary.md" "$dir/summary.previous.md"
+  rm -f "$dir"/part-*.md "$dir/run.log"
+  parts="$(parts_of "$dir/render.jq" "$dir/transcript.jsonl")"
+  n="$(printf '%s\n' "$parts" | grep -c .)"
+  if [ "$n" -le 1 ]; then
+    run_summarizer "$dir" summary.md "$(summary_prompt)" || rc=$?
+  else
+    log_err "purge-guard: $sid: too long for one run; reading it in $n parts"
+    while read -r from to; do
+      k=$((k + 1))
+      run_summarizer "$dir" "part-$k.md" "$(part_prompt "$k" "$n" "$from" "$to")" || rc=$?
+      [ -s "$dir/part-$k.md" ] || { [ "$rc" -ne 0 ] || rc=1; break; }
+    done <<<"$parts"
+    [ "$rc" -eq 0 ] && { run_summarizer "$dir" summary.md "$(merge_prompt "$n")" || rc=$?; }
+  fi
   rm -f "$dir/render.jq"
   if [ ! -s "$dir/summary.md" ]; then
     [ -f "$dir/summary.previous.md" ] && mv "$dir/summary.previous.md" "$dir/summary.md"
-    meta_set "$meta" --arg ts "$(now_iso)" --argjson rc "$rc" '.status="failed" | .ended_at=$ts | .exit=$rc'
+    meta_set "$meta" --arg ts "$(now_iso)" --argjson rc "$rc" --argjson n "$n" \
+      '.status="failed" | .ended_at=$ts | .exit=$rc | .parts=$n'
     log_err "purge-guard: $sid: no summary (exit $rc); see $dir/run.log"
     return 1
   fi
   rm -f "$dir/summary.previous.md"
-  meta_set "$meta" --arg ts "$(now_iso)" '.status="archived" | .archived_at=$ts'
+  meta_set "$meta" --arg ts "$(now_iso)" --argjson n "$n" '.status="archived" | .archived_at=$ts | .parts=$n'
 }
 
 # Copy a conversation into the archive, summarize it, and close the pane that

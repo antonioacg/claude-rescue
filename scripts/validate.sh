@@ -1068,8 +1068,9 @@ echo "[purge guard] a pane's conversation is archived before Claude Code deletes
 # bin/claude-rescue-purge-guard against a throwaway Claude Code home: a
 # hard-hibernated pane whose transcript is 80 days old (cleanup 90, lead 14).
 # A fake claude stands in for the headless summarizer: it records how it was
-# run and writes summary.md (or, as `silent`, writes nothing; as `hang`, never
-# returns).
+# run (runs.log: one line per run, the file it may write) and writes that file,
+# summary.md or a part's notes (or, as `silent`, writes nothing; as `hang`,
+# never returns).
 PG_SOCKPATH=$(tmux -L "$SOCK" display-message -p '#{socket_path}')
 PG_ROOT="$HOME_DIR/purge"
 PG_HOME="$PG_ROOT/claude-home"
@@ -1094,11 +1095,16 @@ cat > "$PG_ROOT/bin/fake-claude" <<'SHEOF'
 #!/usr/bin/env bash
 pwd -P > args.cwd; printf '%s\n' "$@" > args.txt
 [ -f render.jq ] && echo yes > saw-render
+out=$(grep -o 'Edit(./[^)]*)' args.txt | sed 's/^Edit(\.\///; s/)$//')
+echo "$out" >> runs.log
 case "$(basename "$0")" in
   silent) exit 1 ;;
   hang) sleep 300 ;;
 esac
-printf '# Overview\nfake summary\n' > summary.md
+case $out in
+  part-*) printf '# %s\nfake notes\n' "$out" > "$out" ;;
+  *) printf '# Overview\nfake summary\n' > "$out" ;;
+esac
 echo Archived.
 SHEOF
 chmod +x "$PG_ROOT/bin/fake-claude"
@@ -1162,6 +1168,28 @@ pg_run archive "$PG_S2"
 assert "purge guard: archive <sid> archives it anyway" "archived" "$(pg_meta "$PG_S2" .status)"
 assert "purge guard: archive <sid> closes its pane" "" "$(pg_alive "$PG_P2")"
 
+# A conversation longer than one run reads: read in parts, then merged.
+PG_U4=12121212-7777-4777-8777-777777777777; PG_S4=34343434-8888-4888-8888-888888888888
+PG_P4=$(pg_conversation "$PG_U4" "$PG_S4" 1)
+PG_T4="$PG_HOME/projects/$PG_SLUG/$PG_S4.jsonl"
+for i in 1 2 3 4 5 6; do
+  printf '{"type":"assistant","message":{"content":[{"type":"text","text":"reply %s %s"}]}}\n' "$i" \
+    "$(printf 'x%.0s' $(seq 1 120))" >> "$PG_T4"
+done
+CLAUDE_RESCUE_PURGE_PART_CHARS=300 pg_run archive "$PG_S4"
+PG_A4="$HOME_DIR/session-archive/$PG_S4"
+PG_N4=$(pg_meta "$PG_S4" .parts)
+assert "purge guard: a long conversation is read in parts" "yes" "$([ "${PG_N4:-0}" -gt 1 ] && echo yes || echo no)"
+assert "purge guard: one run per part, then the merge" \
+  "$(seq 1 "${PG_N4:-0}" | sed 's/^/part-/; s/$/.md/'; echo summary.md)" "$(cat "$PG_A4/runs.log" 2>/dev/null)"
+assert "purge guard: each part's notes are kept" "$PG_N4" "$(ls "$PG_A4" | grep -c '^part-[0-9]*\.md$')"
+assert "purge guard: the parts cover every line, in order" "1-$(wc -l < "$PG_T4" | tr -d ' ')" \
+  "$(bash -c ". '$REPO/lib/common.sh'; PART_CHARS=300; $(sed -n '/^parts_of() {/,/^}/p' "$REPO/bin/claude-rescue-purge-guard")
+     parts_of '$REPO/lib/transcript-render.jq' '$PG_A4/transcript.jsonl'" \
+     | awk 'NR==1 {first=$1} {if (NR>1 && $1 != prev+1) bad=1; prev=$2} END {print (bad ? "gap" : first "-" prev)}')"
+assert "purge guard: the merge is told how many parts" "1" "$(grep -c "\`part-1.md\` to \`part-$PG_N4.md\`" "$PG_A4/args.txt")"
+assert "purge guard: a long conversation is archived" "archived" "$(pg_meta "$PG_S4" .status)"
+
 # A summarizer that never returns: stopped at the timeout, its pane left open.
 PG_U3=eeeeeeee-5555-4555-8555-555555555555; PG_S3=ffffffff-6666-4666-8666-666666666666
 PG_P3=$(pg_conversation "$PG_U3" "$PG_S3" 85)
@@ -1170,7 +1198,8 @@ assert "purge guard: a hung summarizer is stopped → failed" "failed" "$(pg_met
 assert "purge guard: a failed run leaves the pane open" "$PG_P3" "$(pg_alive "$PG_P3")"
 assert "purge guard: a failed run is not retried while unchanged" "" "$(pg_run due)"
 tmux -L "$SOCK" kill-pane -t "$PG_P3" 2>/dev/null
-rm -f "$HOME_DIR/cache/hibernated/$PG_U1.json" "$HOME_DIR/cache/hibernated/$PG_U2.json" "$HOME_DIR/cache/hibernated/$PG_U3.json"
+rm -f "$HOME_DIR/cache/hibernated/$PG_U1.json" "$HOME_DIR/cache/hibernated/$PG_U2.json" "$HOME_DIR/cache/hibernated/$PG_U3.json" \
+      "$HOME_DIR/cache/hibernated/$PG_U4.json"
 
 # ---------------------------------------------------------------------------
 echo "[install.sh] dry-run accounts for every binary in bin/"
