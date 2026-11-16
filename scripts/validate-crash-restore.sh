@@ -34,6 +34,11 @@
 #   6. Hard → post-restore with a vanished launch dir:
 #        - falls back to a bare `clr <sid>` (never emits `cd <gone-dir> &&`,
 #          which would fail on Enter).
+#   7. Live (not hibernated) claude nested under a shell → crash → restore:
+#        - resurrect does not relaunch it (its saved command line is the
+#          shell), so the restore hook gives it a plain hard marker: capture
+#          painted, `clr <sid>` pre-filled, and arm-sweep keeps its pane_uuid
+#          (3 panes came back blank on 2026-11-16).
 #
 # Exit 0 on all-pass, non-zero on any failure. Cleans up on exit.
 
@@ -554,6 +559,65 @@ if printf '%s' "$PANE_CONTENT" | grep -q "cd $GONE"; then
 else
   RESULTS+=("PASS  scenario 6: no 'cd <gone-dir>' emitted (graceful fallback)"); PASS=$((PASS + 1))
 fi
+
+# ===========================================================================
+echo ""
+echo "[7] live claude nested under a shell → crash → restore: pre-filled, identity kept"
+
+bring_up_fresh
+
+P0=%0
+P0_UUID="$(tmux -L "$SOCK" show-options -pv -t $P0 @claude-pane-id 2>/dev/null)"
+SAVED_SID="$(jq -rs --arg p "$P0_UUID" '
+  [.[] | select(.pane_uuid == $p and (.kind | startswith("session_start")))]
+  | sort_by(.ts) | last | .session_id // empty
+' "$DATA_DIR/windows/"*.jsonl 2>/dev/null)"
+assert_nonempty "scenario 7: SAVED_SID extracted" "$SAVED_SID"
+
+# Re-open the session nested, the way the tree picker opens one
+# (`zsh -ic 'clr <sid>'`): the pane shell's child is that zsh, not claude.
+# SIGKILL the direct claude first so no SessionEnd hook runs.
+wait_idle "$P0_UUID"
+S7_PANE_PID="$(tmux -L "$SOCK" display-message -p -t $P0 '#{pane_pid}')"
+kill -9 $(pgrep -P "$S7_PANE_PID" -x claude) 2>/dev/null
+sleep 1
+# The killed claude leaves tmux encoding control keys in its extended-keys
+# mode (C-u arrives as `17;5u`), so send only plain text and Enter.
+tmux -L "$SOCK" send-keys -t $P0 Enter
+sleep 1
+tmux -L "$SOCK" send-keys -t $P0 "zsh -ic 'clr $SAVED_SID'" Enter
+for _ in $(seq 1 30); do
+  [ "$(tmux -L "$SOCK" display-message -p -t $P0 '#{pane_current_command}')" = claude ] && break
+  sleep 1
+done
+sleep 3
+force_save
+S7_SAVED="$(awk -F'\t' '$1=="pane" && $2=="main" && $3=="1" && $6=="1" {print $10 "|" $11}' "$RESURRECT_DIR/last")"
+assert_contains "scenario 7: saved as fg=claude, command line = the nested zsh" \
+  "^claude\\|:zsh -ic" "$S7_SAVED"
+
+kill_server
+sleep 1
+bash "$REPO/scripts/staging.sh" setup >/dev/null 2>&1
+force_restore
+
+RESTORED_P0="$(pane_with_uuid "$P0_UUID")"
+assert_nonempty "scenario 7: restored pane found by pane_uuid" "$RESTORED_P0"
+PANE_CONTENT=""
+for _ in $(seq 1 20); do
+  PANE_CONTENT="$(tmux -L "$SOCK" capture-pane -p -t "${RESTORED_P0:-%0}" -S - 2>/dev/null)"
+  printf '%s' "$PANE_CONTENT" | grep -q "clr $SAVED_SID" && break
+  sleep 1
+done
+assert "scenario 7: marker is plain hard (no crash-promote)" "hard|" \
+  "$(jq -r '"\(.mode // "")|\(.hard_source // "")"' "$CACHE_DIR/hibernated/$P0_UUID.json" 2>/dev/null)"
+assert_contains "scenario 7: 'clr <sid>' pre-filled" "clr $SAVED_SID" "$PANE_CONTENT"
+
+# arm-sweep must not read the restored shell as a voluntary exit (the marker
+# guards it): before the fix it wiped the pane's identity here.
+tmux -L "$SOCK" run-shell -b "claude-rescue-log arm-sweep"
+sleep 3
+assert_nonempty "scenario 7: pane keeps its pane_uuid after arm-sweep" "$(pane_with_uuid "$P0_UUID")"
 
 # ---------------------------------------------------------------------------
 # Summary

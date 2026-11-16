@@ -725,10 +725,27 @@ cmd_resurrect_restore() {
   # re-stashing the args or rewriting its marker would race the wrapper's
   # relaunch_pid write. The flag is a pane option, so it dies with the server
   # and can only mean "handled in this Epoch".
-  local relaunch_uuids=" " handled_uuids=" " r_sess r_win r_pane r_cmd r_target r_pid r_uuid
-  while IFS=$'\t' read -r r_sess r_win r_pane r_cmd; do
+  # A pane whose saved foreground is claude but whose saved command line is not
+  # (claude nested under another shell, e.g. `zsh -ic 'clr <sid>'`, or a saved
+  # command line that names some other process) is not relaunched, and had no
+  # marker if it wasn't hibernated: arm-sweep then read it as a voluntary exit
+  # and wiped its identity, leaving it blank (3 panes, 2026-11-16). Collect
+  # those as nested_uuids so the marker pass below gives them a plain hard
+  # marker, which gets them painted and pre-filled.
+  local relaunch_uuids=" " handled_uuids=" " nested_uuids=" " r_sess r_win r_pane r_fg r_cmd r_target r_pid r_uuid
+  while IFS=$'\t' read -r r_sess r_win r_pane r_fg r_cmd; do
     r_cmd="${r_cmd#:}"
-    is_claude_relaunch_cmd "$r_cmd" || continue
+    if ! is_claude_relaunch_cmd "$r_cmd"; then
+      [ "$r_fg" = "claude" ] || continue
+      r_target="$r_sess:$r_win.$r_pane"
+      r_pid="$(tmux display-message -p -t "$r_target" '#{pane_pid}' 2>/dev/null)" || continue
+      [ -n "$r_pid" ] || continue
+      r_uuid="$(tmux show-options -pqv -t "$r_target" @claude-pane-id 2>/dev/null)"
+      [ -n "$r_uuid" ] || continue
+      [ -z "$(subtree_pids "$r_pid" claude)" ] || continue
+      nested_uuids+="$r_uuid "
+      continue
+    fi
     r_target="$r_sess:$r_win.$r_pane"
     r_pid="$(tmux display-message -p -t "$r_target" '#{pane_pid}' 2>/dev/null)" || continue
     [ -n "$r_pid" ] || continue
@@ -741,7 +758,7 @@ cmd_resurrect_restore() {
     tmux set-option -pt "$r_target" @claude-rescue-relaunch 1 2>/dev/null || true
     tmux set-option -pt "$r_target" @claude-rescue-resume-cmd "$r_cmd" 2>/dev/null || true
     [ -n "$r_uuid" ] && relaunch_uuids+="$r_uuid "
-  done < <(awk -F'\t' '$1=="pane" {print $2 "\t" $3 "\t" $6 "\t" $11}' "$state_file")
+  done < <(awk -F'\t' '$1=="pane" {print $2 "\t" $3 "\t" $6 "\t" $10 "\t" $11}' "$state_file")
 
   # === Crash-promote: re-decide every marker against what this restore does.
   #   - Pane is being relaunched → hard + hard_source "crash-promote": the
@@ -791,6 +808,16 @@ cmd_resurrect_restore() {
     jq -n --arg p "$r_target" --arg u "$r_uuid" --arg ts "$now" \
        '{pane_id:$p, pane_uuid:$u, ts:$ts, mode:"hard", forced:false, pids:[],
          hard_ts:$ts, hard_source:"crash-promote"}' > "$marker"
+  done
+  for r_uuid in $nested_uuids; do
+    marker="$(hibernated_marker_path "$r_uuid")"
+    [ -f "$marker" ] && continue
+    r_target="$(tmux list-panes -aF $'#{@claude-pane-id}\t#{pane_id}' 2>/dev/null \
+                  | awk -F'\t' -v u="$r_uuid" '$1==u {print $2; exit}')"
+    jq -n --arg p "$r_target" --arg u "$r_uuid" --arg ts "$now" \
+       '{pane_id:$p, pane_uuid:$u, ts:$ts, mode:"hard", forced:false, pids:[],
+         hard_ts:$ts}' > "$marker"
+    log_err "resurrect-restore: $r_target ran claude nested at save — plain hard marker for pre-fill"
   done
   # Stale arm pid files refer to processes from the dead server.
   rm -f "$CLAUDE_RESCUE_CACHE_HOME"/hibernated/*.arm.pid

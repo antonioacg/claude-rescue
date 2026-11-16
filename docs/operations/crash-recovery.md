@@ -47,6 +47,12 @@ pane processes, otherwise `claude-rescue-resume` would not see
      (a claude suspended under a nested shell is saved as `-zsh`, which
      resurrect never relaunches) and a crash-promote left over from an earlier
      restore whose session never came back.
+   - a pane the snapshot saved with claude in the foreground (field 10) but
+     a non-claude command line (field 11), with no marker → a new plain hard
+     marker. That is a live claude nested under a shell (the tree picker opens
+     sessions as `zsh -ic 'clr <sid>'`): resurrect does not relaunch it, and
+     without a marker arm-sweep reads the restored shell as a voluntary exit
+     and wipes the pane's identity (3 blank panes, 2026-11-16).
    A soft claude died with the crash either way; treating it as still-soft
    would trigger a spurious `fg<Enter>` send-keys to a fresh shell on the
    user's next focus-in. Any `relaunch_pid` is from the dead server and is
@@ -137,6 +143,7 @@ to the wrapper through `@claude-rescue-resume-cmd` instead. The leading `~` (sub
 | Claude actively running (foreground) | `claude` | `claude --add-dir ...` | wrapper applied → `claude-rescue-resume` (args from `@claude-rescue-resume-cmd`) → `claude --add-dir ... -r <found_sid>` |
 | Soft-hibernated (claude in T, shell foreground) | `zsh` | `claude --add-dir ...` | **wrapper still applied** (matches on first word of full cmd) → claude resumes the session |
 | Hard-hibernated (claude exited, fresh shell) | `zsh` | `:` (empty) | resurrect launches default shell, no wrapper, no claude |
+| Claude running under a nested shell | `claude` | `zsh -ic …` / `-zsh` | default shell; restore hook writes a plain hard marker → print + `clr <sid>` pre-fill |
 | Pane with no claude history | `zsh` | `:` | default shell, no wrapper |
 
 So **soft-hibernated panes auto-resume claude on restore via the wrapper**,
