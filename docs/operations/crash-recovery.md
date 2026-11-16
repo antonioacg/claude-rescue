@@ -213,4 +213,5 @@ tmux -L claude-rescue-staging list-panes -aF \
   picks the most-recent-with-transcript. Usually correct, but edge cases
   (e.g., the user restarted claude with `-r OLD_SID` after a crash and the
   old transcript exists but was abandoned) can resume a session the user no
-  longer wants. Manual override: pick from the picker (`prefix + R`).
+  longer wants. Manual override: pick another with `clr` (or Session Radar,
+  `prefix + S`).

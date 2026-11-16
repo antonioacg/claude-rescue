@@ -1029,52 +1029,39 @@ CR_RDIR=$(cd / && CLAUDE_PROJECTS_DIR="$CORPUS" "$REPO/bin/claude-rescue" resume
 assert "resume-dir: silent when no dir resolves"  ""                     "$CR_RDIR"
 
 # ---------------------------------------------------------------------------
-echo "[picker] data plane over the fixture corpus"
-# Reuses the corpus built above. The interactive fzf layer is not exercised
-# here (see FOLLOWUPS.md); everything the picker renders from is.
-cr_pick() { CLAUDE_PROJECTS_DIR="$CORPUS" CLAUDE_RESCUE_DATA_HOME=$HOME_DIR \
-            CLAUDE_RESCUE_CACHE_HOME=$HOME_DIR/pickcache "$REPO/bin/claude-rescue" "$@"; }
-# Counted, not hardcoded: earlier scenarios also write transcripts into this
-# corpus, and the invariant under test is "one row per resumable transcript".
-PK_EXPECT=$(ls "$CORPUS"/*/*.jsonl 2>/dev/null | wc -l | tr -d ' ')
-PK_IDX=$(cr_pick index | wc -l | tr -d ' ')
-assert "picker: index has one row per transcript" "$PK_EXPECT" "$PK_IDX"
-PK_FIELDS=$(cr_pick index | awk -F'\t' 'NF!=7 {n++} END {print n+0}')
-assert "picker: every index row is 7 fields" "0" "$PK_FIELDS"
-PK_ORDER=$(cr_pick index | awk -F'\t' 'NR>1 && $3 > prev {bad++} {prev=$3} END {print bad+0}')
-assert "picker: index is ordered newest-first" "0" "$PK_ORDER"
-PK_WARN=$(cr_pick index | awk -F'\t' -v s="$FX_F" '$1==s {print $6}')
-assert "picker: flags a session left downgraded" "1" "$PK_WARN"
-PK_OK=$(cr_pick index | awk -F'\t' -v s="$FX_A" '$1==s {print $6}')
-assert "picker: does not flag an already-repaired one" "" "$PK_OK"
-PK_ROWS=$(cd / && cr_pick pick-rows --scope all | wc -l | tr -d ' ')
-assert "picker: renders a row per session" "$PK_EXPECT" "$PK_ROWS"
-PK_LIVE=$(cd / && cr_pick pick-rows --scope all | awk -F'\t' '$2!="-" {n++} END {print n+0}')
-assert "picker: nothing is live in a fixture corpus" "0" "$PK_LIVE"
-PK_SCOPED=$(cd / && cr_pick pick-rows --scope cwd | wc -l | tr -d ' ')
-assert "picker: cwd scope excludes other projects" "0" "$PK_SCOPED"
-assert_nonempty "picker: preview names the session" "$(cr_pick pick-preview "$FX_A" | grep "$FX_A")"
-PK_STATE=$HOME_DIR/pick-scope
-printf 'cwd\n' > "$PK_STATE"
-cr_pick pick-toggle "$PK_STATE" ; PK_T1=$(cat "$PK_STATE")
-cr_pick pick-toggle "$PK_STATE" ; PK_T2=$(cat "$PK_STATE")
-assert "picker: tab toggles scope out"  "all" "$PK_T1"
-assert "picker: tab toggles scope back" "cwd" "$PK_T2"
-assert_nonempty "picker: header states the active scope" "$(cr_pick pick-header "$PK_STATE" | grep scope)"
-if command -v rg >/dev/null 2>&1; then
-  # Title extraction and content search both go through ripgrep; without it
-  # the index still lists every session, just without titles.
-  PK_TITLE=$(cr_pick index | awk -F'\t' -v s="$FX_B" '$1==s {print $7}')
-  assert "picker: falls back to the first user message as a title" "hi" "$PK_TITLE"
-  PK_SHORT=$(cd / && cr_pick pick-rows --scope all hi | wc -l | tr -d ' ')
-  assert "picker: a 2-char query does not trigger a scan" "$PK_EXPECT" "$PK_SHORT"
-  PK_HIT=$(cd / && cr_pick pick-rows --scope all sonnet | wc -l | tr -d ' ')
-  assert "picker: content search narrows to matching sessions" "1" "$PK_HIT"
-  PK_MISS=$(cd / && cr_pick pick-rows --scope all zzz-no-such-content | wc -l | tr -d ' ')
-  assert "picker: content search with no match yields nothing" "0" "$PK_MISS"
-else
-  echo "  (ripgrep absent — skipping title/content-search assertions)"
-fi
+echo "[pane labels] a hard-hibernated pane says which conversation it holds"
+# @claude-session-id + @claude-state follow the pane's marker: set while it is
+# hard, unset otherwise (lib/common.sh label_pane). Session Radar reads them.
+LB_SOCKPATH=$(tmux -L "$SOCK" display-message -p '#{socket_path}')
+LB_P=$(tmux -L "$SOCK" new-window -d -P -F '#{pane_id}' -t t1)
+LB_U=11111111-2222-4333-8444-555555555555
+LB_S=66666666-7777-4888-8999-000000000000
+tmux -L "$SOCK" set-option -pt "$LB_P" @claude-pane-id "$LB_U"
+mkdir -p "$HOME_DIR/cache/hibernated" "$HOME_DIR/active"
+printf '%s\n' "$LB_S" > "$HOME_DIR/active/$LB_U"
+lb_marker() { printf '{"pane_id":"%s","pane_uuid":"%s","mode":"%s","pids":[]}\n' "$LB_P" "$LB_U" "$1" \
+                > "$HOME_DIR/cache/hibernated/$LB_U.json"; }
+lb_run() { TMUX="$LB_SOCKPATH,0,0" CLAUDE_RESCUE_DATA_HOME="$HOME_DIR" CLAUDE_RESCUE_CACHE_HOME="$HOME_DIR/cache" \
+             bash -c ". '$REPO/lib/common.sh'; $1"; }
+lb_opt() { tmux -L "$SOCK" show-options -pqv -t "$LB_P" "$1"; }
+lb_marker hard
+lb_run "label_pane '$LB_P'"
+assert "labels: hard marker names the session"     "$LB_S"      "$(lb_opt @claude-session-id)"
+assert "labels: hard marker says hibernated"       "hibernated" "$(lb_opt @claude-state)"
+lb_marker soft
+lb_run "label_pane '$LB_P'"
+assert "labels: soft marker carries no label"      ""           "$(lb_opt @claude-session-id)$(lb_opt @claude-state)"
+lb_marker hard
+lb_run "label_all_panes"
+assert "labels: arm-sweep's pass heals a missed label" "$LB_S"  "$(lb_opt @claude-session-id)"
+# Claude Code back in the pane: SessionStart removes the marker, and the label.
+wait_for_shell "$LB_P"
+emit_session_start "$LB_P" "$LB_S" /tmp resume
+# The marker goes first, the label right after it: wait on the label.
+for _ in $(seq 1 50); do [ -z "$(lb_opt @claude-session-id)$(lb_opt @claude-state)" ] && break; sleep 0.1; done
+assert "labels: SessionStart removes the marker" "no" "$([ -f "$HOME_DIR/cache/hibernated/$LB_U.json" ] && echo yes || echo no)"
+assert "labels: SessionStart clears them with the marker" "" "$(lb_opt @claude-session-id)$(lb_opt @claude-state)"
+tmux -L "$SOCK" kill-pane -t "$LB_P"
 
 # ---------------------------------------------------------------------------
 echo "[install.sh] dry-run accounts for every binary in bin/"

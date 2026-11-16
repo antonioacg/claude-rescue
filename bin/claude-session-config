@@ -63,7 +63,7 @@ render_lines() {
   local hstate
   hstate="$("$REPO/bin/claude-rescue-log" hibernate-state "${CLAUDE_RESCUE_ORIG_PANE:-}" 2>/dev/null || echo none)"
   if [ "$hstate" = "none" ]; then
-    printf 'hibernate\t >  hibernate now · capture + /exit, free resources · resume from picker\n'
+    printf 'hibernate\t >  hibernate now · capture + /exit, free resources · resume with clr\n'
   else
     printf 'hibernate\t <  restore now · bring this hibernated session back\n'
   fi

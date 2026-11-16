@@ -496,6 +496,54 @@ read_active_session() {
   head -1 "$f" 2>/dev/null | tr -d '\n'
 }
 
+# --- Pane labels --------------------------------------------------------------
+# A hard-hibernated pane says which conversation it holds, for tools that list
+# Claude Code conversations by pane (the dotfiles' Session Radar shows it
+# asleep there, and goes to the pane instead of resuming it a second time):
+#   @claude-session-id  the session the pane's `clr <sid>` resumes
+#                       (resolve_resume_session_id, active file as fallback)
+#   @claude-state       hibernated
+# Set exactly while the pane's marker is hard, unset otherwise. Derived, never
+# read back: the marker stays the truth, and label_pane re-derives both options
+# from it at every hard transition (escalation, crash-promote, session_start).
+# Args: $1 pane_id, $2 pane_uuid (looked up when empty).
+label_pane() {
+  local pane_id="${1:-}" pane_uuid="${2:-}" sid=""
+  [ -n "$pane_id" ] || return 0
+  [ -n "$pane_uuid" ] || pane_uuid="$(tmux_get_pane_uuid "$pane_id")"
+  if [ -n "$pane_uuid" ] && [ "$(hibernated_marker_field "$pane_uuid" mode)" = "hard" ]; then
+    sid="$(resolve_resume_session_id "$pane_uuid")"
+    [ -n "$sid" ] || sid="$(read_active_session "$pane_uuid")"
+  fi
+  if [ -n "$sid" ]; then
+    tmux set-option -qpt "$pane_id" @claude-session-id "$sid" \; \
+         set-option -qpt "$pane_id" @claude-state hibernated 2>/dev/null || true
+  else
+    tmux set-option -uqpt "$pane_id" @claude-session-id \; \
+         set-option -uqpt "$pane_id" @claude-state 2>/dev/null || true
+  fi
+}
+
+# Every pane whose label disagrees with its marker, relabelled: after a restore
+# (pane options die with the server; the markers do not) and on arm-sweep, so a
+# missed transition heals on the next attach. Cheap when nothing changed: a
+# file test per pane, jq only where a marker exists, the db only to label.
+label_all_panes() {
+  local pane_id puuid sid mode
+  while IFS=$'\t' read -r pane_id puuid sid; do
+    [ -n "$pane_id" ] || continue
+    mode=""
+    [ -n "$puuid" ] && [ -f "$(hibernated_marker_path "$puuid")" ] \
+      && mode="$(hibernated_marker_field "$puuid" mode)"
+    if [ "$mode" = "hard" ]; then
+      [ -n "$sid" ] && continue
+    else
+      [ -z "$sid" ] && continue
+    fi
+    label_pane "$pane_id" "$puuid"
+  done < <(tmux list-panes -aF $'#{pane_id}\t#{@claude-pane-id}\t#{@claude-session-id}' 2>/dev/null)
+}
+
 # Returns TSV: session_name<TAB>window_index<TAB>window_name<TAB>pane_current_path
 tmux_pane_info() {
   local pane_id="$1"

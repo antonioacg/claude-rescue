@@ -190,6 +190,7 @@ cmd_session_start() {
     stale_mode="$(hibernated_marker_field "$pane_uuid" mode)"
     rm -f "$hibernated_file"
     cmd_unhibernated "$pane_id" "${stale_mode:-hard}" 2>/dev/null || true
+    label_pane "$pane_id" "$pane_uuid"
   fi
 
   rebuild_meta "$window_uuid"
@@ -836,6 +837,10 @@ cmd_resurrect_restore() {
   # frozen at first session_start). On the next SessionStart post-restore,
   # each file is overwritten in place; orphaned entries for vanished
   # pane_uuids are harmless (the wrapper only queries by live pane_uuid).
+
+  # Pane labels (@claude-session-id, @claude-state) died with the old server;
+  # the markers, just promoted, say which panes are hard now.
+  label_all_panes
 
   # === Post-restore UX: for each pane with a genuine hard-hibernation marker,
   # repaint the hibernation capture (`claude-rescue print` — the pane is reborn
@@ -1516,6 +1521,7 @@ cmd_hibernate_arm() {
        '. + {mode:$mode, hard_ts:$ts}' \
        "$hibernated_file" > "$hibernated_file.tmp" \
        && mv "$hibernated_file.tmp" "$hibernated_file"
+    label_pane "$pane_id" "$_puuid"
 
     # claude runs on the ALTERNATE screen, so on exit the pane reverts to the
     # pre-claude shell content plus claude's own resume hint — the session's
@@ -1807,6 +1813,10 @@ cmd_arm_sweep() {
     fi
     cmd_hibernate_arm "$pane_id" "$pane_pid" 2>/dev/null || true
   done < <(tmux list-panes -aF $'#{pane_id}\t#{window_active}\t#{pane_active}\t#{@claude-pane-id}\t#{pane_pid}\t#{pane_current_command}' 2>/dev/null)
+
+  # Pane labels follow the markers; this heals any transition a hook missed
+  # (and labels the hard panes of a server running since before labels).
+  label_all_panes
 }
 
 # --- Dispatch ---------------------------------------------------------------

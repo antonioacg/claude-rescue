@@ -186,8 +186,6 @@ set -g @resurrect-processes "\"claude->claude-rescue-resume\""
 # Distinguishable status hint so you can tell staging from your main at a glance.
 set -ag status-right ' [staging]'
 
-# Picker keybinding (set after main config so user's prefix is in effect).
-bind R run-shell "claude-rescue"
 TMUX
 
   echo "    staging dir ready"
@@ -271,7 +269,7 @@ TMUX
   echo "     claude                # real SessionStart hook fires"
   echo "     /clear                # session_end (reason:clear) + new session_start"
   echo "     exit / Ctrl-D         # SessionEnd hook fires"
-  echo "     <prefix> + R          # popup picker (claude-rescue)"
+  echo "     <prefix> + S          # Session Radar (the dotfiles' picker; hibernated panes show as ◇)"
   echo ""
   echo " Watch logs from a normal terminal:"
   echo "     tail -F $DATA_DIR/cache/rescue-log.err   # script-level errors"

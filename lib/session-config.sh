@@ -100,8 +100,8 @@ set_session_config_value() {
   mv -f "$tmp" "$f"
 }
 
-# Resolve the active claude session_id for a tmux pane via the same chain the
-# resume picker uses: pane → @claude-pane-id → $DATA/active/<pane_uuid>.
+# Resolve the active claude session_id for a tmux pane via the identity
+# chain: pane → @claude-pane-id → $DATA/active/<pane_uuid>.
 # Empty stdout on any miss; callers decide whether absence is an error.
 resolve_pane_session_id() {
   local pane="${1:-${CLAUDE_RESCUE_ORIG_PANE:-${TMUX_PANE:-}}}"

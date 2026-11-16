@@ -13,6 +13,11 @@ system where applicable.
 
 ## Picker
 
+Moved (2026-11-16): the picker left this repo for the dotfiles' Session Radar
+(prefix+S, and `clr`/`clrf` in a shell). `prefix + R` and `claude-rescue pick`
+are gone; hard-hibernated panes reach Radar through the pane labels
+(`@claude-session-id`, `@claude-state`). The notes below are history.
+
 The picker (`bin/claude-rescue`, bound to `prefix + R`) was rewritten: the
 two-stage window→session drill-down over our event log is gone, replaced by a
 flat, ripgrep-backed search over claude's own transcript corpus, ordered by
