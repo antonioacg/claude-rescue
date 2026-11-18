@@ -1147,8 +1147,9 @@ assert "purge guard: a conversation a live Claude Code holds is not due" "" "$(p
 kill "$PG_LIVE" 2>/dev/null; wait "$PG_LIVE" 2>/dev/null
 rm -f "$PG_HOME/sessions/$PG_LIVE.json"
 
-pg_run run
+PG_ERR="$(pg_run run 2>&1 >/dev/null)"
 PG_A1="$HOME_DIR/session-archive/$PG_S1"
+assert "purge guard: a first run reports no missing file" "" "$(printf '%s\n' "$PG_ERR" | grep 'No such file')"
 assert "purge guard: the transcript is copied as it was found" "same" \
   "$(cmp -s "$PG_T1" "$PG_A1/transcript.jsonl" && echo same || echo differs)"
 assert "purge guard: the conversation itself is untouched" "$PG_T1_MTIME" \

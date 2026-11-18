@@ -315,8 +315,8 @@ fallback_ready() {
 # 0 when $2 was written; FALLBACK_USED lists what fell back.
 FALLBACK_USED=""
 run_one() {
-  local dir="$1" out="$2" prompt="$3" rc=0 mark
-  mark="$(wc -c < "$dir/run.log" 2>/dev/null | tr -d ' ')"
+  local dir="$1" out="$2" prompt="$3" rc=0 mark=0
+  [ -f "$dir/run.log" ] && mark="$(wc -c < "$dir/run.log" | tr -d ' ')"
   run_summarizer "$dir" "$out" "$prompt" || rc=$?
   [ -s "$dir/$out" ] && return 0
   if fallback_ready \
